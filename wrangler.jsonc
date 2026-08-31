@@ -1,0 +1,70 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "cloud-agent",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-28",
+  "compatibility_flags": ["nodejs_compat"],
+  "vars": {
+    "ENVIRONMENT": "prod",
+    "PUBLIC_URL": "https://cloud-agent.aflow.workers.dev",
+    "MODEL_UPSTREAM_BASE": "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+    "DEFAULT_MODEL": "qwen3.8-flash",
+    "DEFAULT_MAX_MODEL_TOKENS": "5000000",
+    "DEFAULT_MAX_WALL_SECONDS": "3600",
+    "DEFAULT_MAX_ATTEMPTS": "3"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "cloud-agent",
+      "database_id": "8b42f506-6bd6-4820-9267-55c0df7b1c50",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "r2_buckets": [
+    { "binding": "ARTIFACTS", "bucket_name": "cloud-agent-artifacts" },
+    { "binding": "EVIDENCE", "bucket_name": "cloud-agent-evidence" }
+  ],
+  "workflows": [
+    { "name": "attempt", "binding": "ATTEMPT_WORKFLOW", "class_name": "AttemptWorkflow" }
+  ],
+  "queues": {
+    "producers": [
+      { "binding": "REVIEW_QUEUE", "queue": "cloud-agent-review" },
+      { "binding": "REPORT_QUEUE", "queue": "cloud-agent-report" }
+    ],
+    "consumers": [
+      {
+        "queue": "cloud-agent-review",
+        "max_retries": 3,
+        "dead_letter_queue": "cloud-agent-review-dlq",
+        "max_batch_timeout": 5
+      },
+      {
+        "queue": "cloud-agent-report",
+        "max_retries": 3,
+        "dead_letter_queue": "cloud-agent-report-dlq",
+        "max_batch_timeout": 5
+      }
+    ]
+  },
+  "containers": [
+    {
+      "class_name": "Sandbox",
+      "image": "docker.io/cloudflare/sandbox:0.8.14",
+      "max_instances": 50,
+      "instance_type": "standard-2"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      { "name": "Sandbox", "class_name": "Sandbox" },
+      { "name": "TASK_SESSION", "class_name": "TaskSession" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Sandbox"] },
+    { "tag": "v2", "new_sqlite_classes": ["TaskSession"] }
+  ],
+  "observability": { "enabled": true }
+}
