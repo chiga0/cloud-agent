@@ -19,6 +19,8 @@ POST /tasks ──► TaskSession DO (权威状态机 + events hash chain)
                      │  执行产物/裁决经 REPORT_QUEUE 回报 DO
                      ▼
         Sandbox (一次 attempt 一个,qwen-code stream-json 直连百炼)
+        writer: repo 任务成功后导出冻结候选 (git diff → R2)
+        verifier: 独立沙箱重放候选 + 跑 verify_command(不跑 LLM)
         reviewer: 纯 LLM 直调百炼(无工具)
                      │  OPENAI_BASE_URL / OPENAI_API_KEY(token-plan key)
                      ▼
@@ -28,7 +30,9 @@ POST /tasks ──► TaskSession DO (权威状态机 + events hash chain)
         R2: artifacts/(内容寻址) + evidence/(manifest) + D1 终态归档
 ```
 
-权威边界:运行中任务状态/决策只认 TaskSession DO(单写者,带 fencing version),终态归档 D1;transcript、产物以 digest 形式绑定进 evidence manifest;Workflow 历史与日志只是参考,不是权威。事件链按 task 单调 seq 追加(UNIQUE CAS),并发不产生分叉。
+任务主线:writer 成功 →(repo 任务)`VERIFYING` 独立验证 → 通过后派 reviewer → `AWAITING_APPROVAL` → DONE/REJECTED。
+
+权威边界:运行中任务状态/决策只认 TaskSession DO(状态转换经显式转换表校验,所有写路径 `blockConcurrencyWhile` 串行,并有并发测试证明),终态归档 D1;transcript、产物、候选 patch 以 digest 形式绑定进 evidence manifest;每个 decision 强制绑定组合证据 `[writer, verifier?, reviewer?]`。writer `exit_code != 0` 绝不进审批流(门禁:只能 rework 或 BLOCKED)。事件链按 task 单调 seq 追加(链内单写者),并发不产生分叉。
 
 ## 本地开发
 
@@ -37,6 +41,7 @@ npm install
 cp .dev.vars.example .dev.vars   # 填入百炼 key 和本地调试 token
 npm run db:migrate:local
 npm run dev                      # 沙箱本地跑需要 Docker
+npm test                         # vitest:状态机单测 + DO 并发测试(miniflare)
 ```
 
 冒烟:
@@ -46,8 +51,12 @@ TOKEN=本地调试token
 curl -X POST localhost:8787/tasks -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
   -d '{"spec":{"prompt":"写一个 hello.py 并运行"}}'
 curl localhost:8787/tasks/<task_id> -H "authorization: Bearer $TOKEN"
+
+# 审批强制绑定组合证据:先从 /evidence 取 binding_digest
+curl -s localhost:8787/tasks/<task_id>/evidence -H "authorization: Bearer $TOKEN"
 curl -X POST localhost:8787/tasks/<task_id>/approve -H "authorization: Bearer $TOKEN" \
-  -H 'content-type: application/json' -d '{"decision":"approve","actor":"human:me"}'
+  -H 'content-type: application/json' \
+  -d '{"decision":"approve","actor":"human:me","attempt_id":"<writer_attempt_id>","evidence_digest":"<binding_digest>"}'
 ```
 
 ## 部署前一次性配置(需要账号操作)
@@ -73,3 +82,5 @@ curl -X POST localhost:8787/tasks/<task_id>/approve -H "authorization: Bearer $T
 ## 验收
 
 对照最佳实践手册 §7 的 PoC 验收矩阵逐条过:DO/Workflow 崩溃恢复、Queue 重投幂等、Sandbox 容器替换、非 allowlist 网络拒绝、token-plan key 仅注入沙箱供 agent 客户端直连(不经代理/不落盘)、时长与 turn 超限由 qwen-code 参数硬停、审批 HITL(或 reviewer agent 自动裁决)、digest 篡改检测、stale fencing 拒绝、events 链并发无分叉。
+
+M6 追加(均已验收):**失败门禁**(writer 失败产物不可被批准,只能 rework/BLOCKED)、**独立验证器**(冻结候选在独立沙箱重放,结构化报告入证)、**组合证据强制绑定**(缺证据 400 / 伪证据 409,裁决绑定 `[writer, verifier?, reviewer?]`)、**DO 并发保护**(并发创建/读取/启动测试证明无交错写)。

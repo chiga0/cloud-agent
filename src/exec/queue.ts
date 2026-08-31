@@ -10,6 +10,16 @@ interface ReviewMessage {
   idempotency_key: string;
 }
 
+interface VerifyMessage {
+  schema_version: 1;
+  type: "verify-request";
+  task_id: string;
+  session_id: string;
+  spec: TaskSpec;
+  writer_manifest_key: string;
+  idempotency_key: string;
+}
+
 export interface ReportMessage {
   schema_version: 1;
   type: "exec-report";
@@ -37,7 +47,7 @@ export interface ReportMessage {
  * 即忽略),重试安全。
  */
 export async function handleQueue(
-  batch: MessageBatch<ReviewMessage | ReportMessage>,
+  batch: MessageBatch<ReviewMessage | VerifyMessage | ReportMessage>,
   env: Env,
 ): Promise<void> {
   for (const msg of batch.messages) {
@@ -49,6 +59,19 @@ export async function handleQueue(
           role: "reviewer",
           idempotency_key: body.idempotency_key,
           spec: body.spec,
+          max_model_tokens: Number(env.DEFAULT_MAX_MODEL_TOKENS),
+          max_wall_seconds: Number(env.DEFAULT_MAX_WALL_SECONDS),
+        });
+        msg.ack();
+        continue;
+      }
+      if (body?.type === "verify-request") {
+        const session = env.TASK_SESSION.get(env.TASK_SESSION.idFromString(body.session_id));
+        await session.startAttempt({
+          role: "verifier",
+          idempotency_key: body.idempotency_key,
+          spec: body.spec,
+          verify_context: { writer_manifest_key: body.writer_manifest_key },
           max_model_tokens: Number(env.DEFAULT_MAX_MODEL_TOKENS),
           max_wall_seconds: Number(env.DEFAULT_MAX_WALL_SECONDS),
         });

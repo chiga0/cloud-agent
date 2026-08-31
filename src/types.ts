@@ -28,6 +28,7 @@ export interface Env {
 export type TaskState =
   | "PENDING"
   | "RUNNING"
+  | "VERIFYING"
   | "AWAITING_APPROVAL"
   | "DONE"
   | "REJECTED"
@@ -49,6 +50,8 @@ export interface AttemptParams {
   model: string;
   /** TaskSession DO 的实例 id(fetch 环境解析出的权威实例,跨环境经 idFromString 精确路由) */
   session_id: string;
+  /** verifier 专用:writer 的 evidence manifest(含候选 patch)在 R2 的 key */
+  verify_context?: { writer_manifest_key: string };
 }
 
 export class AuthorityConflict extends Error {

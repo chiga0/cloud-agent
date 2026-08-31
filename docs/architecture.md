@@ -148,33 +148,20 @@ digest = sha256(prev_digest || canonical({task_id, kind, payload}))
 
 ### Task 状态
 
-```
-   ┌─────────┐
-   │ PENDING │   (createTask 写入)
-   └────┬────┘
-        │ workflow.claim (CAS v → v+1)
-        ▼
-   ┌─────────┐
-   │ RUNNING │
-   └────┬────┘
-        │ exec_finished + evidence
-        ▼
-┌──────────────────┐       approve         ┌──────┐
-│ AWAITING_APPROVAL│ ─────────────────────►│ DONE │
-└──────────────────┘                       └──────┘
-        │ reject                    │ 异常捕获
-        ▼                           ▼
-   ┌──────────┐                 ┌─────────┐
-   │ REJECTED │                 │ BLOCKED │
-   └──────────┘                 └─────────┘
-```
+合法转换的唯一权威是 `src/control/statemachine.ts` 的 `TASK_TRANSITIONS` 表;所有状态写入经 `setState → assertTransition` 校验,非法转换抛 `AuthorityConflict`(fail closed,不依赖调用点自觉):
 
-所有转换都经过 `authority.transition`:
-```sql
-UPDATE tasks SET state = ?, version = version + 1
- WHERE id = ? AND version = ?
-```
-`changes = 0` 即视为冲突,抛 `AuthorityConflict`,workflow 把它上翻成 `BLOCKED`。
+| from \ to | RUNNING | VERIFYING | AWAITING_APPROVAL | DONE | REJECTED | BLOCKED |
+|---|---|---|---|---|---|---|
+| **PENDING** | ✅(writer claim) | | | | | ✅ |
+| **RUNNING** | ✅(rework 下一 writer) | ✅(writer 成功,派验证器) | ✅(非 repo 任务 / verify fan-out 降级,派 reviewer) | | | ✅(workflow 错误 / writer 失败耗尽) |
+| **VERIFYING** | ✅(验证失败,预算内 rework) | | ✅(验证通过,派 reviewer) | | ✅(验证失败且预算耗尽) | ✅(验证器基建错误耗尽 / 超时) |
+| **AWAITING_APPROVAL** | ✅(reviewer reject,预算内 rework) | | | ✅(approve) | ✅(reject) | ✅(超时兜底) |
+| **DONE / REJECTED / BLOCKED** | — | — | — | — | — | —(终态) |
+
+语义区分:
+- **REJECTED** = 质量否决(reviewer/verifier 判定候选不合格,且 rework 预算耗尽)
+- **BLOCKED** = 执行故障(writer 反复失败耗尽、workflow/基建错误、超时),证据链可定位原因
+- writer `exit_code != 0` **绝不**进入审批流(门禁),只能 rework 或 BLOCKED
 
 ### Attempt 状态
 
@@ -213,12 +200,12 @@ Durable Workflow 把一次 attempt 切成若干独立幂等 step,崩溃后从最
 
 | Step | 作用 | 写入 |
 |---|---|---|
-| **exec** | 按 role 分支:writer/verifier 启 sandbox 跑 qwen-code(重试 2 次指数退避);reviewer 直接调百炼 chat/completions(纯 LLM,无工具) | artifacts(R2), 不写状态 |
-| **extract** | writer/verifier 解析 transcript JSONL 取结果与 tokens;reviewer 对 LLM 单行 JSON 回答直接解析裁决 | —(值传给 report step) |
-| **evidence** | 拼装 manifest(transcript + stderr + verify 三个 ArtifactRef),写 R2 | manifests/ |
-| **report** | 发 `exec-report` 到 REPORT_QUEUE(重试 2 次);consumer 经 session_id 精确路由 DO 的 reportExecution,DO 侧幂等 | events(DO 侧) |
+| **exec** | 按 role 分支:writer 启 sandbox 跑 qwen-code(重试 2 次指数退避),repo 任务成功后导出候选 patch;verifier 走 `runVerifyAttempt`(独立沙箱重放冻结 patch + 跑 verify_command,**不跑 LLM**);reviewer 直接调百炼 chat/completions(纯 LLM,无工具) | artifacts(R2), 不写状态 |
+| **extract** | writer 解析 transcript JSONL 取结果与 tokens;verifier 的 transcript 即结构化验证报告,直接透传(tokens=0);reviewer 对 LLM 单行 JSON 回答直接解析裁决 | —(值传给 report step) |
+| **evidence** | 拼装 manifest(artifact refs:transcript + stderr + verify + **patch**),写 R2 | manifests/ |
+| **report** | 发 `exec-report` 到 REPORT_QUEUE(重试 2 次);consumer 经 session_id 精确路由 DO 的 reportExecution,DO 侧幂等;`result_text` 覆盖 writer 与 verifier(验证摘要可查) | events(DO 侧) |
 | **human-approval** | writer 专用:`waitForEvent(type="approval")` 最长 24h,接受 DO notifyWriter 转发的 agent/human 审批事件 | — |
-| **report-blocked** | 异常兜底:发 `exit_code=-1` 的 exec-report,DO 置 BLOCKED | events(DO 侧) |
+| **report-blocked** | 异常兜底:发 `exit_code=-1` 的 exec-report;writer → task BLOCKED,verifier → 按验证失败进 rework 闭环 | events(DO 侧) |
 
 **回报链路**:workflow/queue consumer 环境里的 DO namespace 与 fetch 环境不一致(见 §13.8),RPC 不能靠 `idFromName`;AttemptParams 携带 `session_id`(TaskSession DO 实例 id,全局唯一),consumer 用 `idFromString(session_id)` 精确路由。DO 决策后 `notifyWriter` 用 `ATTEMPT_WORKFLOW.get(workflow_instance_id)` 发 approval event 唤醒 writer workflow(实例 id = writer attempt_id,DO 侧已存)。
 
@@ -227,12 +214,13 @@ Durable Workflow 把一次 attempt 切成若干独立幂等 step,崩溃后从最
 `@cloudflare/sandbox` 的 `getSandbox(env.Sandbox, attemptId)` 按 attemptId 取一个一次性容器。流程:
 
 1. `setEnvVars` — 注入 `OPENAI_BASE_URL = MODEL_UPSTREAM_BASE`、`OPENAI_API_KEY = DASHSCOPE_API_KEY`(token-plan key)、`OPENAI_MODEL`,qwen-code 直连百炼
-2. 可选 `gitCheckout(repoUrl, depth=1)` 到 `/workspace/repo`
+2. 可选 `gitCheckout(repoUrl, depth=1)` 到 `/workspace/repo`,并 `git rev-parse HEAD` 记录 base SHA
 3. 兜底 `npm install -g @qwen-code/qwen-code@0.21.10`(官方镜像未预装)
 4. 写 `/workspace/task.txt` = prompt
 5. `exec` 跑 `qwen -p "$(cat task.txt)" --output-format stream-json --auth-type openai --yolo --max-session-turns 12 --max-wall-time 5m`
 6. 软失败检测:qwen 在 API 错误时仍 exit=0,但最后一条 `type=result` 的 `result` 字段会含 `[API Error:...]`。识别后上翻 exit_code=11
-7. transcript / stderr 写 R2(内容寻址);如提供 `verify_command`,再跑一次,输出单独作为 verify artifact
+7. transcript / stderr 写 R2(内容寻址);成功且为 repo 任务时导出冻结候选:`git add -A && git diff <base> --binary` → `readFile` → patch artifact(写入 manifest 的 `patch` 字段)
+8. **验证语义不在此执行**:`verify_command` 由独立 verifier 在另一沙箱重放(见 §13.10);非 repo 任务无验证
 
 **软失败检测的意义**:qwen-code 把 API 错误嵌入 stream-json 的 result 事件而不是反映在退出码,如果不识别会把"401/限流"当成"任务成功"。
 
@@ -330,19 +318,21 @@ interface EvidenceManifest {
 
 ---
 
-## 10. 人工审批(HITL)
+## 10. 人工审批(HITL)与证据绑定
 
-`POST /tasks/:id/approve` 接收 `{ decision: "approve" | "reject", actor?: string }`:
+`POST /tasks/:id/approve` 接收 `{ decision: "approve" | "reject", actor?: string, attempt_id, evidence_digest }`,后两者**必填**(`submitDecision` 强制):
 
-1. 查最近 attempt 的 `workflow_instance_id`
-2. `ATTEMPT_WORKFLOW.get(id).sendEvent({ type: "approval", payload })`
-3. Workflow 在 `waitForEvent` 处唤醒,进入 `decide` step
-4. `recordDecision` 写 decisions 表(decision + evidence_digest + fencing_token)
-5. `transition` CAS → DONE 或 REJECTED
+1. `evidence_required` — 缺 `attempt_id` 或 `evidence_digest` → 400
+2. `attempt_not_writer` — attempt 必须是 writer(裁决对象是候选本身)→ 409
+3. `evidence_mismatch` — 提交的 digest 必须等于控制面计算的组合证据 `composite([writer, verifier?])`,防"批的不是看的那份证据" → 409
+4. `task_not_awaiting` — 仅 `AWAITING_APPROVAL` 可裁决 → 409
+5. 通过校验 → `finishApproval`:记 `decision.recorded`(带组合 evidence_digest + fencing_token)→ CAS → DONE/REJECTED → `notifyWriter` 唤醒 writer workflow → 归档 D1(失败挂 30s alarm 重试)
 
-`actor` 默认 `human:api`;后续接入 SSO / 审批系统时改成 `human:<user-id>` 或 `agent:<reviewer-attempt-id>`。
+组合证据的组成(见 §13.9):
+- **人工审批**绑定 `[writer, verifier?]` — 调用方从 `GET /tasks/:id/evidence` 的 `binding_digest` 字段获取,先取证、后裁决
+- **自动裁决**(reviewer)由 DO 内部附裁决者自身证据:`[writer, verifier?, reviewer]`
 
-当前没有自动审批分支 — 即使 exit_code=0 也必等人点 approve。后续可在 `decide` 之前加一个 auto-approve 判断(如 spec.auto_approve === true 且 verify.exit === 0),但当前刻意保守。
+`actor` 默认 `human:api`;接入 SSO / 审批系统时改成 `human:<user-id>`。M5 起已有自动裁决分支:reviewer 纯 LLM 裁决(见 §13.6),人工审批与之互为兜底,先到先决、后到幂等忽略。
 
 ---
 
@@ -357,8 +347,8 @@ interface EvidenceManifest {
 | POST | `/tasks` | `Bearer $WORKER_API_TOKEN` | 创建 task + 首个 attempt,启动 workflow;返回 `{ task_id, attempt_id, workflow }` |
 | GET | `/tasks/:id` | `Bearer $WORKER_API_TOKEN` | 返回 `{ task, attempts[], events[] }`,含 `task.result_text` |
 | GET | `/tasks/:id/result` | `Bearer $WORKER_API_TOKEN` | `text/plain` 直出 agent 最终答案;尚未提取到返回 404 `{ error: "no_result_yet" }` |
-| POST | `/tasks/:id/approve` | `Bearer $WORKER_API_TOKEN` | 发送 approval event 到 workflow |
-| GET | `/tasks/:id/evidence` | `Bearer $WORKER_API_TOKEN` | 返回最新 attempt 的 manifest JSON |
+| POST | `/tasks/:id/approve` | `Bearer $WORKER_API_TOKEN` | 裁决,必填 `attempt_id` + `evidence_digest`(组合证据);缺 400 / 不匹配 409 |
+| GET | `/tasks/:id/evidence` | `Bearer $WORKER_API_TOKEN` | 返回最新 attempt 的 manifest JSON + `binding_digest`(approve 应提交的组合证据) |
 | GET | `/tasks/:id/attempts/:aid/transcript` | `Bearer $WORKER_API_TOKEN` | 流式透传 R2 里的 transcript 原文 |
 
 ### 典型调用序列
@@ -383,11 +373,15 @@ done
 curl -sS $BASE/tasks/$TASK/result \
   -H "Authorization: Bearer $WORKER_API_TOKEN"
 
-# 4. 审批
+# 4. 取证并审批(组合证据强制绑定)
+EV=$(curl -sS $BASE/tasks/$TASK/evidence \
+  -H "Authorization: Bearer $WORKER_API_TOKEN")
+WRITER_ID=$(echo "$EV" | jq -r '.manifest.attempt_id')
+BINDING=$(echo "$EV" | jq -r .binding_digest)
 curl -sS -X POST $BASE/tasks/$TASK/approve \
   -H "Authorization: Bearer $WORKER_API_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"decision":"approve","actor":"human:me"}'
+  -d "{\"decision\":\"approve\",\"actor\":\"human:me\",\"attempt_id\":\"$WRITER_ID\",\"evidence_digest\":\"$BINDING\"}"
 ```
 
 ---
@@ -402,7 +396,7 @@ curl -sS -X POST $BASE/tasks/$TASK/approve \
 | R2 | `ARTIFACTS` = `cloud-agent-artifacts` | 沙箱产物、transcript、verify |
 | R2 | `EVIDENCE` = `cloud-agent-evidence` | manifest |
 | Workflow | `ATTEMPT_WORKFLOW` = `attempt` | Durable Workflow 注册 |
-| Queue | `REVIEW_QUEUE` = `cloud-agent-review`,DLQ = `cloud-agent-review-dlq` | reviewer fan-out 通道 |
+| Queue | `REVIEW_QUEUE` = `cloud-agent-review`,DLQ = `cloud-agent-review-dlq` | fan-out 通道:`review-request`(派 reviewer)+ `verify-request`(派 verifier,M6 复用,不新增队列) |
 | Queue | `REPORT_QUEUE` = `cloud-agent-report`,DLQ = `cloud-agent-report-dlq` | workflow → DO 回报通道(经 session_id 路由) |
 | Container | `Sandbox` = `docker.io/cloudflare/sandbox:0.8.14` | 沙箱基础镜像 |
 | Durable Object | `Sandbox` | 容器绑定 |
@@ -459,15 +453,17 @@ qwen3.8-flash 带 reasoning,单次调用 tokens 可能很高(内部推理 + 工�
 
 已实现 `POST /admin/backfill-results`:扫 `result_text IS NULL` 的 task → 经 events 定位 writer attempt 的 manifest → 读 R2 transcript → extract 结果与 tokens → 回填 `tasks.result_text` / `attempts.tokens_used`。首次执行回填 10/10。注意:代理时代失败任务的 result_text 会保留 `[API Error: ...]` 文本(如实反映失败)。
 
-### 13.6 reviewer / verifier 角色 — 已闭环(writer → reviewer → 自动裁决)
+### 13.6 reviewer / verifier 角色 — 已闭环(含独立验证证据注入)
 
 ~~consumer 骨架就绪但上游没有发消息,reviewer 未生效。~~
 
-已接通:writer attempt 在 evidence 之后向 `REVIEW_QUEUE` 发 `review-request`(幂等 key `task_id:review:1`,队列故障不阻断主流程);consumer 经 `session_id` 路由 DO 创建 reviewer attempt;reviewer 是**纯 LLM**(直接调百炼 `/chat/completions`,无工具,秒级,天然输出 JSON,不做任何任务执行),裁决经 REPORT_QUEUE 回报 DO,DO 记录 `review.completed` + `decision.recorded` 并 CAS → DONE/REJECTED,再 `notifyWriter` 唤醒 writer workflow。
+已接通:候选验证/审查通过后才派 reviewer;reviewer 是**纯 LLM**(直接调百炼 `/chat/completions`,无工具,秒级,天然输出 JSON,不做任何任务执行),裁决经 REPORT_QUEUE 回报 DO,DO 记录 `review.completed` + `decision.recorded`(绑定组合证据,见 §13.9)并 → DONE/REJECTED,再 `notifyWriter` 唤醒 writer workflow。
 
+- **repo 任务**:writer 成功 → 独立验证器重放候选(§13.10)→ 验证通过才派 reviewer
+- **reviewer 输入增强**(M6):repo 任务的 review prompt 注入【独立验证结果】(通过/失败 + verify 输出摘录)与【候选变更摘录】(DO 从 R2 读 writer patch,截断 4000 字),并指令"验证失败必须 reject"——reviewer 的工程判断基于真实重放证据而非自我陈述
 - reviewer 结论由 review prompt 约束为一行 JSON `{"decision":"approve"|"reject","reason":...}`;`extractReviewDecision` 三阶段解析(JSON.parse → 正则 → 关键词兜底)
 - reviewer 自身失败(exit != 0)时不唤醒 writer,留给人工审批兜底
-- 人工审批始终可用(`POST /tasks/:id/approve`,现固定发给 writer attempt);人工先审批后 reviewer 再完成时,reportExecution 幂等忽略
+- 人工审批与自动裁决互为兜底,先到先决、后到幂等忽略;人工裁决必须携带组合证据(§10、§13.9)
 - 曾用 qwen-code(带工具)跑 reviewer:即使 prompt 禁止也会真的执行任务,且结果经 NDJSON 提取器误解析 → 改为纯 LLM 后稳定
 
 ### 13.7 证据端点缺失 — 已实现
@@ -486,6 +482,43 @@ qwen3.8-flash 带 reasoning,单次调用 tokens 可能很高(内部推理 + 工�
 证据:同一 task 的 reportExecution 到达 DO `960cb073`(task:null),getSnapshot 到 `1521a9af`(有数据);fetch 环境跨部署稳定解析同一实例 → 结论是**运行环境绑定的 namespace 不同**,不是版本钉扎。
 
 修复:TaskSession DO 在自身环境生成 `session_id = this.ctx.id.toString()`(全局唯一),经 AttemptParams / queue 消息传递;consumer 用 `env.TASK_SESSION.idFromString(session_id)` + `get()` 精确路由。DO 实例 id 全局唯一,与 namespace 无关。教训:**跨环境(workflow/queue/fetch)RPC Durable Object 不要用 name 路由,显式传实例 id**。
+
+### 13.9 证据门禁与组合证据绑定 — 已实现
+
+~~两个硬伤:① writer `exit_code != 0` 后仍发 review、转 AWAITING_APPROVAL,失败产物可被批准;② `POST /approve` 的 attempt_id/evidence_digest 均可选,且只对比单个 attempt 的 manifest digest——人工裁决可以不带任何证据,或拿旧证据批新候选。~~
+
+修复(控制面强制,不依赖调用方自觉):
+
+- **失败门禁**:writer `exit_code != 0` 一律不进审批流——预算内(`DEFAULT_MAX_ATTEMPTS`)自动 rework 下一个 writer;耗尽 → task **BLOCKED**(与质量否决的 REJECTED 区分)。事件链记 `writer.failed` / `writer.rework_scheduled`
+- **组合证据**:每个 decision 绑定因果链上全部证据的组合 digest `sha256(JSON.stringify([{role, attempt_id, digest}, ...]))`——人工审批 = `[writer, verifier?]`,自动裁决附裁决者 = `[writer, verifier?, reviewer]`。候选或验证记录任一字节变化,组合 digest 即变化
+- **强制校验**(`submitDecision`):`attempt_id`/`evidence_digest` 必填(400 `evidence_required`);必须指向 writer(409 `attempt_not_writer`);必须等于控制面重算的组合绑定(409 `evidence_mismatch`);仅 `AWAITING_APPROVAL` 可裁决(409 `task_not_awaiting`)。调用方从 `GET /tasks/:id/evidence` 的 `binding_digest` 取证
+- **验收**(2026-08-31 部署后):E2E 证实 decision 落库的 digest 与从 R2 manifest 独立重算的 `composite([w,v,r])` / `composite([w,r])` 逐字节一致;缺证据 400、伪证据 409、非 writer 409 全部拒绝
+
+### 13.10 独立验证器 — 已实现(冻结候选 + 独立沙箱重放)
+
+~~`verify_command` 在 writer 同一沙箱内执行,退出码只进文本产物、控制面不解析——验证与执行共享被污染的环境,且"验证通过"不可审计。~~
+
+修复:验证语义从 writer 沙箱移出,成为独立角色纵切:
+
+1. **冻结候选**:writer 成功后导出 `git add -A && git diff <base_sha> --binary` 为 patch,内容寻址入 R2,写入 writer manifest 的 `patch` 字段
+2. **编排**:task `RUNNING → VERIFYING`,经 `REVIEW_QUEUE` 发 `verify-request`(复用现有队列,幂等键 `task:verify:<n>`);consumer 路由 DO 创建 verifier attempt
+3. **重放**:全新沙箱浅克隆默认分支 → 从 R2 取 patch → `git apply` → 跑 `verify_command`;**不跑 LLM**,transcript 即结构化报告 `{apply:{exit_code}, verify:{exit_code, stdout_tail, stderr_tail}}`
+4. **裁决**:验证通过 → 派 reviewer(输入含验证结论 + diff 摘录)→ `AWAITING_APPROVAL`;验证失败 → 按否决进 rework 闭环,预算耗尽 → REJECTED;verifier 基建错误同样按验证失败处理
+- **验收**:repo 任务(`octocat/Hello-World` + `test -f hello.txt && grep -q 'hello cloud-agent' hello.txt`)全链 `RUNNING→VERIFYING→AWAITING_APPROVAL→DONE`,验证器报告 `apply=0, verify=0`
+- **已知限制**:patch 基于浅克隆默认分支,上游在 writer→verifier 窗口期移动时 `git apply` 可能失败——按验证失败处理(证据失败,属预期语义,进 rework)
+
+### 13.11 DO 并发保护 — 已实现并有测试证明
+
+~~"TaskSession 单写者串行"只是注释声明:DO 的 input gate 不保护 RPC,多个并发 RPC 在同一 isolate 内于 await 边界交错,`loadAll → 变更 → saveAll` 是 read-modify-write 竞态——并发创建会写出双份 `task.created`,事件链 sibling 分叉。~~
+
+修复:`createTask / startAttempt / reportExecution / submitDecision` 全部用 `this.ctx.blockConcurrencyWhile()` 包裹完整临界区(读 → 变更 → 写)。
+
+**测试证明**(`test/session-do.test.ts`,vitest + @cloudflare/vitest-pool-workers,真 DO + miniflare):
+- 同一 taskId 并发 8 个 `createTask` → 恰好 1 条 `task.created`,spec_digest 一致,事件链完整(修复前该测试应为红:交错写会产生 2 条)
+- 写与并发 `getSnapshot` 交错 → 无撕裂读,每个快照状态一致、链不断
+- 并发 `startAttempt`(同幂等键)→ 恰好 1 个 attempt,claim 转换一次
+
+另有纯单测覆盖状态转换表合法性、rework 预算判断与组合 digest 确定性(`test/statemachine.test.ts`)。`npm test` 一键运行;注意测试用 `wrangler.test.jsonc`(compatibility_date 受 pool 内置 workerd 版本限制)。
 
 ---
 

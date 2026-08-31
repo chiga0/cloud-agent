@@ -8,6 +8,7 @@ export interface SandboxRunResult {
   transcriptRaw: string;
   stderr: ArtifactRef;
   verify?: ArtifactRef;
+  patch?: ArtifactRef;
 }
 
 /**
@@ -15,6 +16,10 @@ export interface SandboxRunResult {
  * qwen-code 直连百炼(token-plan key);Worker 不做中间代理,
  * token 记账和审计通过事后解析 transcript 完成。
  * 产物回收:stdout/stderr 直接经 ExecResult 回传 → 内容寻址写入 R2。
+ *
+ * repo 任务:checkout 后记录 base SHA,成功后导出候选 patch
+ * (`git add -A && git diff <base> --binary`)作为冻结快照,由独立
+ * verifier 在另一沙箱重放验证——验证语义不在 writer 沙箱内执行。
  *
  * 注意:qwen-code 无头标志以本机 `qwen --help` 为准(此处 -p / --output-format
  * stream-json / --auth-type openai 依据 sources/qwen-code 0.21.10 的 config.ts)。
@@ -26,7 +31,7 @@ export async function runQwenCodeAttempt(
     prompt: string;
     model: string;
     repoUrl?: string;
-    verifyCommand?: string;
+    exportPatch?: boolean;
   },
 ): Promise<SandboxRunResult> {
   const sandbox = getSandbox(env.Sandbox, args.attemptId);
@@ -38,8 +43,11 @@ export async function runQwenCodeAttempt(
     OPENAI_MODEL: args.model,
   });
 
+  let baseSha: string | null = null;
   if (args.repoUrl) {
     await sandbox.gitCheckout(args.repoUrl, { targetDir: "/workspace/repo", depth: 1 });
+    const base = await sandbox.exec("cd /workspace/repo && git rev-parse HEAD");
+    baseSha = base.stdout.trim() || null;
   }
 
   // 官方镜像未预装 qwen-code;Docker 可用后构建 sandbox/Dockerfile 预装镜像可跳过此步
@@ -78,15 +86,14 @@ export async function runQwenCodeAttempt(
   const transcript = await putArtifact(env.ARTIFACTS, run.stdout, `attempts/${args.attemptId}`);
   const stderr = await putArtifact(env.ARTIFACTS, run.stderr, `attempts/${args.attemptId}`);
 
-  let verify: ArtifactRef | undefined;
-  if (args.verifyCommand) {
-    const v = await sandbox.exec(`cd ${workdir} && ${args.verifyCommand}`);
-    verify = await putArtifact(
-      env.ARTIFACTS,
-      `exit=${v.exitCode}\n\n${v.stdout}\n${v.stderr}`,
-      `attempts/${args.attemptId}`,
+  let patch: ArtifactRef | undefined;
+  if (exitCode === 0 && args.exportPatch && args.repoUrl && baseSha) {
+    await sandbox.exec(
+      `cd /workspace/repo && git add -A && git diff ${baseSha} --binary > /tmp/patch.diff`,
     );
+    const file = await sandbox.readFile("/tmp/patch.diff");
+    patch = await putArtifact(env.ARTIFACTS, file.content, `attempts/${args.attemptId}`);
   }
 
-  return { exitCode, transcript, transcriptRaw: run.stdout, stderr, verify };
+  return { exitCode, transcript, transcriptRaw: run.stdout, stderr, patch };
 }

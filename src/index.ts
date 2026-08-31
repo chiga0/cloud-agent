@@ -56,8 +56,8 @@ function landingHtml(env: Env): string {
       <dt>POST /tasks</dt><dd>创建任务(需要 <code>Authorization: Bearer WORKER_API_TOKEN</code>)</dd>
       <dt>GET /tasks/:id</dt><dd>查询任务、attempts 与事件链(需鉴权)</dd>
       <dt>GET /tasks/:id/result</dt><dd>读取 agent 最终答案(纯文本,需鉴权)</dd>
-      <dt>POST /tasks/:id/approve</dt><dd>审批(建议带 attempt_id + evidence_digest,需鉴权)</dd>
-      <dt>GET /tasks/:id/evidence</dt><dd>最新 attempt 的 evidence manifest(需鉴权)</dd>
+      <dt>POST /tasks/:id/approve</dt><dd>审批(必须带 attempt_id + evidence_digest,需鉴权)</dd>
+      <dt>GET /tasks/:id/evidence</dt><dd>最新 attempt 的 evidence manifest + binding_digest(需鉴权)</dd>
       <dt>GET /tasks/:id/attempts/:aid/transcript</dt><dd>attempt 的 transcript 原文(需鉴权)</dd>
       <dt>GET /tasks/:id/attempts/:aid/verify</dt><dd>attempt 的 verify 输出(需鉴权)</dd>
       <dt>GET /admin/chain-check</dt><dd>校验 D1 归档的事件 hash chain(需鉴权)</dd>
@@ -136,7 +136,7 @@ async function handleGetEvidence(env: Env, taskId: string): Promise<Response> {
     return Response.json({ error: { type: "evidence_missing", detail: res.key } }, { status: 404 });
   }
   const manifest = (await obj.json()) as EvidenceManifest;
-  return Response.json({ digest: res.digest, manifest });
+  return Response.json({ digest: res.digest, binding_digest: res.binding_digest, manifest });
 }
 
 async function handleGetAttemptArtifact(
@@ -188,7 +188,12 @@ async function handleApprove(req: Request, env: Env, taskId: string): Promise<Re
     actor: body.actor ?? "human:api",
   });
   if (!res.ok) {
-    const status = res.error === "unknown_attempt" || res.error === "evidence_mismatch" ? 409 : 404;
+    const status =
+      res.error === "evidence_required"
+        ? 400
+        : res.error === "task not found"
+          ? 404
+          : 409;
     return Response.json({ error: { type: res.error, state: res.state } }, { status });
   }
   return Response.json({ ok: true });

@@ -1,0 +1,41 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "cloud-agent-test",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-22",
+  "compatibility_flags": ["nodejs_compat"],
+  "vars": {
+    "ENVIRONMENT": "test",
+    "PUBLIC_URL": "http://localhost",
+    "MODEL_UPSTREAM_BASE": "https://example.invalid/v1",
+    "DEFAULT_MODEL": "test-model",
+    "DEFAULT_MAX_MODEL_TOKENS": "100000",
+    "DEFAULT_MAX_WALL_SECONDS": "600",
+    "DEFAULT_MAX_ATTEMPTS": "3"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "cloud-agent-test",
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "r2_buckets": [
+    { "binding": "ARTIFACTS", "bucket_name": "test-artifacts" },
+    { "binding": "EVIDENCE", "bucket_name": "test-evidence" }
+  ],
+  "workflows": [
+    { "name": "attempt", "binding": "ATTEMPT_WORKFLOW", "class_name": "AttemptWorkflow" }
+  ],
+  "queues": {
+    "producers": [
+      { "binding": "REVIEW_QUEUE", "queue": "test-review" },
+      { "binding": "REPORT_QUEUE", "queue": "test-report" }
+    ]
+  },
+  "durable_objects": {
+    "bindings": [{ "name": "TASK_SESSION", "class_name": "TaskSession" }]
+  },
+  "migrations": [{ "tag": "v2", "new_sqlite_classes": ["TaskSession"] }]
+}

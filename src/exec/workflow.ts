@@ -3,6 +3,7 @@ import type { AttemptParams, Env } from "../types";
 import type { ReportMessage } from "./queue";
 import { writeManifest, type EvidenceManifest } from "../audit/evidence";
 import { runQwenCodeAttempt, type SandboxRunResult } from "./sandbox";
+import { runVerifyAttempt } from "./verify";
 import { runReviewLLM } from "./review";
 import {
   extractResultFromTranscript,
@@ -31,13 +32,24 @@ export class AttemptWorkflow extends WorkflowEntrypoint<Env, AttemptParams> {
         "exec",
         { retries: { limit: 2, delay: "10 seconds", backoff: "exponential" } },
         async () => {
-          if (p.role === "writer" || p.role === "verifier") {
+          if (p.role === "verifier") {
+            if (!p.verify_context?.writer_manifest_key) {
+              throw new Error("verifier attempt missing verify_context.writer_manifest_key");
+            }
+            return runVerifyAttempt(this.env, {
+              attemptId: p.attempt_id,
+              taskId: p.task_id,
+              spec: p.spec,
+              writerManifestKey: p.verify_context.writer_manifest_key,
+            });
+          }
+          if (p.role === "writer") {
             return runQwenCodeAttempt(this.env, {
               attemptId: p.attempt_id,
               prompt: p.spec.prompt,
               model: p.model,
               repoUrl: p.spec.repo_url,
-              verifyCommand: p.spec.verify_command,
+              exportPatch: Boolean(p.spec.repo_url),
             });
           }
           return runReviewLLM(this.env, {
@@ -56,6 +68,10 @@ export class AttemptWorkflow extends WorkflowEntrypoint<Env, AttemptParams> {
             tokens: "tokens" in runResult ? runResult.tokens : 0,
             review: extractReviewDecision(text),
           };
+        }
+        if (p.role === "verifier") {
+          // transcript 已是结构化 JSON 报告,不做 NDJSON 提取
+          return { text: runResult.transcriptRaw, tokens: 0, review: undefined };
         }
         return {
           text: extractResultFromTranscript(runResult.transcriptRaw),
@@ -76,6 +92,7 @@ export class AttemptWorkflow extends WorkflowEntrypoint<Env, AttemptParams> {
           transcript: runResult.transcript,
           artifacts: [runResult.stderr],
           verify: "verify" in runResult ? runResult.verify : undefined,
+          patch: "patch" in runResult ? runResult.patch : undefined,
         };
         return writeManifest(this.env.EVIDENCE, manifest);
       });
@@ -91,7 +108,10 @@ export class AttemptWorkflow extends WorkflowEntrypoint<Env, AttemptParams> {
         manifest_key: manifestRef.key,
         manifest_digest: manifestRef.digest,
         tokens: extracted.tokens,
-        result_text: p.role === "writer" ? (extracted.text ?? "").slice(0, 32_000) : null,
+        result_text:
+          p.role === "writer" || p.role === "verifier"
+            ? (extracted.text ?? "").slice(0, 32_000)
+            : null,
         review: extracted.review,
       };
       await step.do(

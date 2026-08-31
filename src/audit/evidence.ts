@@ -35,7 +35,24 @@ export interface EvidenceManifest {
   transcript: ArtifactRef;
   artifacts: ArtifactRef[];
   verify?: ArtifactRef;
+  /** writer 导出的候选变更 patch(repo 任务),供独立验证器重放 */
+  patch?: ArtifactRef;
   model_calls_digest?: string;
+}
+
+export interface EvidencePart {
+  role: string;
+  attempt_id: string;
+  digest: string;
+}
+
+/**
+ * 决策绑定的组合证据:对因果链上各角色证据(writer 候选、verifier 验证、
+ * reviewer 裁决)的 digest 做规范化序列化后取哈希。人工审批必须提供与
+ * [writer, verifier?] 一致的组合值;自动裁决由控制面直接计算。
+ */
+export async function compositeEvidenceDigest(parts: EvidencePart[]): Promise<string> {
+  return sha256Hex(JSON.stringify(parts));
 }
 
 export async function writeManifest(
