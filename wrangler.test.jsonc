@@ -13,7 +13,9 @@
     "DEFAULT_MAX_WALL_SECONDS": "600",
     "DEFAULT_MAX_ATTEMPTS": "3",
     "REJECT_EVIDENCE_MODE": "shadow",
-    "BASE_PIN_MODE": "shadow"
+    "BASE_PIN_MODE": "shadow",
+    // 控制面端点的鉴权走真实 checkApiToken,因此测试环境也需要一个值
+    "WORKER_API_TOKEN": "test-worker-api-token"
   },
   "d1_databases": [
     {

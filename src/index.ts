@@ -1,6 +1,7 @@
-import type { Env, TaskSpec } from "./types";
+import type { Env, TaskSpec, TaskState } from "./types";
 import { handleQueue } from "./exec/queue";
 import { TaskSession } from "./control/session";
+import { TASK_TRANSITIONS } from "./control/statemachine";
 import type { EvidenceManifest } from "./audit/evidence";
 import { sha256Hex } from "./audit/evidence";
 import { assembleCandidate, candidateFileName } from "./audit/candidate";
@@ -65,6 +66,7 @@ function landingHtml(env: Env): string {
       <dt>GET /tasks/:id/candidate?format=patch</dt><dd>下载补丁正文(<code>curl -o candidate.patch</code> 后本地 <code>git apply</code>);下发前重算 sha256,状态在 <code>x-candidate-status</code> / <code>x-safe-to-apply</code> 头里</dd>
       <dt>GET /tasks/:id/attempts/:aid/transcript</dt><dd>attempt 的 transcript 原文(verifier 为 JSON 验证报告,需鉴权)</dd>
       <dt>GET /admin/chain-check</dt><dd>校验 D1 归档的事件 hash chain(需鉴权)</dd>
+      <dt>GET /admin/tasks</dt><dd>归档任务列表(需鉴权):<strong>只读</strong>投影,数据源仅为 D1 归档的 <code>tasks</code> 表 —— 任务到终态才归档,因此<strong>不含仍在 DO 中运行、尚未归档的任务</strong>(实时状态看 <code>GET /tasks/:id</code>)。按 <code>updated_at</code> 降序返回 <code>{"tasks":[{id,state,created_at,updated_at,version}],"count":N}</code>;可选 <code>?state=</code> 精确过滤(合法取值见状态机,非法 → 400)、可选 <code>?limit=</code>(默认 50,上限 200,非数字或越界 → 400)</dd>
     </dl>
   </div>
 
@@ -347,6 +349,70 @@ async function handleChainCheck(env: Env): Promise<Response> {
   return Response.json({ checked, broken, brokenTasks: brokenTasks.slice(0, 20) });
 }
 
+/** 合法 state 取值从权威转换表派生:状态机增删状态时这里自动跟上,不留第二份清单。 */
+const TASK_STATES: readonly TaskState[] = Object.keys(TASK_TRANSITIONS) as TaskState[];
+
+const DEFAULT_ADMIN_TASKS_LIMIT = 50;
+const MAX_ADMIN_TASKS_LIMIT = 200;
+
+interface ArchivedTaskRow {
+  id: string;
+  state: string;
+  created_at: string;
+  updated_at: string;
+  version: number;
+}
+
+/**
+ * GET /admin/tasks —— 归档任务列表(只读投影,数据源仅为 D1 `tasks` 表)。
+ *
+ * 归档只在终态发生,所以这里**看不到仍在 DO 中运行、尚未归档的任务** —— 它是
+ * 复盘与「捞需要人工处理的任务」的视图,不是实时看板;实时状态仍走 /tasks/:id。
+ * 不引入新的状态对象,也不碰控制面状态机与归档写路径。
+ */
+async function handleAdminTasks(url: URL, env: Env): Promise<Response> {
+  const state = url.searchParams.get("state");
+  if (state !== null && !(TASK_STATES as readonly string[]).includes(state)) {
+    return Response.json(
+      {
+        error: {
+          type: "invalid_state",
+          detail: `state must be one of ${TASK_STATES.join(", ")}`,
+        },
+      },
+      { status: 400 },
+    );
+  }
+
+  let limit = DEFAULT_ADMIN_TASKS_LIMIT;
+  const rawLimit = url.searchParams.get("limit");
+  if (rawLimit !== null) {
+    const parsed = Number(rawLimit);
+    if (!Number.isInteger(parsed) || parsed < 1 || parsed > MAX_ADMIN_TASKS_LIMIT) {
+      return Response.json(
+        {
+          error: {
+            type: "invalid_limit",
+            detail: `limit must be an integer within [1, ${MAX_ADMIN_TASKS_LIMIT}]`,
+          },
+        },
+        { status: 400 },
+      );
+    }
+    limit = parsed;
+  }
+
+  const sql =
+    "SELECT id, state, created_at, updated_at, version FROM tasks" +
+    (state === null ? "" : " WHERE state = ?") +
+    " ORDER BY updated_at DESC LIMIT ?";
+  const params: Array<string | number> = state === null ? [] : [state];
+  params.push(limit);
+  const rows = await env.DB.prepare(sql).bind(...params).all<ArchivedTaskRow>();
+  // count 是本次返回的条数(受 limit 截断),不是表里的总匹配数。
+  return Response.json({ tasks: rows.results, count: rows.results.length });
+}
+
 export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(req.url);
@@ -365,6 +431,10 @@ export default {
 
     if (url.pathname === "/admin/chain-check" && req.method === "GET") {
       return handleChainCheck(env);
+    }
+
+    if (url.pathname === "/admin/tasks" && req.method === "GET") {
+      return handleAdminTasks(url, env);
     }
 
     const taskMatch =
