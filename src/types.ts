@@ -20,10 +20,14 @@ export interface Env {
   DEFAULT_MAX_MODEL_TOKENS: string;
   DEFAULT_MAX_WALL_SECONDS: string;
   DEFAULT_MAX_ATTEMPTS: string;
+  /** reviewer reject 的证据校验:"shadow"(只记账) | "enforce"(不成立即降级 accept-with-notes) */
+  REJECT_EVIDENCE_MODE: string;
 
   DASHSCOPE_API_KEY: string;
   WORKER_API_TOKEN: string;
 }
+
+export type ReviewEvidenceMode = "shadow" | "enforce";
 
 export type TaskState =
   | "PENDING"
@@ -36,6 +40,8 @@ export type TaskState =
 
 export interface TaskSpec {
   prompt: string;
+  /** 声明式验收标准。缺省时 reviewer 的意见纯 advisory,无权触发返工。 */
+  acceptance?: string[];
   repo_url?: string;
   verify_command?: string;
   worker?: "qwen-code";
@@ -52,6 +58,8 @@ export interface AttemptParams {
   session_id: string;
   /** verifier 专用:writer 的 evidence manifest(含候选 patch)在 R2 的 key */
   verify_context?: { writer_manifest_key: string };
+  /** 返工时带走的修复指令(上一轮硬门禁失败证据或成立的 reject),拼进 writer prompt */
+  instructions?: string[];
 }
 
 export class AuthorityConflict extends Error {

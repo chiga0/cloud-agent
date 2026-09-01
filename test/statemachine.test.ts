@@ -2,9 +2,13 @@ import { describe, expect, it } from "vitest";
 import { AuthorityConflict, type TaskState } from "../src/types";
 import {
   TASK_TRANSITIONS,
+  attemptDeadline,
   assertTransition,
   decideRework,
   isLegalTransition,
+  nextWatchdogAlarm,
+  WALL_GRACE_SECONDS,
+  WATCHDOG_MIN_INTERVAL_MS,
 } from "../src/control/statemachine";
 import { compositeEvidenceDigest } from "../src/audit/evidence";
 
@@ -56,6 +60,34 @@ describe("decideRework(writer 失败门禁的预算判断)", () => {
     expect(decideRework({ writerAttempts: 2, maxAttempts: 3 }).action).toBe("rework");
     expect(decideRework({ writerAttempts: 3, maxAttempts: 3 }).action).toBe("exhausted");
     expect(decideRework({ writerAttempts: 5, maxAttempts: 3 }).action).toBe("exhausted");
+  });
+});
+
+describe("watchdog 续期(alarm 一次性,不续期就丢兜底)", () => {
+  const nowMs = Date.parse("2026-09-01T00:00:00.000Z");
+  const at = (offsetMs: number, wall: number) => ({
+    created_at: new Date(nowMs + offsetMs).toISOString(),
+    max_wall_seconds: wall,
+  });
+
+  it("deadline = 创建时刻 + 墙钟上限 + 宽限", () => {
+    expect(attemptDeadline(at(0, 600))).toBe(nowMs + (600 + WALL_GRACE_SECONDS) * 1000);
+  });
+
+  it("本次触发无一过期时仍按最早 deadline 续期", () => {
+    const running = [at(0, 600), at(-10_000, 600)];
+    const next = nextWatchdogAlarm({ running, nowMs });
+    expect(next).toBe(attemptDeadline(running[1]));
+  });
+
+  it("deadline 已过但本轮没判过期时,最短 60s 后续期(不自旋也不丢兜底)", () => {
+    const next = nextWatchdogAlarm({ running: [at(-10 * 60_000, 60)], nowMs });
+    expect(next).toBe(nowMs + WATCHDOG_MIN_INTERVAL_MS);
+  });
+
+  it("没有 RUNNING attempt 或任务已终态则停表", () => {
+    expect(nextWatchdogAlarm({ running: [], nowMs })).toBeNull();
+    expect(nextWatchdogAlarm({ running: [at(0, 600)], nowMs, terminal: true })).toBeNull();
   });
 });
 

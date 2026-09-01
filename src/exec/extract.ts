@@ -1,3 +1,5 @@
+import type { ReviewSource, ReviewVerdict } from "../control/gates";
+
 /**
  * 从 qwen-code stream-json transcript 提取 agent 的最终回答。
  *
@@ -66,32 +68,64 @@ export function extractTokensFromTranscript(transcript: string): number {
   return best;
 }
 
-export interface ReviewDecision {
-  decision: "approve" | "reject";
-  reason: string;
+const REVIEW_SOURCES: ReviewSource[] = ["task_prompt", "writer_result", "verify_output", "patch"];
+
+function asStringArray(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const items = value.filter((v): v is string => typeof v === "string" && v.trim().length > 0);
+  return items.length > 0 ? items : undefined;
+}
+
+/** 把任意形状的 LLM 输出收敛成 ReviewVerdict;decision 不合法即 none。 */
+function toVerdict(parsed: Record<string, unknown>): ReviewVerdict {
+  const decision = parsed.decision === "approve" || parsed.decision === "reject" ? parsed.decision : "none";
+  const criteria = Array.isArray(parsed.failed_criteria)
+    ? parsed.failed_criteria.filter((v): v is number => typeof v === "number" && Number.isInteger(v))
+    : undefined;
+  const evidence = Array.isArray(parsed.evidence)
+    ? (parsed.evidence as Array<Record<string, unknown>>)
+        .filter(
+          (e): e is { source: ReviewSource; quote: string } =>
+            typeof e?.source === "string" &&
+            REVIEW_SOURCES.includes(e.source as ReviewSource) &&
+            typeof e?.quote === "string",
+        )
+        .map((e) => ({ source: e.source, quote: e.quote }))
+    : undefined;
+  return {
+    decision,
+    reason: typeof parsed.reason === "string" ? parsed.reason : "",
+    failed_criteria: criteria && criteria.length > 0 ? criteria : undefined,
+    fix_instructions: asStringArray(parsed.fix_instructions),
+    evidence: evidence && evidence.length > 0 ? evidence : undefined,
+  };
 }
 
 /**
  * 解析 reviewer 的裁决。reviewer 走纯 LLM,输入就是单行 JSON 回答
  * (不是 NDJSON transcript,不能经 extractResultFromTranscript 处理)。
- * 依次尝试:整段 JSON 解析 → 文本中搜索 JSON 片段 → 关键词兜底。
+ * 依次尝试:整段 JSON → 文本里的 JSON 片段 → decision 正则兜底。
+ *
+ * 全部失败时返回 `none` 而非 reject:解析失败是基建问题,不该让任务返工,
+ * 交由人工裁决(fail-closed)。
  */
-export function extractReviewDecision(text: string): ReviewDecision {
+export function parseReviewVerdict(text: string): ReviewVerdict {
   try {
-    const parsed = JSON.parse(text) as { decision?: unknown; reason?: unknown };
-    if (parsed.decision === "approve" || parsed.decision === "reject") {
-      return { decision: parsed.decision, reason: String(parsed.reason ?? "") };
-    }
+    const parsed = JSON.parse(text) as unknown;
+    if (parsed && typeof parsed === "object") return toVerdict(parsed as Record<string, unknown>);
   } catch {
     // fall through to fragment search
   }
-  const m = text.match(/\{"decision"\s*:\s*"(approve|reject)"(?:[^}]*"reason"\s*:\s*"((?:[^"\\]|\\.)*)")?\}/);
-  if (m) {
-    return { decision: m[1] as "approve" | "reject", reason: m[2] ? JSON.parse(`"${m[2]}"`) : "" };
+  const fragment = /\{[\s\S]*\}/.exec(text);
+  if (fragment) {
+    try {
+      const parsed = JSON.parse(fragment[0]) as unknown;
+      if (parsed && typeof parsed === "object") return toVerdict(parsed as Record<string, unknown>);
+    } catch {
+      // fall through to decision regex
+    }
   }
-  const lower = text.toLowerCase();
-  return {
-    decision: lower.includes("approve") && !lower.includes("reject") ? "approve" : "reject",
-    reason: text.slice(0, 500),
-  };
+  const m = /"decision"\s*:\s*"(approve|reject)"/.exec(text);
+  if (m) return { decision: m[1] as "approve" | "reject", reason: text.slice(0, 500) };
+  return { decision: "none", reason: `unparseable_verdict:${text.slice(0, 200)}` };
 }

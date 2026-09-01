@@ -1,7 +1,17 @@
 import { DurableObject } from "cloudflare:workers";
-import type { AttemptParams, Env, TaskSpec, TaskState } from "../types";
+import type { AttemptParams, Env, ReviewEvidenceMode, TaskSpec, TaskState } from "../types";
 import { compositeEvidenceDigest, sha256Hex, type EvidenceManifest, type EvidencePart } from "../audit/evidence";
-import { assertTransition, decideRework } from "./statemachine";
+import { assertTransition, attemptDeadline, decideRework, isLegalTransition, nextWatchdogAlarm } from "./statemachine";
+import {
+  assessReviewRejection,
+  describeVerifyFailure,
+  isNoProgress,
+  MATERIAL_LIMITS,
+  normalizeForMatch,
+  type ReviewMaterial,
+  type ReviewSource,
+  type ReviewVerdict,
+} from "./gates";
 
 /**
  * 每任务一个 TaskSession DO:任务状态机、事件 hash chain、决策、重试策略的
@@ -28,6 +38,21 @@ interface TaskRecord {
   archived: boolean;
   pending_review: boolean;
   pending_verify: boolean;
+  /** 熔断或 reviewer 不可用后置真:自动裁决对该任务失效,终态只能由人工给出 */
+  awaiting_human: boolean;
+  review_evidence_mode: ReviewEvidenceMode;
+  /** 最近一次候选摘要(patch digest 或归一化产出),用于无进展熔断 */
+  last_candidate_digest: string | null;
+  /** 钉住的当前证据:审批绑定、/evidence、血缘核对的唯一口径 */
+  current_evidence: CurrentEvidence | null;
+}
+
+interface CurrentEvidence {
+  writer_attempt_id: string;
+  writer_manifest_key: string;
+  writer_manifest_digest: string;
+  verifier_attempt_id?: string;
+  verifier_manifest_digest?: string;
 }
 
 interface AttemptRecord {
@@ -43,7 +68,11 @@ interface AttemptRecord {
   finished_at: string | null;
   manifest_key: string | null;
   manifest_digest: string | null;
-  review: { decision: "approve" | "reject"; reason: string } | null;
+  verify_context?: { writer_manifest_key: string };
+  instructions?: string[];
+  /** 失败时的错误尾部摘录,返工时随新 attempt 带走 */
+  error_tail: string | null;
+  review: ReviewVerdict | null;
 }
 
 interface DecisionRecord {
@@ -72,6 +101,8 @@ interface SessionData {
   decisions: DecisionRecord[];
   events: EventRecord[];
 }
+
+type ReportArgs = Parameters<TaskSession["reportExecution"]>[0];
 
 const EVENTS_PER_SHARD = 100;
 
@@ -148,7 +179,11 @@ export class TaskSession extends DurableObject<Env> {
 
   // ---- RPC: 任务创建 ----
 
-  async createTask(spec: unknown, taskId: string): Promise<{ task_id: string; spec_digest: string }> {
+  async createTask(
+    spec: unknown,
+    taskId: string,
+    reviewEvidenceMode?: ReviewEvidenceMode,
+  ): Promise<{ task_id: string; spec_digest: string }> {
     return this.ctx.blockConcurrencyWhile(async () => {
       const s = await this.loadAll();
       if (s.task) return { task_id: s.task.id, spec_digest: s.task.spec_digest };
@@ -168,6 +203,11 @@ export class TaskSession extends DurableObject<Env> {
         archived: false,
         pending_review: false,
         pending_verify: false,
+        awaiting_human: false,
+        review_evidence_mode:
+          reviewEvidenceMode ?? (this.env.REJECT_EVIDENCE_MODE === "enforce" ? "enforce" : "shadow"),
+        last_candidate_digest: null,
+        current_evidence: null,
       };
       await this.appendEvent(s, "task.created", { spec_digest: specDigest });
       await this.saveAll(s);
@@ -184,6 +224,7 @@ export class TaskSession extends DurableObject<Env> {
     max_wall_seconds: number;
     spec?: TaskSpec;
     verify_context?: { writer_manifest_key: string };
+    instructions?: string[];
   }): Promise<{ attempt_id: string; workflow_instance_id: string | null }> {
     return this.ctx.blockConcurrencyWhile(async () => {
       const s = await this.loadAll();
@@ -203,6 +244,7 @@ export class TaskSession extends DurableObject<Env> {
       max_wall_seconds: number;
       spec?: TaskSpec;
       verify_context?: { writer_manifest_key: string };
+      instructions?: string[];
     },
   ): Promise<{ attempt_id: string; workflow_instance_id: string | null }> {
     const existing = s.attempts.find((a) => a.idempotency_key === args.idempotency_key);
@@ -222,6 +264,9 @@ export class TaskSession extends DurableObject<Env> {
       finished_at: null,
       manifest_key: null,
       manifest_digest: null,
+      verify_context: args.verify_context,
+      instructions: args.instructions,
+      error_tail: null,
       review: null,
     };
     s.attempts.push(record);
@@ -253,11 +298,12 @@ export class TaskSession extends DurableObject<Env> {
       model: this.env.DEFAULT_MODEL,
       session_id: this.ctx.id.toString(),
       verify_context: args.verify_context,
+      instructions: args.instructions,
     };
     const instance = await this.env.ATTEMPT_WORKFLOW.create({ id, params });
     record.workflow_instance_id = instance.id;
 
-    await this.ctx.storage.setAlarm(Date.now() + (args.max_wall_seconds + 300) * 1000);
+    await this.ctx.storage.setAlarm(attemptDeadline(record));
     return { attempt_id: id, workflow_instance_id: instance.id };
   }
 
@@ -272,7 +318,8 @@ export class TaskSession extends DurableObject<Env> {
     manifest_digest?: string | null;
     tokens?: number;
     result_text?: string | null;
-    review?: { decision: "approve" | "reject"; reason: string };
+    patch_digest?: string | null;
+    review?: ReviewVerdict;
   }): Promise<{ ok: boolean; ignored?: boolean; error?: string }> {
     return this.ctx.blockConcurrencyWhile(async () => {
       const s = await this.loadAll();
@@ -288,6 +335,9 @@ export class TaskSession extends DurableObject<Env> {
       attempt.tokens_used = args.tokens ?? 0;
       if (args.manifest_key) attempt.manifest_key = args.manifest_key;
       if (args.manifest_digest) attempt.manifest_digest = args.manifest_digest;
+      if (args.exit_code !== 0) {
+        attempt.error_tail = (args.error ?? `exit_code=${args.exit_code}`).slice(0, 1200);
+      }
 
       if (args.exit_code < 0) {
         attempt.state = "BLOCKED";
@@ -305,7 +355,7 @@ export class TaskSession extends DurableObject<Env> {
           await this.archiveWithRetry(s);
         } else if (attempt.role === "verifier") {
           // 验证器基建错误按验证失败处理,进入 rework 闭环
-          await this.onVerifyFailed(s, args.attempt_id, args.error ?? "verifier workflow error");
+          await this.onVerifyFailed(s, args.attempt_id, args.error ?? "verifier workflow error", null);
         }
         await this.saveAll(s);
         return { ok: true };
@@ -330,129 +380,11 @@ export class TaskSession extends DurableObject<Env> {
       });
 
       if (attempt.role === "writer") {
-        // 门禁:writer 失败不得进入审批流,只能 rework 或 BLOCKED
-        if (args.exit_code !== 0) {
-          await this.appendEvent(s, "writer.failed", {
-            attempt_id: args.attempt_id,
-            exit_code: args.exit_code,
-          });
-          await this.scheduleRework(s, {
-            decider: `agent:${args.attempt_id}`,
-            reason: `writer exit_code=${args.exit_code}`,
-            eventKind: "writer.rework_scheduled",
-            onExhausted: async () => {
-              this.setState(s, "BLOCKED");
-              await this.appendEvent(s, "task.transition", {
-                to: "BLOCKED",
-                actor: "system:control",
-                reason: "writer attempts exhausted without success",
-              });
-              await this.archiveWithRetry(s);
-            },
-          });
-          await this.saveAll(s);
-          return { ok: true };
-        }
-
-        if (args.result_text != null) s.task!.result_text = args.result_text;
-        const spec = JSON.parse(s.task!.spec) as TaskSpec;
-        if (spec.repo_url && args.manifest_key) {
-          // repo 任务:候选先经独立验证器重放验证,通过后才派 reviewer
-          if (!s.task!.pending_verify) {
-            s.task!.pending_verify = true;
-            const writerIndex = s.attempts.filter((a) => a.role === "writer").length;
-            const verifyKey = `${s.task!.id}:verify:${writerIndex}`;
-            try {
-              await this.env.REVIEW_QUEUE.send({
-                schema_version: 1,
-                type: "verify-request",
-                task_id: s.task!.id,
-                session_id: this.ctx.id.toString(),
-                spec,
-                writer_manifest_key: args.manifest_key,
-                idempotency_key: verifyKey,
-              });
-              await this.appendEvent(s, "verify.requested", {
-                attempt_id: args.attempt_id,
-                idempotency_key: verifyKey,
-              });
-            } catch (err) {
-              s.task!.pending_verify = false;
-              await this.appendEvent(s, "verify.fanout_failed", {
-                attempt_id: args.attempt_id,
-                error: String(err).slice(0, 200),
-              });
-            }
-          }
-          if (s.task!.pending_verify) {
-            this.setState(s, "VERIFYING");
-            await this.appendEvent(s, "task.transition", {
-              to: "VERIFYING",
-              actor: `agent:${args.attempt_id}`,
-              reason: "writer succeeded, dispatching verifier",
-            });
-          } else {
-            await this.fanoutReview(s, args.attempt_id);
-            this.setState(s, "AWAITING_APPROVAL");
-            await this.appendEvent(s, "task.transition", {
-              to: "AWAITING_APPROVAL",
-              actor: `agent:${args.attempt_id}`,
-              reason: "writer finished (verify fanout degraded)",
-            });
-          }
-        } else {
-          await this.fanoutReview(s, args.attempt_id);
-          this.setState(s, "AWAITING_APPROVAL");
-          await this.appendEvent(s, "task.transition", {
-            to: "AWAITING_APPROVAL",
-            actor: `agent:${args.attempt_id}`,
-            reason: "writer finished",
-          });
-        }
-      }
-
-      if (attempt.role === "verifier") {
-        if (args.exit_code === 0) {
-          await this.appendEvent(s, "verify.completed", { attempt_id: args.attempt_id, passed: true });
-          await this.fanoutReview(s, args.attempt_id, { passed: true, summary: args.result_text ?? "" });
-          this.setState(s, "AWAITING_APPROVAL");
-          await this.appendEvent(s, "task.transition", {
-            to: "AWAITING_APPROVAL",
-            actor: `agent:${args.attempt_id}`,
-            reason: "verification passed",
-          });
-        } else {
-          await this.appendEvent(s, "verify.completed", {
-            attempt_id: args.attempt_id,
-            passed: false,
-            exit_code: args.exit_code,
-          });
-          await this.onVerifyFailed(s, args.attempt_id, `verify exit_code=${args.exit_code}`);
-        }
-      }
-
-      if (attempt.role === "reviewer") {
-        const review = args.review ?? { decision: "reject" as const, reason: "reviewer 未产出结论" };
-        attempt.review = review;
-        await this.appendEvent(s, "review.completed", {
-          attempt_id: args.attempt_id,
-          decision: review.decision,
-          reason: review.reason,
-        });
-        const writer = this.latestWriter(s);
-        if (review.decision === "approve") {
-          const binding = writer
-            ? await this.computeBindingDigest(s, writer, attempt)
-            : attempt.manifest_digest ?? "";
-          await this.finishApproval(s, {
-            attemptId: args.attempt_id,
-            actor: `agent:${args.attempt_id}`,
-            decision: "approve",
-            evidenceDigest: binding,
-          });
-        } else {
-          await this.handleReviewReject(s, args.attempt_id, review.reason);
-        }
+        await this.onWriterReport(s, attempt, args);
+      } else if (attempt.role === "verifier") {
+        await this.onVerifierReport(s, attempt, args);
+      } else if (attempt.role === "reviewer") {
+        await this.onReviewerReport(s, attempt, args);
       }
 
       await this.saveAll(s);
@@ -460,29 +392,246 @@ export class TaskSession extends DurableObject<Env> {
     });
   }
 
-  /** 独立验证失败(或验证器基建错误):走与审查否决相同的 rework 闭环,耗尽则终态。 */
-  private async onVerifyFailed(s: SessionData, verifierAttemptId: string, reason: string): Promise<void> {
+  /** writer 回报:失败走硬门禁返工;成功则钉证据、过无进展熔断,再派 verifier 或 reviewer。 */
+  private async onWriterReport(
+    s: SessionData,
+    attempt: AttemptRecord,
+    args: ReportArgs,
+  ): Promise<void> {
+    // 门禁:writer 失败不得进入审批流,只能 rework 或 BLOCKED。机械事实,无需举证。
+    if (args.exit_code !== 0) {
+      await this.appendEvent(s, "writer.failed", {
+        attempt_id: attempt.id,
+        exit_code: args.exit_code,
+      });
+      await this.scheduleRework(s, {
+        decider: `agent:${attempt.id}`,
+        reason: `writer exit_code=${args.exit_code}`,
+        eventKind: "writer.rework_scheduled",
+        instructions: attempt.error_tail ? [attempt.error_tail] : undefined,
+        onExhausted: async () => {
+          this.setState(s, "BLOCKED");
+          await this.appendEvent(s, "task.transition", {
+            to: "BLOCKED",
+            actor: "system:control",
+            reason: "writer attempts exhausted without success",
+          });
+          await this.archiveWithRetry(s);
+        },
+      });
+      return;
+    }
+
+    if (args.result_text != null) s.task!.result_text = args.result_text;
+    const candidate =
+      args.patch_digest ??
+      (args.result_text != null ? await sha256Hex(normalizeForMatch(args.result_text)) : null);
+
+    await this.pinWriterEvidence(s, attempt, args.manifest_key, args.manifest_digest);
+
+    if (isNoProgress(s.task!.last_candidate_digest, candidate)) {
+      // 两轮候选逐字节相同:自动循环不会再有进展,停下转人工(省一次沙箱 + 一次裁决)
+      await this.appendEvent(s, "gate.no_progress", {
+        attempt_id: attempt.id,
+        candidate_digest: candidate,
+        awaiting: "human",
+      });
+      await this.holdForHuman(s, `agent:${attempt.id}`, "identical candidate: no progress");
+      return;
+    }
+    s.task!.last_candidate_digest = candidate;
+
+    const spec = JSON.parse(s.task!.spec) as TaskSpec;
+    if (spec.repo_url && args.manifest_key) {
+      // repo 任务:候选先经独立验证器重放验证,通过后才派 reviewer
+      if (!s.task!.pending_verify) {
+        s.task!.pending_verify = true;
+        const writerIndex = s.attempts.filter((a) => a.role === "writer").length;
+        const verifyKey = `${s.task!.id}:verify:${writerIndex}`;
+        try {
+          await this.env.REVIEW_QUEUE.send({
+            schema_version: 1,
+            type: "verify-request",
+            task_id: s.task!.id,
+            session_id: this.ctx.id.toString(),
+            spec,
+            writer_manifest_key: args.manifest_key,
+            idempotency_key: verifyKey,
+          });
+          await this.appendEvent(s, "verify.requested", {
+            attempt_id: attempt.id,
+            idempotency_key: verifyKey,
+          });
+        } catch (err) {
+          s.task!.pending_verify = false;
+          await this.appendEvent(s, "verify.fanout_failed", {
+            attempt_id: attempt.id,
+            error: String(err).slice(0, 200),
+          });
+        }
+      }
+      if (s.task!.pending_verify) {
+        this.setState(s, "VERIFYING");
+        await this.appendEvent(s, "task.transition", {
+          to: "VERIFYING",
+          actor: `agent:${attempt.id}`,
+          reason: "writer succeeded, dispatching verifier",
+        });
+      } else {
+        await this.fanoutReview(s, attempt.id);
+        await this.ensureAwaitingApproval(s, `agent:${attempt.id}`, "writer finished (verify fanout degraded)");
+      }
+    } else {
+      await this.fanoutReview(s, attempt.id);
+      await this.ensureAwaitingApproval(s, `agent:${attempt.id}`, "writer finished");
+    }
+  }
+
+  /** verifier 回报:先核对它验的是不是当前候选,再按通过/失败分流。 */
+  private async onVerifierReport(
+    s: SessionData,
+    attempt: AttemptRecord,
+    args: ReportArgs,
+  ): Promise<void> {
+    const pinned = s.task!.current_evidence;
+    if (!pinned || attempt.verify_context?.writer_manifest_key !== pinned.writer_manifest_key) {
+      // 重投/乱序的陈旧验证结论:与被验证的候选不是同一个血缘,不采信
+      await this.appendEvent(s, "evidence.lineage_mismatch", {
+        verifier_attempt_id: attempt.id,
+        verified: attempt.verify_context?.writer_manifest_key ?? null,
+        current: pinned?.writer_manifest_key ?? null,
+      });
+      return;
+    }
+    if (args.manifest_digest) {
+      pinned.verifier_attempt_id = attempt.id;
+      pinned.verifier_manifest_digest = args.manifest_digest;
+      await this.appendEvent(s, "evidence.pinned", {
+        writer_attempt_id: pinned.writer_attempt_id,
+        verifier_attempt_id: attempt.id,
+        verifier_manifest_digest: args.manifest_digest,
+      });
+    }
+
+    if (args.exit_code === 0) {
+      await this.appendEvent(s, "verify.completed", { attempt_id: attempt.id, passed: true });
+      await this.fanoutReview(s, attempt.id, { passed: true, summary: args.result_text ?? "" });
+      await this.ensureAwaitingApproval(s, `agent:${attempt.id}`, "verification passed");
+    } else {
+      await this.appendEvent(s, "verify.completed", {
+        attempt_id: attempt.id,
+        passed: false,
+        exit_code: args.exit_code,
+      });
+      await this.onVerifyFailed(
+        s,
+        attempt.id,
+        `verify exit_code=${args.exit_code}`,
+        describeVerifyFailure(args.result_text),
+      );
+    }
+  }
+
+  /** reviewer 回报:机械结论不归它;它的 reject 要交证据,拿不出就只是附注。 */
+  private async onReviewerReport(
+    s: SessionData,
+    attempt: AttemptRecord,
+    args: ReportArgs,
+  ): Promise<void> {
+    const verdict: ReviewVerdict =
+      args.exit_code !== 0
+        ? { decision: "none", reason: `reviewer_unavailable:${(args.error ?? `exit_code=${args.exit_code}`).slice(0, 300)}` }
+        : (args.review ?? { decision: "none", reason: "reviewer 未产出结论" });
+    attempt.review = verdict;
+
+    if (verdict.decision === "none") {
+      // 模型抖动、HTTP 失败、输出不合规都不是质量结论:不返工也不放行,交人工
+      await this.appendEvent(s, "review.unavailable", {
+        attempt_id: attempt.id,
+        reason: verdict.reason.slice(0, 500),
+      });
+      await this.holdForHuman(s, `agent:${attempt.id}`, "reviewer unavailable");
+      return;
+    }
+
+    await this.appendEvent(s, "review.completed", {
+      attempt_id: attempt.id,
+      decision: verdict.decision,
+      reason: verdict.reason,
+      failed_criteria: verdict.failed_criteria ?? null,
+    });
+
+    if (s.task!.awaiting_human) {
+      await this.appendEvent(s, "review.advisory_ignored_awaiting_human", {
+        attempt_id: attempt.id,
+        decision: verdict.decision,
+      });
+      return;
+    }
+
+    if (verdict.decision === "approve") {
+      await this.finishApproval(s, {
+        attemptId: attempt.id,
+        actor: `agent:${attempt.id}`,
+        decision: "approve",
+        evidenceDigest: await this.computeBindingDigest(s, attempt),
+      });
+      return;
+    }
+
+    const spec = JSON.parse(s.task!.spec) as TaskSpec;
+    const material = (await this.ctx.storage.get<ReviewMaterial>("review_material")) ?? null;
+    const assessment = assessReviewRejection({ acceptance: spec.acceptance, verdict, material });
+    const mode = s.task!.review_evidence_mode;
+    await this.appendEvent(s, "review.reject_assessed", {
+      attempt_id: attempt.id,
+      honored: assessment.honored,
+      reason: assessment.honored ? null : assessment.reason,
+      mode,
+    });
+
+    if (!assessment.honored && mode === "enforce") {
+      // 说不出可核对证据的 reject 不算否决,降级为「通过 + 附注」
+      await this.appendEvent(s, "review.downgraded", {
+        attempt_id: attempt.id,
+        reason: assessment.reason,
+      });
+      await this.finishApproval(s, {
+        attemptId: attempt.id,
+        actor: `agent:${attempt.id}`,
+        decision: "accept_with_notes",
+        evidenceDigest: await this.computeBindingDigest(s, attempt),
+      });
+      return;
+    }
+
+    await this.handleReviewReject(s, attempt.id, verdict.reason, verdict.fix_instructions);
+  }
+
+  /** 独立验证失败(或验证器基建错误):硬门禁,无需举证,直接返工;耗尽则 REJECTED。 */
+  private async onVerifyFailed(
+    s: SessionData,
+    verifierAttemptId: string,
+    reason: string,
+    instructions: string[] | null,
+  ): Promise<void> {
     await this.scheduleRework(s, {
       decider: `agent:${verifierAttemptId}`,
       reason,
       eventKind: "verify.rework_scheduled",
+      instructions: instructions ?? [reason],
       onExhausted: async () => {
-        const writer = this.latestWriter(s);
-        const verifier = s.attempts.find((a) => a.id === verifierAttemptId);
-        const binding = writer
-          ? await this.computeBindingDigest(s, writer, verifier)
-          : verifier?.manifest_digest ?? "";
         await this.finishApproval(s, {
           attemptId: verifierAttemptId,
           actor: `agent:${verifierAttemptId}`,
           decision: "reject",
-          evidenceDigest: binding,
+          evidenceDigest: await this.computeBindingDigest(s),
         });
       },
     });
   }
 
-  /** writer 成功 / 验证通过后派 reviewer(幂等:pending_review)。 */
+  /** writer 成功 / 验证通过后派 reviewer(幂等:pending_review),并留存喂入材料供举证核对。 */
   private async fanoutReview(
     s: SessionData,
     triggerAttemptId: string,
@@ -492,7 +641,15 @@ export class TaskSession extends DurableObject<Env> {
     s.task!.pending_review = true;
     const writerIndex = s.attempts.filter((a) => a.role === "writer").length;
     const reviewKey = `${s.task!.id}:review:${writerIndex}`;
-    const spec = await this.buildReviewSpec(s, s.task!.result_text ?? "", verify);
+    const { spec, material, missing } = await this.buildReviewSpec(s, verify);
+    if (missing.length > 0) {
+      // 材料缺失时 reviewer 无从举证,其 reject 在 enforce 下必然被降级
+      await this.appendEvent(s, "review.material_missing", {
+        attempt_id: triggerAttemptId,
+        missing,
+      });
+    }
+    await this.ctx.storage.put("review_material", material);
     try {
       await this.env.REVIEW_QUEUE.send({
         schema_version: 1,
@@ -505,6 +662,7 @@ export class TaskSession extends DurableObject<Env> {
       await this.appendEvent(s, "review.requested", {
         attempt_id: triggerAttemptId,
         idempotency_key: reviewKey,
+        material_digest: await sha256Hex(JSON.stringify(material)),
       });
     } catch (err) {
       await this.appendEvent(s, "review.fanout_failed", {
@@ -514,70 +672,140 @@ export class TaskSession extends DurableObject<Env> {
     }
   }
 
+  /**
+   * 组装 reviewer 的输入材料。返回的 material 就是**实际喂入的截断原文**:
+   * reviewer 若要以 reject 触发返工,它引用的证据必须能在这些字符串里逐字找到,
+   * 因此材料与控制面核对用的是同一份,不能事后重新拼。
+   */
   private async buildReviewSpec(
     s: SessionData,
-    writerResult: string,
     verify?: { passed: boolean; summary: string },
-  ): Promise<TaskSpec> {
-    const original = (JSON.parse(s.task!.spec) as TaskSpec).prompt;
-    let material = `【原始任务】\n${original}\n\n【agent 产出】\n${writerResult.slice(0, 2000)}\n\n`;
-    if (verify) {
-      material +=
-        `【独立验证结果(在干净沙箱重放候选变更并运行验证命令)】\n` +
-        `${verify.passed ? "通过" : "失败"}\n${verify.summary.slice(0, 1000)}\n\n`;
-      const patchExcerpt = await this.loadPatchExcerpt(s);
-      if (patchExcerpt) material += `【候选变更(diff 摘录)】\n${patchExcerpt}\n\n`;
-    }
-    return {
-      prompt:
-        `你是 review agent。只审查,绝不执行任务:\n` +
-        `- 禁止调用任何工具、禁止网络查询、禁止再次运行任务\n` +
-        `- 只依据下方材料判断是否满足【原始任务】\n` +
-        `- 有【独立验证结果】时,验证失败必须 reject;验证通过仍需核对产出是否切题\n\n` +
-        material +
-        `只输出一行 JSON,不要 markdown、不要解释:{"decision":"approve"|"reject","reason":"一句话理由"}`,
-      worker: "qwen-code",
+  ): Promise<{ spec: TaskSpec; material: ReviewMaterial; missing: ReviewSource[] }> {
+    const taskSpec = JSON.parse(s.task!.spec) as TaskSpec;
+    const taskPrompt = taskSpec.prompt.slice(0, MATERIAL_LIMITS.task_prompt);
+    const writerResult = (s.task!.result_text ?? "").slice(0, MATERIAL_LIMITS.writer_result);
+    const verifyOutput = verify ? verify.summary.slice(0, MATERIAL_LIMITS.verify_output) : null;
+    const { text: patchExcerpt, missing } = await this.loadPatchExcerpt(s);
+
+    const material: ReviewMaterial = {
+      task_prompt: taskPrompt,
+      writer_result: writerResult,
+      verify_output: verifyOutput,
+      patch_excerpt: patchExcerpt,
     };
+    const acceptance = taskSpec.acceptance ?? [];
+    const criteria = acceptance.length
+      ? acceptance.map((c, i) => `${i}. ${c}`).join("\n")
+      : "(任务未声明验收标准)";
+
+    const prompt = [
+      `你是 review agent。只做判断,不执行任务:`,
+      `- 禁止调用任何工具、禁止网络查询、禁止重跑任务`,
+      `- 机械门禁(执行退出码、干净沙箱重放候选、验证命令、超时与预算)已由控制面校验并通过,你不必也不应重复确认`,
+      `- 你的唯一职责:核对【agent 产出】是否切题、是否满足每一条【验收标准】`,
+      ``,
+      `【原始任务】`,
+      taskPrompt,
+      ``,
+      `【验收标准(编号从 0 开始)】`,
+      criteria,
+      ``,
+      `【agent 产出】`,
+      writerResult,
+      ``,
+      ...(verify
+        ? [
+            `【独立验证结果(干净沙箱重放候选 + 运行验证命令)】`,
+            verify.passed ? "通过" : "失败",
+            verifyOutput ?? "",
+            ``,
+          ]
+        : []),
+      ...(patchExcerpt ? [`【候选变更(diff 摘录)】`, patchExcerpt, ``] : []),
+      `只输出一行 JSON,不要 markdown、不要解释:`,
+      `{"decision":"approve"|"reject","reason":"一句话理由","failed_criteria":[验收标准编号],"fix_instructions":["可直接执行的祈使句"],"evidence":[{"source":"task_prompt|writer_result|verify_output|patch","quote":"上方材料里的原文片段(不少于 12 字符;核对时忽略换行与大小写)"}]}`,
+      ``,
+      `reject 的门槛(三条缺一即不成立):指出失败的验收标准编号、给出具体可执行的修复指令、`,
+      `引用上方材料中能找到的原文证据(不改写、不概括)。做不到就不要 reject —— 用 approve 收尾,把保留意见写进 reason,`,
+      `它只会作为附注留档,不会触发返工。`,
+    ].join("\n");
+
+    return { spec: { prompt, worker: "qwen-code" }, material, missing };
   }
 
-  /** 从 writer 最新 manifest 读取候选 patch 摘录,失败静默返回 null。 */
-  private async loadPatchExcerpt(s: SessionData): Promise<string | null> {
-    const writer = this.latestWriter(s);
-    if (!writer?.manifest_key) return null;
+  /** 从钉住的 writer manifest 读取候选 patch 摘录;取不到但要如实报告缺失。 */
+  private async loadPatchExcerpt(
+    s: SessionData,
+  ): Promise<{ text: string | null; missing: ReviewSource[] }> {
+    const key = s.task!.current_evidence?.writer_manifest_key;
+    if (!key) return { text: null, missing: [] };
     try {
-      const obj = await this.env.EVIDENCE.get(writer.manifest_key);
-      if (!obj) return null;
+      const obj = await this.env.EVIDENCE.get(key);
+      if (!obj) return { text: null, missing: ["patch"] };
       const manifest = (await obj.json()) as EvidenceManifest;
-      if (!manifest.patch) return null;
+      if (!manifest.patch) return { text: null, missing: [] };
       const patch = await this.env.ARTIFACTS.get(manifest.patch.key);
-      if (!patch) return null;
-      return (await patch.text()).slice(0, 4000);
+      if (!patch) return { text: null, missing: ["patch"] };
+      return { text: (await patch.text()).slice(0, MATERIAL_LIMITS.patch), missing: [] };
     } catch {
-      return null;
+      return { text: null, missing: ["patch"] };
     }
   }
 
-  private latestWriter(s: SessionData): AttemptRecord | undefined {
-    return s.attempts
-      .filter((a) => a.role === "writer")
-      .sort((a, b) => a.created_at.localeCompare(b.created_at))
-      .pop();
+  /** 钉住 writer 候选证据:此后 /evidence、审批绑定、血缘核对都以它为准。 */
+  private async pinWriterEvidence(
+    s: SessionData,
+    attempt: AttemptRecord,
+    manifestKey?: string | null,
+    manifestDigest?: string | null,
+  ): Promise<void> {
+    if (!manifestKey || !manifestDigest) return;
+    s.task!.current_evidence = {
+      writer_attempt_id: attempt.id,
+      writer_manifest_key: manifestKey,
+      writer_manifest_digest: manifestDigest,
+    };
+    await this.appendEvent(s, "evidence.pinned", {
+      writer_attempt_id: attempt.id,
+      writer_manifest_digest: manifestDigest,
+    });
+  }
+
+  /** 收敛到"可被裁决"状态;已在 AWAITING_APPROVAL 则不动。 */
+  private async ensureAwaitingApproval(s: SessionData, actor: string, reason: string): Promise<void> {
+    if (s.task!.state === "AWAITING_APPROVAL") return;
+    // 不可收敛时保持原状态而非抛出:这条路径是 fail-closed 的安全网,
+    // 抛错会让整个回报 RPC 失败、消息进 DLQ,任务反而无人知晓。
+    if (!isLegalTransition(s.task!.state, "AWAITING_APPROVAL")) return;
+    this.setState(s, "AWAITING_APPROVAL");
+    await this.appendEvent(s, "task.transition", { to: "AWAITING_APPROVAL", actor, reason });
+  }
+
+  /** 自动裁决失效(熔断或 reviewer 不可用):不再派工,终态只能由人工给出。 */
+  private async holdForHuman(s: SessionData, actor: string, reason: string): Promise<void> {
+    s.task!.awaiting_human = true;
+    s.task!.pending_review = false;
+    s.task!.pending_verify = false;
+    await this.ensureAwaitingApproval(s, actor, reason);
   }
 
   /**
-   * 决策绑定的组合证据:因果链上的 [writer 候选, verifier 验证?, 裁决者?]。
-   * 人工审批校验 [writer, verifier?] 组合;自动裁决附裁决者自身证据。
+   * 决策绑定的组合证据:钉住的 [writer 候选, verifier 验证?, 裁决者?]。
+   * 一律读 current_evidence —— /evidence、人工审批、自动裁决三处同口径,
+   * 否则人从接口拿到的 digest 会与 DO 重算值不一致而永久 409。
    */
-  private async computeBindingDigest(s: SessionData, writer: AttemptRecord, decider?: AttemptRecord): Promise<string> {
+  private async computeBindingDigest(s: SessionData, decider?: AttemptRecord): Promise<string> {
     const parts: EvidencePart[] = [];
-    if (writer.manifest_digest) {
-      parts.push({ role: "writer", attempt_id: writer.id, digest: writer.manifest_digest });
-    }
-    const verifier = s.attempts
-      .filter((a) => a.role === "verifier" && a.manifest_digest && a.created_at >= writer.created_at)
-      .pop();
-    if (verifier) {
-      parts.push({ role: "verifier", attempt_id: verifier.id, digest: verifier.manifest_digest! });
+    const ev = s.task!.current_evidence;
+    if (ev) {
+      parts.push({ role: "writer", attempt_id: ev.writer_attempt_id, digest: ev.writer_manifest_digest });
+      if (ev.verifier_attempt_id && ev.verifier_manifest_digest) {
+        parts.push({
+          role: "verifier",
+          attempt_id: ev.verifier_attempt_id,
+          digest: ev.verifier_manifest_digest,
+        });
+      }
     }
     if (decider && decider.role === "reviewer" && decider.manifest_digest) {
       parts.push({ role: "reviewer", attempt_id: decider.id, digest: decider.manifest_digest });
@@ -585,10 +813,16 @@ export class TaskSession extends DurableObject<Env> {
     return compositeEvidenceDigest(parts);
   }
 
-  /** 有限返工:预算内起下一个 writer;耗尽走 onExhausted(reviewer/verifier 否决→REJECTED,writer 失败→BLOCKED)。 */
+  /** 有限返工:预算内起下一个 writer(带走修复指令);耗尽走 onExhausted。 */
   private async scheduleRework(
     s: SessionData,
-    args: { decider: string; reason: string; eventKind: string; onExhausted: () => Promise<void> },
+    args: {
+      decider: string;
+      reason: string;
+      eventKind: string;
+      instructions?: string[];
+      onExhausted: () => Promise<void>;
+    },
   ): Promise<void> {
     const writerAttempts = s.attempts.filter((a) => a.role === "writer");
     const maxAttempts = Number(this.env.DEFAULT_MAX_ATTEMPTS ?? "3");
@@ -599,35 +833,43 @@ export class TaskSession extends DurableObject<Env> {
     await this.notifyWriter(s, "reject", args.decider);
     s.task!.pending_review = false;
     s.task!.pending_verify = false;
+    // 新 attempt = 新容器 + 空工作区:不带上轮失败证据,它就会把已排除的弯路再走一遍
     await this.startAttemptInternal(s, {
       role: "writer",
       idempotency_key: `${s.task!.id}:attempt:${writerAttempts.length + 1}`,
       max_model_tokens: Number(this.env.DEFAULT_MAX_MODEL_TOKENS),
       max_wall_seconds: Number(this.env.DEFAULT_MAX_WALL_SECONDS),
+      instructions: args.instructions,
     });
     await this.appendEvent(s, args.eventKind, {
       decider: args.decider,
       reason: args.reason.slice(0, 500),
+      instructions: args.instructions?.map((i) => i.slice(0, 300)) ?? null,
       attempt_number: writerAttempts.length + 1,
     });
   }
 
-  private async handleReviewReject(s: SessionData, reviewerAttemptId: string, reason: string): Promise<void> {
+  /** reviewer 的 reject 成立后的返工路径(是否成立已由 onReviewerReport 判定)。 */
+  private async handleReviewReject(
+    s: SessionData,
+    reviewerAttemptId: string,
+    reason: string,
+    fixInstructions?: string[],
+  ): Promise<void> {
     await this.scheduleRework(s, {
       decider: `agent:${reviewerAttemptId}`,
       reason,
       eventKind: "review.retry_scheduled",
+      instructions: fixInstructions?.length ? fixInstructions : [reason],
       onExhausted: async () => {
-        const writer = this.latestWriter(s);
-        const reviewer = s.attempts.find((a) => a.id === reviewerAttemptId);
-        const binding = writer
-          ? await this.computeBindingDigest(s, writer, reviewer)
-          : reviewer?.manifest_digest ?? "";
         await this.finishApproval(s, {
           attemptId: reviewerAttemptId,
           actor: `agent:${reviewerAttemptId}`,
           decision: "reject",
-          evidenceDigest: binding,
+          evidenceDigest: await this.computeBindingDigest(
+            s,
+            s.attempts.find((a) => a.id === reviewerAttemptId),
+          ),
         });
       },
     });
@@ -647,17 +889,21 @@ export class TaskSession extends DurableObject<Env> {
       if (!args.attempt_id || !args.evidence_digest) {
         return { ok: false, error: "evidence_required", state: s.task.state };
       }
-      const attempt = s.attempts.find((a) => a.id === args.attempt_id);
-      if (!attempt) return { ok: false, error: "unknown_attempt" };
-      if (attempt.role !== "writer") return { ok: false, error: "attempt_not_writer" };
-      if (!attempt.manifest_digest) return { ok: false, error: "evidence_missing", state: s.task.state };
-      const binding = await this.computeBindingDigest(s, attempt);
-      if (args.evidence_digest !== binding) return { ok: false, error: "evidence_mismatch" };
+      const ev = s.task.current_evidence;
+      if (!ev) return { ok: false, error: "evidence_missing", state: s.task.state };
+      // 只认钉住的那一版候选:对旧 attempt 的审批不能裁决当前候选
+      if (args.attempt_id !== ev.writer_attempt_id) {
+        return { ok: false, error: "attempt_not_current_writer", state: s.task.state };
+      }
+      const binding = await this.computeBindingDigest(s);
+      if (args.evidence_digest !== binding) {
+        return { ok: false, error: "evidence_mismatch", state: s.task.state };
+      }
       if (s.task.state !== "AWAITING_APPROVAL") {
         return { ok: false, error: "task_not_awaiting", state: s.task.state };
       }
       await this.finishApproval(s, {
-        attemptId: attempt.id,
+        attemptId: ev.writer_attempt_id,
         actor: args.actor,
         decision: args.decision,
         evidenceDigest: binding,
@@ -670,7 +916,12 @@ export class TaskSession extends DurableObject<Env> {
   /** 终态收敛:记录 decision → 状态转换 → 唤醒 writer → 清 alarm → 归档 D1。 */
   private async finishApproval(
     s: SessionData,
-    args: { attemptId: string | null; actor: string; decision: "approve" | "reject"; evidenceDigest: string },
+    args: {
+      attemptId: string | null;
+      actor: string;
+      decision: "approve" | "reject" | "accept_with_notes";
+      evidenceDigest: string;
+    },
   ): Promise<void> {
     s.decisions.push({
       id: crypto.randomUUID(),
@@ -687,7 +938,8 @@ export class TaskSession extends DurableObject<Env> {
       evidence_digest: args.evidenceDigest,
       fencing_token: s.task!.version,
     });
-    this.setState(s, args.decision === "approve" ? "DONE" : "REJECTED");
+    // accept_with_notes = reject 举证不成立时降级放行,意见留在事件链而不触发返工
+    this.setState(s, args.decision === "reject" ? "REJECTED" : "DONE");
     await this.appendEvent(s, "task.transition", {
       to: s.task!.state,
       actor: args.actor,
@@ -718,8 +970,14 @@ export class TaskSession extends DurableObject<Env> {
         type: "approval",
         payload: { decision, actor, task_id: s.task!.id },
       });
-    } catch {
-      // workflow 已不存在时静默:人工兜底由归档状态可见
+    } catch (err) {
+      // 事件丢了 writer 只会挂到 24h 超时才结束:必须留下可归因的记录,而不是静默
+      await this.appendEvent(s, "workflow.notify_failed", {
+        attempt_id: last.id,
+        workflow_instance_id: last.workflow_instance_id,
+        decision,
+        error: String(err).slice(0, 200),
+      });
     }
   }
 
@@ -759,24 +1017,49 @@ export class TaskSession extends DurableObject<Env> {
     return { found: true, result_text: s.task.result_text };
   }
 
-  async getManifestKey(attemptId?: string): Promise<{
+  /**
+   * GET /evidence:审批绑定的取数入口。一律读钉住的 current_evidence,
+   * 与 submitDecision 重算的组合 digest 同口径 —— 两处口径不同会让人工
+   * 拿着接口返回的 digest 永久 409。
+   */
+  async getEvidenceSummary(): Promise<{
     found: boolean;
     key: string | null;
     digest: string | null;
     binding_digest: string | null;
+    writer_attempt_id: string | null;
+    verifier_attempt_id: string | null;
+    awaiting_human: boolean;
   }> {
     const s = await this.loadAll();
-    if (!s.task) return { found: false, key: null, digest: null, binding_digest: null };
-    const candidates = s.attempts
-      .filter((a) => a.manifest_key && (!attemptId || a.id === attemptId))
-      .sort((a, b) => b.created_at.localeCompare(a.created_at));
-    const writer = this.latestWriter(s);
+    if (!s.task) {
+      return {
+        found: false,
+        key: null,
+        digest: null,
+        binding_digest: null,
+        writer_attempt_id: null,
+        verifier_attempt_id: null,
+        awaiting_human: false,
+      };
+    }
+    const ev = s.task.current_evidence;
     return {
       found: true,
-      key: candidates[0]?.manifest_key ?? null,
-      digest: candidates[0]?.manifest_digest ?? null,
-      binding_digest: writer ? await this.computeBindingDigest(s, writer) : null,
+      key: ev?.writer_manifest_key ?? null,
+      digest: ev?.writer_manifest_digest ?? null,
+      binding_digest: ev ? await this.computeBindingDigest(s) : null,
+      writer_attempt_id: ev?.writer_attempt_id ?? null,
+      verifier_attempt_id: ev?.verifier_attempt_id ?? null,
+      awaiting_human: s.task.awaiting_human,
     };
+  }
+
+  /** GET /attempts/:id/transcript:该 attempt 自己的 manifest,不参与证据钉住。 */
+  async getAttemptManifestKey(attemptId: string): Promise<{ found: boolean; key: string | null }> {
+    const s = await this.loadAll();
+    if (!s.task) return { found: false, key: null };
+    return { found: true, key: s.attempts.find((a) => a.id === attemptId)?.manifest_key ?? null };
   }
 
   // ---- 终态归档:D1 一次性写入(幂等,可重放重建) ----
@@ -834,53 +1117,70 @@ export class TaskSession extends DurableObject<Env> {
   // ---- alarm:归档重试 + attempt 超时兜底 ----
 
   async alarm(): Promise<void> {
-    const s = await this.loadAll();
-    if (!s.task) return;
+    // alarm 与 RPC 并发:不复用同一临界区,陈旧快照可能把已裁决的任务改写成
+    // BLOCKED,并把陈旧行覆盖回 D1 归档。
+    return this.ctx.blockConcurrencyWhile(async () => {
+      const s = await this.loadAll();
+      if (!s.task) return;
 
-    if (
-      !s.task.archived &&
-      (s.task.state === "DONE" || s.task.state === "REJECTED" || s.task.state === "BLOCKED")
-    ) {
-      try {
-        await this.archive(s);
-      } catch {
-        await this.ctx.storage.setAlarm(Date.now() + 30_000);
-      }
-      await this.saveAll(s);
-      return;
-    }
-
-    const nowMs = Date.now();
-    let changed = false;
-    for (const a of s.attempts) {
-      if (a.state === "RUNNING" && nowMs - Date.parse(a.created_at) > (a.max_wall_seconds + 300) * 1000) {
-        a.state = "BLOCKED";
-        a.finished_at = this.now();
-        changed = true;
-        await this.appendEvent(s, "attempt.blocked", {
-          attempt_id: a.id,
-          reason: "alarm: wall time exceeded",
-        });
-      }
-    }
-    if (changed) {
-      const stillRunning = s.attempts.some((a) => a.state === "RUNNING");
-      if (!stillRunning && (s.task.state === "RUNNING" || s.task.state === "VERIFYING" || s.task.state === "AWAITING_APPROVAL")) {
-        this.setState(s, "BLOCKED");
-        await this.appendEvent(s, "task.transition", {
-          to: "BLOCKED",
-          actor: "system:alarm",
-          reason: "all attempts blocked",
-        });
+      if (
+        !s.task.archived &&
+        (s.task.state === "DONE" || s.task.state === "REJECTED" || s.task.state === "BLOCKED")
+      ) {
         try {
           await this.archive(s);
         } catch {
           await this.ctx.storage.setAlarm(Date.now() + 30_000);
         }
-      } else if (stillRunning) {
-        await this.ctx.storage.setAlarm(nowMs + 60_000);
+        await this.saveAll(s);
+        return;
       }
-    }
-    await this.saveAll(s);
+
+      const nowMs = Date.now();
+      let changed = false;
+      for (const a of s.attempts) {
+        if (a.state === "RUNNING" && nowMs > attemptDeadline(a)) {
+          a.state = "BLOCKED";
+          a.finished_at = this.now();
+          changed = true;
+          await this.appendEvent(s, "attempt.blocked", {
+            attempt_id: a.id,
+            reason: "alarm: wall time exceeded",
+          });
+        }
+      }
+      if (changed) {
+        const stillRunning = s.attempts.some((a) => a.state === "RUNNING");
+        if (!stillRunning && (s.task.state === "RUNNING" || s.task.state === "VERIFYING" || s.task.state === "AWAITING_APPROVAL")) {
+          this.setState(s, "BLOCKED");
+          await this.appendEvent(s, "task.transition", {
+            to: "BLOCKED",
+            actor: "system:alarm",
+            reason: "all attempts blocked",
+          });
+          try {
+            await this.archive(s);
+          } catch {
+            await this.ctx.storage.setAlarm(Date.now() + 30_000);
+          }
+        }
+        // 只有真的改了状态才回写:提前触发(无人过期)时不写,避免与并发 RPC 互踩快照
+        await this.saveAll(s);
+      }
+
+      // alarm 是一次性的:本次触发没有任何 attempt 过期时也必须续期,
+      // 否则超时兜底就此静默消失,任务会永远挂着。
+      const terminal =
+        s.task.archived ||
+        s.task.state === "DONE" ||
+        s.task.state === "REJECTED" ||
+        s.task.state === "BLOCKED";
+      const next = nextWatchdogAlarm({
+        running: s.attempts.filter((a) => a.state === "RUNNING"),
+        nowMs,
+        terminal,
+      });
+      if (next != null) await this.ctx.storage.setAlarm(next);
+    });
   }
 }

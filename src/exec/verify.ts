@@ -76,5 +76,5 @@ export async function runVerifyAttempt(
   const reportText = JSON.stringify(report, null, 2);
   const transcript = await putArtifact(env.ARTIFACTS, reportText, `attempts/${args.attemptId}`);
   const stderrRef: ArtifactRef = await putArtifact(env.ARTIFACTS, "", `attempts/${args.attemptId}`);
-  return { exitCode, transcript, transcriptRaw: reportText, stderr: stderrRef };
+  return { exitCode, transcript, stderr: stderrRef };
 }

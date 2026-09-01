@@ -11,7 +11,8 @@
     "DEFAULT_MODEL": "test-model",
     "DEFAULT_MAX_MODEL_TOKENS": "100000",
     "DEFAULT_MAX_WALL_SECONDS": "600",
-    "DEFAULT_MAX_ATTEMPTS": "3"
+    "DEFAULT_MAX_ATTEMPTS": "3",
+    "REJECT_EVIDENCE_MODE": "shadow"
   },
   "d1_databases": [
     {

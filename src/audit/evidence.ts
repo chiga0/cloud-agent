@@ -34,7 +34,6 @@ export interface EvidenceManifest {
   model: string;
   transcript: ArtifactRef;
   artifacts: ArtifactRef[];
-  verify?: ArtifactRef;
   /** writer 导出的候选变更 patch(repo 任务),供独立验证器重放 */
   patch?: ArtifactRef;
   model_calls_digest?: string;

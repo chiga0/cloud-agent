@@ -11,7 +11,8 @@
     "DEFAULT_MODEL": "qwen3.8-flash",
     "DEFAULT_MAX_MODEL_TOKENS": "5000000",
     "DEFAULT_MAX_WALL_SECONDS": "3600",
-    "DEFAULT_MAX_ATTEMPTS": "3"
+    "DEFAULT_MAX_ATTEMPTS": "3",
+    "REJECT_EVIDENCE_MODE": "shadow"
   },
   "d1_databases": [
     {
@@ -51,7 +52,7 @@
   "containers": [
     {
       "class_name": "Sandbox",
-      "image": "docker.io/cloudflare/sandbox:0.8.14",
+      "image": "registry.cloudflare.com/34817bdd8eefd771f3c7ee9ef6f1a5f0/cloud-agent-sandbox:qwen-0.21.10",
       "max_instances": 50,
       "instance_type": "standard-2"
     }

@@ -4,7 +4,5 @@ FROM docker.io/cloudflare/sandbox:0.8.14
 
 ARG QWEN_CODE_VERSION=0.21.10
 
-RUN curl -fsSL https://bun.sh/install | bash
-ENV PATH="/root/.bun/bin:${PATH}"
-RUN bun add -g @qwen-code/qwen-code@${QWEN_CODE_VERSION} \
+RUN npm install -g --no-audit --no-fund @qwen-code/qwen-code@${QWEN_CODE_VERSION} \
   && qwen --version

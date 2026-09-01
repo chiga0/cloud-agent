@@ -5,9 +5,7 @@ import { putArtifact, type ArtifactRef } from "../audit/evidence";
 export interface SandboxRunResult {
   exitCode: number;
   transcript: ArtifactRef;
-  transcriptRaw: string;
   stderr: ArtifactRef;
-  verify?: ArtifactRef;
   patch?: ArtifactRef;
 }
 
@@ -50,11 +48,6 @@ export async function runQwenCodeAttempt(
     baseSha = base.stdout.trim() || null;
   }
 
-  // 官方镜像未预装 qwen-code;Docker 可用后构建 sandbox/Dockerfile 预装镜像可跳过此步
-  await sandbox.exec(
-    "command -v qwen >/dev/null 2>&1 || npm install -g @qwen-code/qwen-code@0.21.10",
-  );
-
   await sandbox.writeFile("/workspace/task.txt", args.prompt);
   const workdir = args.repoUrl ? "/workspace/repo" : "/workspace";
   // --yolo:沙箱已是隔离边界,内部 permission 检查会挡住 shell/write,放行即可。
@@ -95,5 +88,5 @@ export async function runQwenCodeAttempt(
     patch = await putArtifact(env.ARTIFACTS, file.content, `attempts/${args.attemptId}`);
   }
 
-  return { exitCode, transcript, transcriptRaw: run.stdout, stderr, patch };
+  return { exitCode, transcript, stderr, patch };
 }

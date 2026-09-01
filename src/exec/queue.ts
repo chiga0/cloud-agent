@@ -1,4 +1,5 @@
 import type { Env, TaskSpec } from "../types";
+import type { ReviewVerdict } from "../control/gates";
 import { TaskSession } from "../control/session";
 
 interface ReviewMessage {
@@ -33,7 +34,9 @@ export interface ReportMessage {
   manifest_digest?: string | null;
   tokens?: number;
   result_text?: string | null;
-  review?: { decision: "approve" | "reject"; reason: string };
+  /** writer 导出的候选 patch 摘要(非 repo 任务为空),无进展熔断的比较基准 */
+  patch_digest?: string | null;
+  review?: ReviewVerdict;
 }
 
 /**
@@ -89,6 +92,7 @@ export async function handleQueue(
           manifest_digest: body.manifest_digest ?? null,
           tokens: body.tokens ?? 0,
           result_text: body.result_text ?? null,
+          patch_digest: body.patch_digest ?? null,
           review: body.review,
         });
         // reportExecution 幂等且自身不抛错;只有 DO 不可达等异常才 retry

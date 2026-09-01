@@ -23,11 +23,11 @@ export async function runReviewLLM(
   const body = {
     model: args.model,
     messages: [
-      { role: "system", content: "你只输出严格一行 JSON,不输出任何其他内容。" },
+      { role: "system", content: "严格按 user 消息给出的 JSON schema 输出一行 JSON,不输出任何其他内容、不输出 markdown。" },
       { role: "user", content: args.prompt },
     ],
     temperature: 0,
-    max_tokens: 512,
+    max_tokens: 1200,
   };
 
   let resp: Response;

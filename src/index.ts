@@ -57,9 +57,8 @@ function landingHtml(env: Env): string {
       <dt>GET /tasks/:id</dt><dd>查询任务、attempts 与事件链(需鉴权)</dd>
       <dt>GET /tasks/:id/result</dt><dd>读取 agent 最终答案(纯文本,需鉴权)</dd>
       <dt>POST /tasks/:id/approve</dt><dd>审批(必须带 attempt_id + evidence_digest,需鉴权)</dd>
-      <dt>GET /tasks/:id/evidence</dt><dd>最新 attempt 的 evidence manifest + binding_digest(需鉴权)</dd>
-      <dt>GET /tasks/:id/attempts/:aid/transcript</dt><dd>attempt 的 transcript 原文(需鉴权)</dd>
-      <dt>GET /tasks/:id/attempts/:aid/verify</dt><dd>attempt 的 verify 输出(需鉴权)</dd>
+      <dt>GET /tasks/:id/evidence</dt><dd>钉住的候选 manifest + approve 所需 attempt_id / binding_digest(需鉴权)</dd>
+      <dt>GET /tasks/:id/attempts/:aid/transcript</dt><dd>attempt 的 transcript 原文(verifier 为 JSON 验证报告,需鉴权)</dd>
       <dt>GET /admin/chain-check</dt><dd>校验 D1 归档的事件 hash chain(需鉴权)</dd>
     </dl>
   </div>
@@ -69,7 +68,8 @@ function landingHtml(env: Env): string {
     <pre style="overflow:auto"><code>curl -X POST ${base}/tasks \\
   -H "Authorization: Bearer $WORKER_API_TOKEN" \\
   -H "Content-Type: application/json" \\
-  -d '{"spec":{"prompt":"在 /workspace 写一个 hello.py 并运行"}}'</code></pre>
+  -d '{"spec":{"prompt":"在 /workspace 写一个 hello.py 并运行","acceptance":["存在 hello.py","运行输出 hello"]}}'</code></pre>
+    <div class="sub" style="margin:12px 0 0">acceptance 决定 reviewer 的否决权:没有验收标准时,它的 reject 只作为附注留档。</div>
   </div>
 </main>
 </body>
@@ -81,19 +81,44 @@ function checkApiToken(req: Request, env: Env): boolean {
   return !!env.WORKER_API_TOKEN && token === env.WORKER_API_TOKEN;
 }
 
+/**
+ * acceptance 是 reviewer 的 reject 能否成立的前提(没有它,任何否决都只是附注),
+ * 因此在入口处校验形状。上限与 gates.ts 的判定口径一致。
+ */
+function validateAcceptance(acceptance: unknown): string | null {
+  if (acceptance == null) return null;
+  if (!Array.isArray(acceptance)) return "acceptance must be an array of strings";
+  if (acceptance.length > 8) return "acceptance supports at most 8 criteria";
+  for (const c of acceptance) {
+    if (typeof c !== "string") return "each acceptance criterion must be a string";
+    const len = c.trim().length;
+    if (len < 3 || len > 500) return "each acceptance criterion must be 3–500 characters";
+  }
+  return null;
+}
+
 async function handleCreateTask(req: Request, env: Env): Promise<Response> {
   const body = (await req.json()) as {
     spec: TaskSpec;
     model?: string;
     budget?: { max_model_tokens?: number; max_wall_seconds?: number };
+    review_evidence_mode?: string;
   };
   if (!body?.spec?.prompt) {
     return Response.json({ error: { type: "invalid_spec", detail: "spec.prompt required" } }, { status: 400 });
   }
+  const acceptanceError = validateAcceptance(body.spec.acceptance);
+  if (acceptanceError) {
+    return Response.json({ error: { type: "invalid_acceptance", detail: acceptanceError } }, { status: 400 });
+  }
+  const mode =
+    body.review_evidence_mode === "enforce" || body.review_evidence_mode === "shadow"
+      ? body.review_evidence_mode
+      : undefined;
 
   const taskId = crypto.randomUUID();
   const session = TaskSession.from(env, taskId);
-  await session.createTask(body.spec, taskId);
+  await session.createTask(body.spec, taskId, mode);
   const attempt = await session.startAttempt({
     role: "writer",
     idempotency_key: `${taskId}:attempt:1`,
@@ -126,7 +151,7 @@ async function handleGetResult(env: Env, taskId: string): Promise<Response> {
 }
 
 async function handleGetEvidence(env: Env, taskId: string): Promise<Response> {
-  const res = await TaskSession.from(env, taskId).getManifestKey();
+  const res = await TaskSession.from(env, taskId).getEvidenceSummary();
   if (!res.found) return Response.json({ error: { type: "not_found" } }, { status: 404 });
   if (!res.key) {
     return Response.json({ error: { type: "no_evidence_yet" } }, { status: 404 });
@@ -136,16 +161,22 @@ async function handleGetEvidence(env: Env, taskId: string): Promise<Response> {
     return Response.json({ error: { type: "evidence_missing", detail: res.key } }, { status: 404 });
   }
   const manifest = (await obj.json()) as EvidenceManifest;
-  return Response.json({ digest: res.digest, binding_digest: res.binding_digest, manifest });
+  return Response.json({
+    attempt_id: res.writer_attempt_id,
+    verifier_attempt_id: res.verifier_attempt_id,
+    awaiting_human: res.awaiting_human,
+    digest: res.digest,
+    binding_digest: res.binding_digest,
+    manifest,
+  });
 }
 
-async function handleGetAttemptArtifact(
+async function handleGetAttemptTranscript(
   env: Env,
   taskId: string,
   attemptId: string,
-  which: "transcript" | "verify",
 ): Promise<Response> {
-  const res = await TaskSession.from(env, taskId).getManifestKey(attemptId);
+  const res = await TaskSession.from(env, taskId).getAttemptManifestKey(attemptId);
   if (!res.found) return Response.json({ error: { type: "not_found" } }, { status: 404 });
   if (!res.key) {
     return Response.json({ error: { type: "no_evidence_yet" } }, { status: 404 });
@@ -155,16 +186,9 @@ async function handleGetAttemptArtifact(
     return Response.json({ error: { type: "evidence_missing", detail: res.key } }, { status: 404 });
   }
   const manifest = (await manifestObj.json()) as EvidenceManifest;
-  const ref = which === "transcript" ? manifest.transcript : manifest.verify;
-  if (!ref) {
-    return Response.json(
-      { error: { type: "no_verify_artifact", detail: "verify_command 未配置或未执行" } },
-      { status: 404 },
-    );
-  }
-  const artifact = await env.ARTIFACTS.get(ref.key);
+  const artifact = await env.ARTIFACTS.get(manifest.transcript.key);
   if (!artifact) {
-    return Response.json({ error: { type: "artifact_missing", detail: ref.key } }, { status: 404 });
+    return Response.json({ error: { type: "artifact_missing", detail: manifest.transcript.key } }, { status: 404 });
   }
   return new Response(artifact.body, {
     headers: { "content-type": "text/plain; charset=utf-8" },
@@ -265,16 +289,9 @@ export default {
     }
 
     const attemptMatch =
-      /^\/tasks\/([0-9a-f-]{36})\/attempts\/([0-9a-f-]{36})\/(transcript|verify)$/.exec(
-        url.pathname,
-      );
+      /^\/tasks\/([0-9a-f-]{36})\/attempts\/([0-9a-f-]{36})\/transcript$/.exec(url.pathname);
     if (attemptMatch && req.method === "GET") {
-      return handleGetAttemptArtifact(
-        env,
-        attemptMatch[1],
-        attemptMatch[2],
-        attemptMatch[3] as "transcript" | "verify",
-      );
+      return handleGetAttemptTranscript(env, attemptMatch[1], attemptMatch[2]);
     }
 
     return Response.json({ error: { type: "not_found" } }, { status: 404 });
