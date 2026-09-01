@@ -156,9 +156,14 @@ export interface SandboxGit extends SandboxExec {
  * 目录),再次 `gitCheckout` 必败于 "already exists",重试机制就此失效
  * (prod 实测:首次 clone 撞 SDK 600s 超时,后续两次重试全死在此错上)。
  * 先清空目标目录,让每次重试都从干净状态开始。
+ *
+ * 清理前先把会话 cwd 挪到根目录再删:沙箱的 `exec()` 复用常驻 shell 会话,
+ * 上一轮执行可能已把 cwd 停进这个目录(如 writer 的 `cd /workspace/repo &&
+ * qwen`);目录本体被删后,同一会话里再 spawn 的进程(包括紧接着的克隆)会死于
+ * "Unable to read current working directory"(prod 实测,两次重试全灭)。
  */
 export async function checkoutRepo(sandbox: SandboxGit, repoUrl: string): Promise<void> {
-  await sandbox.exec(`rm -rf ${REPO_DIR}`);
+  await sandbox.exec(`cd / && rm -rf ${REPO_DIR}`);
   await sandbox.gitCheckout(repoUrl, { targetDir: REPO_DIR, depth: 1 });
 }
 

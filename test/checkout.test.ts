@@ -28,11 +28,11 @@ function fakeSandbox() {
 }
 
 describe("checkoutRepo", () => {
-  it("先清空目标目录再克隆:重试复用容器时,残留目录不得让克隆失败", async () => {
+  it("先把会话 cwd 挪到根目录再清空目标目录:重试复用容器时,残留目录与死 cwd 都不得让克隆失败", async () => {
     const sb = fakeSandbox();
     await checkoutRepo(sb, "https://github.com/example/repo");
     expect(sb.calls).toEqual([
-      { kind: "exec", arg: `rm -rf ${REPO_DIR}` },
+      { kind: "exec", arg: `cd / && rm -rf ${REPO_DIR}` },
       { kind: "gitCheckout", arg: "https://github.com/example/repo", options: { targetDir: REPO_DIR, depth: 1 } },
     ]);
   });
