@@ -1,4 +1,4 @@
-import { beforeAll, describe, expect, it } from "vitest";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { env } from "cloudflare:test";
 import type { TaskSession } from "../src/control/session";
 import type { ReviewVerdict } from "../src/control/gates";
@@ -615,5 +615,89 @@ describe("exec-report 消息映射", () => {
       .filter((k) => !["schema_version", "type", "task_id", "session_id"].includes(k))
       .sort();
     expect(forwarded).toEqual(expected);
+  });
+});
+
+/**
+ * Fix B(r7):attempt 终态即销毁沙箱。r7 prod 实测任务 BLOCKED 后孤儿 qwen
+ * 仍烧 token 2.5 分钟 —— 终态转换必须主动 destroy 容器。
+ * 测试环境没有 Sandbox 绑定:getSandbox 抛错被 catch,走 `sandbox_destroy
+ * failed` 日志路径,恰好断言「机制开火 + 失败不阻塞权威写入」。
+ */
+describe("attempt 终态销毁沙箱", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function spyDestroyLogs() {
+    const warns: string[] = [];
+    const infos: string[] = [];
+    vi.spyOn(console, "warn").mockImplementation((...a: unknown[]) => {
+      warns.push(a.map(String).join(" "));
+    });
+    vi.spyOn(console, "info").mockImplementation((...a: unknown[]) => {
+      infos.push(a.map(String).join(" "));
+    });
+    return { warns, infos, all: () => [...warns, ...infos] };
+  }
+
+  const flush = () => new Promise((r) => setTimeout(r, 100));
+
+  it("writer exit<0 → BLOCKED 时销毁沙箱,销毁失败不阻塞终态写入", async () => {
+    const logs = spyDestroyLogs();
+    const stub = newStub();
+    await createTask(stub);
+    const { attempt_id } = await stub.startAttempt({
+      role: "writer",
+      idempotency_key: crypto.randomUUID(),
+      ...BUDGET,
+    });
+    const res = await stub.reportExecution({
+      attempt_id,
+      exit_code: -1,
+      error: "internal workflows error",
+    });
+    expect(res.ok).toBe(true);
+    await flush();
+
+    expect(
+      logs.warns.some((l) =>
+        l.includes(`sandbox_destroy failed attempt=${attempt_id}`) &&
+        l.includes("reason=attempt_blocked:workflow_error"),
+      ),
+    ).toBe(true);
+    const snap = await stub.getSnapshot();
+    expect(snap!.task.state).toBe("BLOCKED");
+    chainIntact(snap!.events);
+  });
+
+  it("writer SUCCEEDED 同样销毁(reason=attempt_finished:exit=0)", async () => {
+    const logs = spyDestroyLogs();
+    const stub = newStub();
+    await createTask(stub);
+    const attempt_id = await writerOk(stub);
+    await flush();
+
+    expect(
+      logs.all().some((l) =>
+        l.includes(`sandbox_destroy`) &&
+        l.includes(`attempt=${attempt_id}`) &&
+        l.includes("reason=attempt_finished:exit=0"),
+      ),
+    ).toBe(true);
+  });
+
+  it("reviewer 终态不触发销毁:LLM 直连从无沙箱,不发无谓 RPC", async () => {
+    const logs = spyDestroyLogs();
+    const stub = newStub();
+    await createTask(stub);
+    await writerOk(stub);
+    logs.warns.length = 0;
+    logs.infos.length = 0;
+
+    await reviewerReport(stub, { exit_code: 12, error: "upstream 502" });
+    await flush();
+
+    expect(logs.all().some((l) => l.includes("sandbox_destroy"))).toBe(false);
   });
 });

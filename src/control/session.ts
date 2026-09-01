@@ -1,4 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
+import { getSandbox } from "@cloudflare/sandbox";
 import type { AttemptParams, BaseReport, Env, ReviewEvidenceMode, TaskSpec, TaskState } from "../types";
 import { InvalidBaseSha } from "../types";
 import {
@@ -340,6 +341,33 @@ export class TaskSession extends DurableObject<Env> {
     return { attempt_id: id, workflow_instance_id: instance.id };
   }
 
+  /**
+   * attempt 到达终态即销毁其沙箱容器(SIGKILL 级)。r7 prod 实测:任务
+   * BLOCKED 之后孤儿 qwen 仍对 token-plan 持续 POST 烧 token 2.5 分钟,
+   * 而 sleepAfter 自动休眠是分钟级且只停容器 API、不杀内部进程 ——
+   * 主动 destroy 是把「无人消费的 token 燃烧 + 容器内凭据残留窗口」
+   * 清零的唯一手段。
+   *
+   * fire-and-forget:权威状态转换在前,销毁失败不得影响终态写入;
+   * 失败留 `sandbox_destroy failed` 日志,容器由平台回收兜底。
+   * reviewer 走 LLM 直连、从无沙箱,跳过以免无谓的 DO RPC。
+   */
+  private destroyAttemptSandbox(attemptId: string, role: AttemptRecord["role"], reason: string): void {
+    if (role === "reviewer") return;
+    this.ctx.waitUntil(
+      (async () => {
+        try {
+          await getSandbox(this.env.Sandbox, attemptId).destroy();
+          console.info(`sandbox_destroy ok attempt=${attemptId} reason=${reason}`);
+        } catch (err) {
+          console.warn(
+            `sandbox_destroy failed attempt=${attemptId} reason=${reason} err=${String(err).slice(0, 200)}`,
+          );
+        }
+      })(),
+    );
+  }
+
   // ---- RPC: workflow 回报执行结果(幂等:attempt 非 RUNNING 即忽略) ----
 
   async reportExecution(args: {
@@ -375,6 +403,7 @@ export class TaskSession extends DurableObject<Env> {
 
       if (args.exit_code < 0) {
         attempt.state = "BLOCKED";
+        this.destroyAttemptSandbox(attempt.id, attempt.role, "attempt_blocked:workflow_error");
         await this.appendEvent(s, "attempt.blocked", {
           attempt_id: args.attempt_id,
           error: args.error ?? "workflow error",
@@ -396,6 +425,11 @@ export class TaskSession extends DurableObject<Env> {
       }
 
       attempt.state = args.exit_code === 0 ? "SUCCEEDED" : "FAILED";
+      this.destroyAttemptSandbox(
+        attempt.id,
+        attempt.role,
+        `attempt_finished:exit=${args.exit_code}`,
+      );
       await this.appendEvent(s, "attempt.exec_finished", {
         attempt_id: args.attempt_id,
         exit_code: args.exit_code,
@@ -1306,6 +1340,7 @@ export class TaskSession extends DurableObject<Env> {
           a.state = "BLOCKED";
           a.finished_at = this.now();
           changed = true;
+          this.destroyAttemptSandbox(a.id, a.role, "alarm:wall_time_exceeded");
           await this.appendEvent(s, "attempt.blocked", {
             attempt_id: a.id,
             reason: "alarm: wall time exceeded",
