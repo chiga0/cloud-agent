@@ -10,6 +10,7 @@ import {
   exportPatchScript,
   pinWorkspace,
 } from "./base";
+import { LONGRUN_SCRIPT, collectLongRunOutput, longRunScript } from "./longrun";
 
 export interface SandboxRunResult {
   exitCode: number;
@@ -89,34 +90,66 @@ export function deriveWriterBudget(
   return { wallMinutes, maxSessionTurns };
 }
 
-/**
- * 在一次性 Sandbox 中运行 qwen-code(stream-json)。
- * qwen-code 直连百炼(低权 token-plan key);Worker 不做中间代理,
- * token 记账和审计通过事后解析 transcript 完成。
- * 产物回收:stdout/stderr 直接经 ExecResult 回传 → 内容寻址写入 R2。
- *
- * repo 任务:克隆后把工作副本**钉到精确 commit**(pinWorkspace),成功后按
- * `git diff <base> --binary` 导出冻结快照,由独立 verifier 在另一沙箱重放同一
- * 基线验证 —— 验证语义不在 writer 沙箱内执行。基线不可用时不起模型:那是环境
- * 事实,烧一次沙箱只会重复同一个失败。
- *
- * 注意:qwen-code 无头标志以本机 `qwen --help` 为准(此处 -p / --output-format
- * stream-json / --auth-type openai 依据 sources/qwen-code 0.21.10 的 config.ts)。
+/** qwen 无头命令行(不含 cd/env/重定向——那些收在 longRunScript 里)。
+ * --yolo:沙箱已是隔离边界,内部 permission 检查会挡住 shell/write,放行即可。
+ * --max-session-turns / --max-wall-time:双重 budget,防止 reasoning loop 烧穿
+ * proxy 或沙箱时长;达到阈值时 qwen 以 exit=55/53 干净退出,便于上游识别。
+ * 墙钟必须与任务预算同源:曾硬编码 5m,代码类任务(装依赖+跑测试)必然撞墙。
  */
-export async function runQwenCodeAttempt(
+export function qwenCommand(
+  maxWallSeconds: number | undefined,
+  env: {
+    DEFAULT_MAX_WALL_SECONDS?: string;
+    DEFAULT_MAX_SESSION_TURNS?: string;
+    MAX_WRITER_WALL_MINUTES?: string;
+  },
+): string {
+  const { wallMinutes, maxSessionTurns } = deriveWriterBudget(maxWallSeconds, env);
+  return (
+    `QWEN_CODE_SUPPRESS_YOLO_WARNING=1 qwen -p "$(cat /workspace/task.txt)" ` +
+    `--output-format stream-json --auth-type openai --yolo ` +
+    `--max-session-turns ${maxSessionTurns} --max-wall-time ${wallMinutes}m`
+  );
+}
+
+/**
+ * 轮询到期兜底(Fix C):qwen 自带 --max-wall-time 会先干净退出,这里只兜
+ * 「qwen 自己都没能退出」的悬挂(r6 实测单次模型调用悬挂 24 分钟)。
+ * = min(qwen 墙钟 + 3min 余量, 任务预算 - 60s),后者保证赶在 DO 的
+ * attemptDeadline alarm(claim + budget)之前给出带证据的回报。
+ */
+export function qwenDeadlineSeconds(
+  maxWallSeconds: number | undefined,
+  env: { DEFAULT_MAX_WALL_SECONDS?: string; MAX_WRITER_WALL_MINUTES?: string },
+): number {
+  const { wallMinutes } = deriveWriterBudget(maxWallSeconds, env);
+  const budget = maxWallSeconds ?? Number(env.DEFAULT_MAX_WALL_SECONDS ?? "3600");
+  return Math.max(60, Math.min(wallMinutes * 60 + 180, budget - 60));
+}
+
+export interface QwenPrepareResult {
+  /** 基线材质化失败:直接上报,不起模型(环境事实,烧沙箱只会重复同一失败) */
+  early?: SandboxRunResult;
+  base?: BaseReport;
+}
+
+/**
+ * Fix C prepare 相:全部是短操作(克隆/钉基线/写任务文件/写启动脚本),
+ * 在 workflow 的单个 step 内完成。模型凭据经 longRunScript 的 export 写进
+ * 启动脚本——setEnvVars 只作用于 default session 的 shell(SDK 实证),
+ * 专用 session 里的进程拿不到,所以必须随脚本走。
+ */
+export async function prepareQwenAttempt(
   env: Env,
   args: {
     attemptId: string;
     prompt: string;
     model: string;
     repoUrl?: string;
-    exportPatch?: boolean;
-    /** 控制面已冻结的基线;null = 本次执行解析默认分支 HEAD 并固定 */
     basePin?: string | null;
-    /** 任务墙钟预算(秒);缺省回落环境默认。qwen 的墙钟由它推导,留余量给导出/回报 */
     maxWallSeconds?: number;
   },
-): Promise<SandboxRunResult> {
+): Promise<QwenPrepareResult> {
   const sandbox = getSandbox(env.Sandbox, args.attemptId);
   let base: BaseReport | undefined;
 
@@ -125,39 +158,56 @@ export async function runQwenCodeAttempt(
     const pinned = await pinWorkspace(sandbox, args.basePin ?? null, pinMode(env));
     if (!pinned.ok) {
       return {
-        exitCode: pinned.code,
-        transcript: await putArtifact(
-          env.ARTIFACTS,
-          `base materialization failed (exit ${pinned.code})\n${pinned.detail}\n`,
-          `attempts/${args.attemptId}`,
-        ),
-        stderr: await putArtifact(env.ARTIFACTS, pinned.detail, `attempts/${args.attemptId}`),
+        early: {
+          exitCode: pinned.code,
+          transcript: await putArtifact(
+            env.ARTIFACTS,
+            `base materialization failed (exit ${pinned.code})\n${pinned.detail}\n`,
+            `attempts/${args.attemptId}`,
+          ),
+          stderr: await putArtifact(env.ARTIFACTS, pinned.detail, `attempts/${args.attemptId}`),
+        },
       };
     }
     base = pinned.base;
   }
 
   // 基线确定之后才交凭据:一个连工作副本都建不起来的任务不该摸到模型 key。
-  await sandbox.setEnvVars(sandboxModelEnv(env, args.model));
-
   await sandbox.writeFile("/workspace/task.txt", args.prompt);
-  const workdir = args.repoUrl ? REPO_DIR : "/workspace";
-  // --yolo:沙箱已是隔离边界,内部 permission 检查会挡住 shell/write,放行即可。
-  // --max-session-turns / --max-wall-time:双重 budget,防止 reasoning loop 烧穿
-  // proxy 或沙箱时长;达到阈值时 qwen 以 exit=55/53 干净退出,便于上游识别。
-  // 墙钟必须与任务预算同源:曾硬编码 5m,代码类任务(装依赖+跑测试)必然撞墙。
-  const { wallMinutes, maxSessionTurns } = deriveWriterBudget(args.maxWallSeconds, env);
-  const run = await sandbox.exec(
-    `cd ${workdir} && QWEN_CODE_SUPPRESS_YOLO_WARNING=1 qwen -p "$(cat /workspace/task.txt)" ` +
-      `--output-format stream-json --auth-type openai --yolo ` +
-      `--max-session-turns ${maxSessionTurns} --max-wall-time ${wallMinutes}m`,
+  await sandbox.writeFile(
+    LONGRUN_SCRIPT,
+    longRunScript({
+      workdir: args.repoUrl ? REPO_DIR : "/workspace",
+      env: sandboxModelEnv(env, args.model),
+      command: qwenCommand(args.maxWallSeconds, env),
+    }),
   );
+  return { base };
+}
+
+/**
+ * Fix C collect 相:进程已终态(或到期被杀),读回输出文件 → 内容寻址落 R2。
+ * 与旧阻塞路径的唯一语义差:stdout/stderr 来自文件而非 ExecResult 回传。
+ * patch 导出仍走 default session 的短 exec——qwen 从未占用过它,无排队竞态。
+ */
+export async function collectQwenAttempt(
+  env: Env,
+  args: {
+    attemptId: string;
+    repoUrl?: string;
+    exportPatch?: boolean;
+    base?: BaseReport;
+  },
+  outcome: { exitCode: number | null },
+): Promise<SandboxRunResult> {
+  const sandbox = getSandbox(env.Sandbox, args.attemptId);
+  const { stdout, stderr } = await collectLongRunOutput(sandbox);
 
   // qwen stream-json 在遇到 API 错误时仍以 exit=0 返回,把错误嵌入最后一条
   // type=result 事件的 result 字段。在此识别并上翻为 exitCode != 0,避免误判成功。
-  let exitCode = run.exitCode;
-  if (exitCode === 0 && run.stdout) {
-    const lastLine = run.stdout.trim().split("\n").filter(Boolean).pop() ?? "";
+  let exitCode = outcome.exitCode ?? -1;
+  if (exitCode === 0 && stdout) {
+    const lastLine = stdout.trim().split("\n").filter(Boolean).pop() ?? "";
     if (lastLine) {
       try {
         const evt = JSON.parse(lastLine) as { type?: string; is_error?: boolean; result?: string };
@@ -170,8 +220,9 @@ export async function runQwenCodeAttempt(
     }
   }
 
-  const transcript = await putArtifact(env.ARTIFACTS, run.stdout, `attempts/${args.attemptId}`);
-  const stderr = await putArtifact(env.ARTIFACTS, run.stderr, `attempts/${args.attemptId}`);
+  const transcript = await putArtifact(env.ARTIFACTS, stdout, `attempts/${args.attemptId}`);
+  const stderrRef = await putArtifact(env.ARTIFACTS, stderr, `attempts/${args.attemptId}`);
+  const base = args.base;
 
   let patch: ArtifactRef | undefined;
   if (exitCode === 0 && args.exportPatch && args.repoUrl && base?.sha) {
@@ -192,5 +243,5 @@ export async function runQwenCodeAttempt(
     patch = await putArtifact(env.ARTIFACTS, file.content, `attempts/${args.attemptId}`);
   }
 
-  return { exitCode, transcript, stderr, patch, base };
+  return { exitCode, transcript, stderr: stderrRef, patch, base };
 }
