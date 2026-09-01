@@ -1,6 +1,7 @@
 import type { Env, TaskSpec, TaskState } from "./types";
+import { ATTEMPT_ROLES } from "./types";
 import { handleQueue } from "./exec/queue";
-import { TaskSession } from "./control/session";
+import { ATTEMPT_STATES, TaskSession } from "./control/session";
 import { TASK_TRANSITIONS } from "./control/statemachine";
 import type { EvidenceManifest } from "./audit/evidence";
 import { sha256Hex } from "./audit/evidence";
@@ -67,6 +68,7 @@ function landingHtml(env: Env): string {
       <dt>GET /tasks/:id/attempts/:aid/transcript</dt><dd>attempt 的 transcript 原文(verifier 为 JSON 验证报告,需鉴权)</dd>
       <dt>GET /admin/chain-check</dt><dd>校验 D1 归档的事件 hash chain(需鉴权)</dd>
       <dt>GET /admin/tasks</dt><dd>归档任务列表(需鉴权):<strong>只读</strong>投影,数据源仅为 D1 归档的 <code>tasks</code> 表 —— 任务到终态才归档,因此<strong>不含仍在 DO 中运行、尚未归档的任务</strong>(实时状态看 <code>GET /tasks/:id</code>)。按 <code>updated_at</code> 降序返回 <code>{"tasks":[{id,state,created_at,updated_at,version}],"count":N}</code>;可选 <code>?state=</code> 精确过滤(合法取值见状态机,非法 → 400)、可选 <code>?limit=</code>(默认 50,上限 200,非数字或越界 → 400)</dd>
+      <dt>GET /admin/attempts</dt><dd>归档 attempt 列表(需鉴权):按任务复盘各 attempt(writer / verifier / reviewer)的终态与 token 消耗。<strong>只读</strong>投影,数据源仅为 D1 归档的 <code>attempts</code> 表 —— attempt 随任务终态才归档,因此<strong>不含尚未归档的在途 attempt</strong>(实时状态看 <code>GET /tasks/:id</code>)。按 <code>created_at</code> 降序返回 <code>{"attempts":[{id,task_id,role,state,tokens_used,max_model_tokens,max_wall_seconds,workflow_instance_id,created_at,finished_at}],"count":N}</code>(<code>count</code> 是本次返回条数,受 limit 截断)。安全投影:<code>proxy_token</code>(一次性模型代理凭据)<strong>绝不下发</strong>,内部去重用的 <code>idempotency_key</code> 同样不进投影。可选过滤器按 AND 组合:<code>?task_id=</code>(36 字符 UUID,畸形 → 400)、<code>?role=</code>(writer/reviewer/verifier)、<code>?state=</code>(RUNNING/SUCCEEDED/FAILED/BLOCKED;合法取值来自权威声明,非法 → 400,不命中返回空列表)、<code>?limit=</code>(默认 50,上限 200,非数字或越界 → 400)</dd>
     </dl>
   </div>
 
@@ -352,8 +354,23 @@ async function handleChainCheck(env: Env): Promise<Response> {
 /** 合法 state 取值从权威转换表派生:状态机增删状态时这里自动跟上,不留第二份清单。 */
 const TASK_STATES: readonly TaskState[] = Object.keys(TASK_TRANSITIONS) as TaskState[];
 
-const DEFAULT_ADMIN_TASKS_LIMIT = 50;
-const MAX_ADMIN_TASKS_LIMIT = 200;
+const DEFAULT_ADMIN_LIMIT = 50;
+const MAX_ADMIN_LIMIT = 200;
+
+/**
+ * 归档读端点(`/admin/tasks`、`/admin/attempts`)共用的 limit 口径:缺省 50,
+ * 只接受 [1, 200] 内的整数。`error` 非空即 400 —— 一份规则,不各写一份。
+ */
+function parseAdminLimit(raw: string | null):
+  | { limit: number; error: null }
+  | { limit: null; error: string } {
+  if (raw === null) return { limit: DEFAULT_ADMIN_LIMIT, error: null };
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > MAX_ADMIN_LIMIT) {
+    return { limit: null, error: `limit must be an integer within [1, ${MAX_ADMIN_LIMIT}]` };
+  }
+  return { limit: parsed, error: null };
+}
 
 interface ArchivedTaskRow {
   id: string;
@@ -384,22 +401,9 @@ async function handleAdminTasks(url: URL, env: Env): Promise<Response> {
     );
   }
 
-  let limit = DEFAULT_ADMIN_TASKS_LIMIT;
-  const rawLimit = url.searchParams.get("limit");
-  if (rawLimit !== null) {
-    const parsed = Number(rawLimit);
-    if (!Number.isInteger(parsed) || parsed < 1 || parsed > MAX_ADMIN_TASKS_LIMIT) {
-      return Response.json(
-        {
-          error: {
-            type: "invalid_limit",
-            detail: `limit must be an integer within [1, ${MAX_ADMIN_TASKS_LIMIT}]`,
-          },
-        },
-        { status: 400 },
-      );
-    }
-    limit = parsed;
+  const { limit, error } = parseAdminLimit(url.searchParams.get("limit"));
+  if (error !== null) {
+    return Response.json({ error: { type: "invalid_limit", detail: error } }, { status: 400 });
   }
 
   const sql =
@@ -411,6 +415,110 @@ async function handleAdminTasks(url: URL, env: Env): Promise<Response> {
   const rows = await env.DB.prepare(sql).bind(...params).all<ArchivedTaskRow>();
   // count 是本次返回的条数(受 limit 截断),不是表里的总匹配数。
   return Response.json({ tasks: rows.results, count: rows.results.length });
+}
+
+/**
+ * 归档 attempt 的投影字段。`proxy_token`(一次性模型代理凭据)与
+ * `idempotency_key`(内部去重管道)**刻意不在列表里**:读投影不该成为
+ * 凭据的第二条出口,复盘要的是结果、终态与 token 消耗,不是拿回能重放的钥匙。
+ */
+interface ArchivedAttemptRow {
+  id: string;
+  task_id: string;
+  role: string;
+  state: string;
+  tokens_used: number;
+  max_model_tokens: number;
+  max_wall_seconds: number;
+  workflow_instance_id: string | null;
+  created_at: string;
+  finished_at: string | null;
+}
+
+/** 与 `/tasks/:id` 路由同一个 id 口径:36 字符 `[0-9a-f-]` UUID。 */
+const TASK_ID_RE = /^[0-9a-f-]{36}$/;
+
+/**
+ * GET /admin/attempts —— 归档 attempt 列表(只读投影,数据源仅为 D1 `attempts` 表)。
+ *
+ * 按任务复盘各 attempt(writer/verifier/reviewer)的执行结果、终态与 token 消耗。
+ * 与 /admin/tasks 同理:归档只在终态发生,**看不到仍在 DO 中运行、尚未归档的
+ * 在途 attempt** —— 实时状态仍走 /tasks/:id。不新增状态对象,不碰状态机与归档
+ * 写路径;role/state 的合法取值直接引用权威声明(ATTEMPT_ROLES / ATTEMPT_STATES),
+ * 不在这里另立清单。
+ *
+ * 过滤器可组合(AND 语义):`?task_id=` 精确匹配、`?role=`、`?state=`;
+ * 过滤不命中返回空列表而不是 404。`?limit=` 缺省 50、上限 200。
+ */
+async function handleAdminAttempts(url: URL, env: Env): Promise<Response> {
+  const taskId = url.searchParams.get("task_id");
+  if (taskId !== null && !TASK_ID_RE.test(taskId)) {
+    return Response.json(
+      {
+        error: {
+          type: "invalid_task_id",
+          detail: "task_id must be a 36-character task uuid",
+        },
+      },
+      { status: 400 },
+    );
+  }
+
+  const role = url.searchParams.get("role");
+  if (role !== null && !(ATTEMPT_ROLES as readonly string[]).includes(role)) {
+    return Response.json(
+      {
+        error: {
+          type: "invalid_role",
+          detail: `role must be one of ${ATTEMPT_ROLES.join(", ")}`,
+        },
+      },
+      { status: 400 },
+    );
+  }
+
+  const state = url.searchParams.get("state");
+  if (state !== null && !(ATTEMPT_STATES as readonly string[]).includes(state)) {
+    return Response.json(
+      {
+        error: {
+          type: "invalid_state",
+          detail: `state must be one of ${ATTEMPT_STATES.join(", ")}`,
+        },
+      },
+      { status: 400 },
+    );
+  }
+
+  const { limit, error } = parseAdminLimit(url.searchParams.get("limit"));
+  if (error !== null) {
+    return Response.json({ error: { type: "invalid_limit", detail: error } }, { status: 400 });
+  }
+
+  // 值一律走占位符绑定,拼进 SQL 的只有下面这段固定的列名/WHERE 片段。
+  const where: string[] = [];
+  const params: Array<string | number> = [];
+  if (taskId !== null) {
+    where.push("task_id = ?");
+    params.push(taskId);
+  }
+  if (role !== null) {
+    where.push("role = ?");
+    params.push(role);
+  }
+  if (state !== null) {
+    where.push("state = ?");
+    params.push(state);
+  }
+  params.push(limit);
+  const sql =
+    "SELECT id, task_id, role, state, tokens_used, max_model_tokens, max_wall_seconds," +
+    " workflow_instance_id, created_at, finished_at FROM attempts" +
+    (where.length === 0 ? "" : ` WHERE ${where.join(" AND ")}`) +
+    " ORDER BY created_at DESC LIMIT ?";
+  const rows = await env.DB.prepare(sql).bind(...params).all<ArchivedAttemptRow>();
+  // count 是本次返回的条数(受 limit 截断),不是表里的总匹配数。
+  return Response.json({ attempts: rows.results, count: rows.results.length });
 }
 
 export default {
@@ -435,6 +543,10 @@ export default {
 
     if (url.pathname === "/admin/tasks" && req.method === "GET") {
       return handleAdminTasks(url, env);
+    }
+
+    if (url.pathname === "/admin/attempts" && req.method === "GET") {
+      return handleAdminAttempts(url, env);
     }
 
     const taskMatch =

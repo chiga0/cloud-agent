@@ -91,10 +91,18 @@ export interface TaskSpec {
   worker?: "qwen-code";
 }
 
+/**
+ * attempt 角色的唯一权威清单。类型由这个常量元组派生,运行时的入参校验
+ * (如 `GET /admin/attempts` 的 `?role=`)引用同一份声明 —— 加一个角色只需要
+ * 改这里,不会出现「端点自己硬编码了另一份合法值」的漂移。
+ */
+export const ATTEMPT_ROLES = ["writer", "reviewer", "verifier"] as const;
+export type AttemptRole = (typeof ATTEMPT_ROLES)[number];
+
 export interface AttemptParams {
   task_id: string;
   attempt_id: string;
-  role: "writer" | "reviewer" | "verifier";
+  role: AttemptRole;
   spec: TaskSpec;
   spec_digest: string;
   model: string;

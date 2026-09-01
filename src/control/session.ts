@@ -1,6 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import { getSandbox } from "@cloudflare/sandbox";
-import type { AttemptParams, BaseReport, Env, ReviewEvidenceMode, TaskSpec, TaskState } from "../types";
+import type { AttemptParams, AttemptRole, BaseReport, Env, ReviewEvidenceMode, TaskSpec, TaskState } from "../types";
 import { InvalidBaseSha } from "../types";
 import {
   compositeEvidenceDigest,
@@ -71,10 +71,18 @@ interface CurrentEvidence {
   verifier_manifest_digest?: string;
 }
 
+/**
+ * attempt 生命周期的唯一权威取值集(RUNNING + 三个终态)。类型由这个常量元组
+ * 派生,归档读投影(`GET /admin/attempts` 的 `?state=`)引用同一份声明 ——
+ * 状态的增删只改这里,读端自动跟上。
+ */
+export const ATTEMPT_STATES = ["RUNNING", "SUCCEEDED", "FAILED", "BLOCKED"] as const;
+export type AttemptState = (typeof ATTEMPT_STATES)[number];
+
 interface AttemptRecord {
   id: string;
-  role: "writer" | "reviewer" | "verifier";
-  state: "RUNNING" | "SUCCEEDED" | "FAILED" | "BLOCKED";
+  role: AttemptRole;
+  state: AttemptState;
   idempotency_key: string;
   tokens_used: number;
   max_model_tokens: number;
@@ -242,7 +250,7 @@ export class TaskSession extends DurableObject<Env> {
   // ---- RPC: 启动 attempt(幂等:同 idempotency_key 只创建一个) ----
 
   async startAttempt(args: {
-    role: "writer" | "reviewer" | "verifier";
+    role: AttemptRole;
     idempotency_key: string;
     max_model_tokens: number;
     max_wall_seconds: number;
@@ -262,7 +270,7 @@ export class TaskSession extends DurableObject<Env> {
   private async startAttemptInternal(
     s: SessionData,
     args: {
-      role: "writer" | "reviewer" | "verifier";
+      role: AttemptRole;
       idempotency_key: string;
       max_model_tokens: number;
       max_wall_seconds: number;

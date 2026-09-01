@@ -74,6 +74,17 @@ curl -s localhost:8787/tasks/<task_id>/candidate -H "authorization: Bearer $TOKE
 # 取回补丁并在它被验证过的那个 commit 上本地重放(下发前服务端已重算 sha256)
 curl -s -OJ "localhost:8787/tasks/<task_id>/candidate?format=patch" -H "authorization: Bearer $TOKEN"
 git -C <你的仓库> checkout <candidate.base.sha> && git apply task-<task_id>-<patch前12位>.patch
+
+# 复盘各 attempt(writer/verifier/reviewer)的终态与 token 消耗 —— `GET /admin/attempts`。
+# 它是 D1 归档的**只读视图**(读投影,不是新的状态权威):attempt 随任务终态才归档,
+# 因此**不含尚未归档的在途 attempt** —— 在跑的任务仍看 `GET /tasks/<task_id>`。
+# 安全投影:一次性模型代理凭据 `proxy_token` **绝不下发**,内部去重用的
+# `idempotency_key` 同样不进投影;返回字段固定为 id/task_id/role/state/tokens_used/
+# max_model_tokens/max_wall_seconds/workflow_instance_id/created_at/finished_at。
+# 过滤按 AND 组合:?task_id=(36 字符 UUID) ?role= ?state= ?limit=(默认 50,上限 200);
+# 畸形值 → 400,过滤不命中 → 空列表(count 是本次返回条数,受 limit 截断,不是总匹配数)
+curl -s "localhost:8787/admin/attempts?task_id=<task_id>&role=writer" \
+  -H "authorization: Bearer $TOKEN" | jq '{count, attempts: [.attempts[] | {id, state, tokens_used, finished_at}]}'
 ```
 
 ## 部署前一次性配置(需要账号操作)
