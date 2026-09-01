@@ -34,8 +34,17 @@ export interface Env {
   EGRESS_GIT_HOSTS?: string;
   /** 补丁字节上限。可选,缺配/非法回落 1 MiB(见 base.ts DEFAULT_MAX_PATCH_BYTES)。 */
   MAX_PATCH_BYTES?: string;
-  /** writer 沙箱内 qwen-code 的 session turns 上限。可选,缺配/非法回落 40(见 sandbox.ts)。 */
+  /**
+   * writer 沙箱内 qwen-code 的 session turns 上限。可选,缺配/非法时随墙钟
+   * 推导(≈8 turns/min,下限 40,见 sandbox.ts deriveWriterBudget)。
+   */
   DEFAULT_MAX_SESSION_TURNS?: string;
+  /**
+   * qwen 墙钟的平台安全上限(分钟)。可选,缺配/非法回落 25 —— workerd 挂起
+   * 检测会在 ~29:48 杀掉单条 await 中的请求(M9 prod 实测),超过它拿到的是
+   * 平台击杀而非 qwen 的干净退出。
+   */
+  MAX_WRITER_WALL_MINUTES?: string;
 
   /** Worker 侧高权 key:给 reviewer 用;也是沙箱 key 缺配时的回落值 */
   DASHSCOPE_API_KEY: string;
