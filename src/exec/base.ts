@@ -145,9 +145,60 @@ export interface SandboxExec {
   exec(cmd: string): Promise<{ exitCode: number; stdout: string; stderr: string }>;
 }
 
-/** 需要 checkout 能力的沙箱接口,同样便于假沙箱单测。 */
+/**
+ * 需要 checkout 能力的沙箱接口,同样便于假沙箱单测。
+ * createSession / startProcess / deleteSession 是杀孤儿进程必需的
+ * 「带 sessionId 的定位参数」API:SDK 在 sessionId 显式给出时直接
+ * POST 容器端 `/api/process/start`,完全绕开默认会话的命令队列。
+ */
 export interface SandboxGit extends SandboxExec {
   gitCheckout(repoUrl: string, options?: { targetDir?: string; depth?: number }): Promise<unknown>;
+  createSession(options: { id?: string; cwd?: string }): Promise<unknown>;
+  startProcess(command: string, options?: undefined, sessionId?: string): Promise<unknown>;
+  deleteSession(sessionId: string): Promise<unknown>;
+}
+
+/**
+ * 杀孤儿专用隔离会话的固定 id。重试(甚至跨 run)复用同一容器时命中同一
+ * 会话:createSession 撞「已存在」被吞掉后,startProcess 仍能用它下发。
+ */
+export const ORPHAN_KILL_SESSION = "orphan-killer";
+
+/** 方括号模式防 pkill 自匹配;结尾 `true` 保证「无残留」也以 0 退出。 */
+export const ORPHAN_KILL_CMD = `pkill -9 -f '/workspace/rep[o]' 2>/dev/null; pkill -9 -f '[q]wen' 2>/dev/null; true`;
+
+/**
+ * 在隔离会话里杀残留进程,绝不走默认会话的 exec()。
+ *
+ * r7 prod 实测:run 被平台取消后孤儿 qwen 仍占着默认会话,重试的 pkill
+ * 经 exec() 下发被**排队 429,690ms**(会话串行执行命令),等排到时克隆
+ * 早已开始 —— 等于没杀。容器端每个 session 独立,`startProcess(cmd,
+ * undefined, sessionId)` 直连 `/api/process/start`,与孤儿并发执行。
+ *
+ * best-effort:三步各自吞错并打日志(staging 克隆本身对活孤儿免疫,
+ * 杀不掉也不阻塞主链路),但日志必须可辨 —— r9 的 tail 靠
+ * `orphan_kill` 前缀确认机制是否真的开火。
+ */
+async function killOrphanProcesses(sandbox: SandboxGit): Promise<void> {
+  try {
+    await sandbox.createSession({ id: ORPHAN_KILL_SESSION, cwd: "/" });
+    console.info(`orphan_kill session_created id=${ORPHAN_KILL_SESSION}`);
+  } catch (err) {
+    // 已存在(上一次重试建过)或 RPC 丢失都落在这:会话在容器端可能已就绪,继续
+    console.warn(`orphan_kill session_create_failed err=${String(err).slice(0, 200)}`);
+  }
+  try {
+    await sandbox.startProcess(ORPHAN_KILL_CMD, undefined, ORPHAN_KILL_SESSION);
+    console.info(`orphan_kill process_started session=${ORPHAN_KILL_SESSION}`);
+  } catch (err) {
+    console.warn(`orphan_kill process_start_failed err=${String(err).slice(0, 200)}`);
+  }
+  try {
+    await sandbox.deleteSession(ORPHAN_KILL_SESSION);
+  } catch (err) {
+    // 删不掉只泄漏一个空会话,不影响本轮;下一次重试 createSession 撞已存在同上
+    console.warn(`orphan_kill session_delete_failed err=${String(err).slice(0, 200)}`);
+  }
 }
 
 /**
@@ -158,8 +209,11 @@ export interface SandboxGit extends SandboxExec {
  *
  * r6 还证明「先 rm 再 clone」不够:run 被取消时容器内进程并未死透,残留的
  * qwen 及其子进程(node/vitest 等)会在 rm(exit 0)与 clone 之间重新往
- * /workspace/repo 写文件,clone 照样报「已存在且非空」。因此:
- * 1. 先尽力杀掉引用 repo 目录或 qwen 的残留进程(方括号模式防 pkill 自匹配);
+ * /workspace/repo 写文件,clone 照样报「已存在且非空」。r7 进一步证明
+ * 杀残留**不能走默认会话的 exec()**:孤儿占着会话时,pkill 被排队 7.2 分钟,
+ * 等于没杀。因此:
+ * 1. 经固定 id 的隔离会话异步下发 pkill(与孤儿并发;不等它完成 ——
+ *    staging 克隆对活孤儿免疫,杀只是让换入窗口更干净);
  * 2. 克隆进 staging 目录 —— 耗时最长的环节与任何写 REPO_DIR 的进程零竞态;
  * 3. 单条 `rm + mv` 完成换入,竞态窗口缩到毫秒级;
  * 4. 每步 exec 的退出码显式校验,失败大声 throw,不再带病走进克隆。
@@ -171,9 +225,7 @@ export interface SandboxGit extends SandboxExec {
  */
 export async function checkoutRepo(sandbox: SandboxGit, repoUrl: string): Promise<void> {
   const staging = `${REPO_DIR}.new`;
-  await sandbox.exec(
-    `pkill -9 -f '/workspace/rep[o]' 2>/dev/null; pkill -9 -f '[q]wen' 2>/dev/null; true`,
-  );
+  await killOrphanProcesses(sandbox);
   const rm = await sandbox.exec(`cd / && rm -rf ${REPO_DIR} ${staging}`);
   if (rm.exitCode !== 0) {
     throw new Error(`workspace cleanup failed (exit ${rm.exitCode}): ${rm.stderr.slice(-300)}`);
