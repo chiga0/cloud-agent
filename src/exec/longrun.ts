@@ -84,8 +84,30 @@ export function longRunScript(args: {
   return `${lines.join("\n")}\n`;
 }
 
+/**
+ * SDK 对「进程记录不存在」抛 ProcessNotFoundError(name 固定,见
+ * @cloudflare/sandbox errors/classes.ts:createErrorFromResponse →
+ * ErrorCode.PROCESS_NOT_FOUND),**不是返回 null**。首次启动前查无记录、或容器
+ * 重启后记录消失,都表现为这个异常 → 一律按 missing 处理。
+ *
+ * 其它异常(网络/5xx/ProcessError)是暂态,必须上抛让 step 重试:吞成 missing
+ * 会把一次可恢复的抖动误判成「进程蒸发」,直接 -1 上报、白白丢弃在跑的长进程。
+ * 据 name 匹配而非 instanceof —— 打包后类身份可能不是同一份,name 是稳定契约。
+ */
+function isProcessNotFound(err: unknown): boolean {
+  return (err as { name?: string } | null)?.name === "ProcessNotFoundError";
+}
+
 async function readProcess(sb: LongRunSandbox): Promise<ProcessSnapshot> {
-  const p = await sb.getProcess(LONGRUN_PROCESS_ID, LONGRUN_SESSION);
+  let p: { status?: string; exitCode?: number | null; startTime?: Date | string | number } | null;
+  try {
+    p = await sb.getProcess(LONGRUN_PROCESS_ID, LONGRUN_SESSION);
+  } catch (err) {
+    if (isProcessNotFound(err)) {
+      return { status: "missing", exitCode: null, startedAtMs: null };
+    }
+    throw err;
+  }
   if (!p || typeof p.status !== "string") {
     return { status: "missing", exitCode: null, startedAtMs: null };
   }

@@ -72,9 +72,17 @@ interface Call {
   args: unknown[];
 }
 
+/** 真实 SDK 契约:进程不存在时 getProcess 抛 name=ProcessNotFoundError,不是返回 null。 */
+function processNotFound(): Error {
+  const e = new Error("Process longrun not found");
+  e.name = "ProcessNotFoundError";
+  return e;
+}
+
 function fakeLongRun(overrides: {
   existing?: { status?: string; exitCode?: number | null; startTime?: Date | string | number } | null;
   createSessionError?: Error;
+  getProcessError?: Error;
   killError?: Error;
   files?: Record<string, string>;
   readFileError?: Error;
@@ -92,7 +100,10 @@ function fakeLongRun(overrides: {
     },
     async getProcess(id, sessionId) {
       calls.push({ kind: "getProcess", args: [id, sessionId] });
-      return (overrides.existing ?? null) as never;
+      if (overrides.getProcessError) throw overrides.getProcessError;
+      // existing 显式给对象(含 {} 畸形记录)才返回;null/undefined = 进程不存在 = 抛。
+      if (overrides.existing == null) throw processNotFound();
+      return overrides.existing as never;
     },
     async killProcess(id, signal, sessionId) {
       calls.push({ kind: "killProcess", args: [id, signal, sessionId] });
@@ -108,7 +119,7 @@ function fakeLongRun(overrides: {
 }
 
 describe("launchOrReattach", () => {
-  it("全新启动:建专用 session → 查无记录 → 固定 processId + autoCleanup:false 启动", async () => {
+  it("全新启动:建专用 session → getProcess 抛 not-found(查无记录)→ 固定 processId + autoCleanup:false 启动", async () => {
     const { sb, calls } = fakeLongRun({ existing: null });
     const out = await launchOrReattach(sb);
     expect(out.reattached).toBe(false);
@@ -153,14 +164,39 @@ describe("launchOrReattach", () => {
     const out = await launchOrReattach(sb);
     expect(out.reattached).toBe(false);
   });
+
+  it("getProcess 抛 name=ProcessNotFoundError → 据 name 识别为 missing 并启动(r10 prod 失败因:不靠 instanceof)", async () => {
+    const nf = new Error("Process longrun not found");
+    nf.name = "ProcessNotFoundError";
+    const { sb, calls } = fakeLongRun({ getProcessError: nf });
+    const out = await launchOrReattach(sb);
+    expect(out.reattached).toBe(false);
+    expect(out.snapshot.status).toBe("running");
+    expect(calls.some((c) => c.kind === "startProcess")).toBe(true);
+  });
+
+  it("getProcess 抛暂态错误(非 not-found)→ 上抛,绝不吞成 missing(否则丢掉在跑的长进程)", async () => {
+    const transient = new Error("upstream 503");
+    transient.name = "ProcessError";
+    const { sb, calls } = fakeLongRun({ getProcessError: transient });
+    await expect(launchOrReattach(sb)).rejects.toThrow("upstream 503");
+    expect(calls.some((c) => c.kind === "startProcess")).toBe(false);
+  });
 });
 
 // ---- poll / terminal / kill / collect ----
 
 describe("pollLongRun", () => {
-  it("记录消失 = missing(容量事实,workflow 按 -1 上报)", async () => {
+  it("记录消失(getProcess 抛 not-found)= missing(容量事实,workflow 按 -1 上报)", async () => {
     const { sb } = fakeLongRun({ existing: null });
     expect(await pollLongRun(sb)).toEqual({ status: "missing", exitCode: null, startedAtMs: null });
+  });
+
+  it("轮询期 getProcess 抛暂态错误 → 上抛(让 poll step 重试),不吞成 missing", async () => {
+    const transient = new Error("socket hang up");
+    transient.name = "ProcessError";
+    const { sb } = fakeLongRun({ getProcessError: transient });
+    await expect(pollLongRun(sb)).rejects.toThrow("socket hang up");
   });
 
   it("终态映射:failed 带 exitCode,Date 型 startTime 也能解析", async () => {
