@@ -15,7 +15,7 @@
     "REJECT_EVIDENCE_MODE": "shadow",
     "BASE_PIN_MODE": "shadow",
     "EGRESS_MODE": "enforce",
-    "EGRESS_GIT_HOSTS": "github.com"
+    "EGRESS_GIT_HOSTS": "github.com,registry.npmjs.org"
   },
   "d1_databases": [
     {
@@ -55,7 +55,7 @@
   "containers": [
     {
       "class_name": "Sandbox",
-      "image": "registry.cloudflare.com/34817bdd8eefd771f3c7ee9ef6f1a5f0/cloud-agent-sandbox:qwen-0.21.10",
+      "image": "registry.cloudflare.com/34817bdd8eefd771f3c7ee9ef6f1a5f0/cloud-agent-sandbox:qwen-0.21.10-r1",
       "max_instances": 50,
       "instance_type": "standard-2"
     }
