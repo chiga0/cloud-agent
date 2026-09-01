@@ -76,6 +76,7 @@ export class AttemptWorkflow extends WorkflowEntrypoint<Env, AttemptParams> {
                 repoUrl: p.spec.repo_url,
                 exportPatch: Boolean(p.spec.repo_url),
                 basePin: p.base_pin ?? null,
+                maxWallSeconds: p.max_wall_seconds,
               }),
             );
           }

@@ -52,6 +52,23 @@ function pinMode(env: Env): BasePinMode {
 }
 
 /**
+ * qwen-code 双预算推导(纯函数,可单测)。
+ * 墙钟与任务预算同源:留 120s 给 patch 导出/证据/回报,让 qwen 先于外层
+ * 预算干净退出(否则外层杀进程时产物与回报都拿不到)。
+ * turns 是防 reasoning loop 的独立闸,真实刹车主靠模型侧预算。
+ */
+export function deriveWriterBudget(
+  maxWallSeconds: number | undefined,
+  env: { DEFAULT_MAX_WALL_SECONDS?: string; DEFAULT_MAX_SESSION_TURNS?: string },
+): { wallMinutes: number; maxSessionTurns: number } {
+  const budgetSeconds = maxWallSeconds ?? Number(env.DEFAULT_MAX_WALL_SECONDS ?? "3600");
+  const wallMinutes = Math.max(1, Math.floor((budgetSeconds - 120) / 60));
+  const turnsRaw = Number(env.DEFAULT_MAX_SESSION_TURNS ?? "");
+  const maxSessionTurns = Number.isFinite(turnsRaw) && turnsRaw > 0 ? Math.floor(turnsRaw) : 40;
+  return { wallMinutes, maxSessionTurns };
+}
+
+/**
  * 在一次性 Sandbox 中运行 qwen-code(stream-json)。
  * qwen-code 直连百炼(低权 token-plan key);Worker 不做中间代理,
  * token 记账和审计通过事后解析 transcript 完成。
@@ -75,6 +92,8 @@ export async function runQwenCodeAttempt(
     exportPatch?: boolean;
     /** 控制面已冻结的基线;null = 本次执行解析默认分支 HEAD 并固定 */
     basePin?: string | null;
+    /** 任务墙钟预算(秒);缺省回落环境默认。qwen 的墙钟由它推导,留余量给导出/回报 */
+    maxWallSeconds?: number;
   },
 ): Promise<SandboxRunResult> {
   const sandbox = getSandbox(env.Sandbox, args.attemptId);
@@ -105,10 +124,12 @@ export async function runQwenCodeAttempt(
   // --yolo:沙箱已是隔离边界,内部 permission 检查会挡住 shell/write,放行即可。
   // --max-session-turns / --max-wall-time:双重 budget,防止 reasoning loop 烧穿
   // proxy 或沙箱时长;达到阈值时 qwen 以 exit=55/53 干净退出,便于上游识别。
+  // 墙钟必须与任务预算同源:曾硬编码 5m,代码类任务(装依赖+跑测试)必然撞墙。
+  const { wallMinutes, maxSessionTurns } = deriveWriterBudget(args.maxWallSeconds, env);
   const run = await sandbox.exec(
     `cd ${workdir} && QWEN_CODE_SUPPRESS_YOLO_WARNING=1 qwen -p "$(cat /workspace/task.txt)" ` +
       `--output-format stream-json --auth-type openai --yolo ` +
-      `--max-session-turns 12 --max-wall-time 5m`,
+      `--max-session-turns ${maxSessionTurns} --max-wall-time ${wallMinutes}m`,
   );
 
   // qwen stream-json 在遇到 API 错误时仍以 exit=0 返回,把错误嵌入最后一条

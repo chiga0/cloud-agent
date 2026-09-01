@@ -307,6 +307,9 @@ export class TaskSession extends DurableObject<Env> {
       instructions: args.instructions,
       // 基线是执行期事实,不在冻结的 spec 里;返工轮靠这一行继承同一 commit
       base_pin: s.task!.base?.sha ?? null,
+      // 墙钟预算透传到执行面:qwen --max-wall-time 若与任务预算脱钩,
+      // 预算形同虚设(曾硬编码 5m,代码类任务装依赖都跑不完)
+      max_wall_seconds: args.max_wall_seconds,
     };
 
     // base_pin 进事件链:跨轮 patch_digest 比较与「这一轮验的是哪个 commit」

@@ -34,6 +34,8 @@ export interface Env {
   EGRESS_GIT_HOSTS?: string;
   /** 补丁字节上限。可选,缺配/非法回落 1 MiB(见 base.ts DEFAULT_MAX_PATCH_BYTES)。 */
   MAX_PATCH_BYTES?: string;
+  /** writer 沙箱内 qwen-code 的 session turns 上限。可选,缺配/非法回落 40(见 sandbox.ts)。 */
+  DEFAULT_MAX_SESSION_TURNS?: string;
 
   /** Worker 侧高权 key:给 reviewer 用;也是沙箱 key 缺配时的回落值 */
   DASHSCOPE_API_KEY: string;
@@ -98,6 +100,8 @@ export interface AttemptParams {
    * 上材质化到同一个值 —— 跨轮 patch_digest 比较与候选可重放性都以此为前提。
    */
   base_pin?: string | null;
+  /** writer 墙钟预算(秒)。执行面据此推导 qwen --max-wall-time,缺省回落环境默认。 */
+  max_wall_seconds?: number;
 }
 
 export class AuthorityConflict extends Error {
