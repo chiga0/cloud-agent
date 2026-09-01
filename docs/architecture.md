@@ -718,7 +718,9 @@ checkout --quiet --detach '<sha>'
 
 **真正该记的账不是噪音**：`AttemptWorkflow.run` 的编排本身(`exec → extract → evidence → report` 四步、`slim()` 瘦身、`waitForEvent("human-approval")`、catch 的回报)**在本地完全没有执行路径** —— 容器起不来,本地 Workflows 自己还会 internal error。这条链路只有 prod E2E 一层保障。
 
-**本轮补的部分**(`test/queue-routing.test.ts`,5 条):回报链路的最后一公里 `handleQueue`,即 §13.8 幽灵实例事故的修法现场。此前只有 `reportArgsFrom` 的字段映射有单测,投递入口零覆盖。现在钉住:按 `session_id` 走 `idFromString` 命中正确实例并驱动状态机(writer 成功 → attempt `SUCCEEDED` + task `AWAITING_APPROVAL` + tokens 落库)/ 指向合法但空无任务的实例 → ack 且真实任务事件数不变(若退回 name-based id 这条即红)/ workflow 抛错的 `-1` 回报 → attempt 与 task 一起 `BLOCKED` 且 error 进 `attempt.blocked` / `review-request` 重投同幂等键 → 只有一个 reviewer attempt / 未知类型 → ack 不 retry。
+**本轮补的部分**(`test/queue-routing.test.ts`,5 条):回报链路的最后一公里 `handleQueue`,即 §13.8 幽灵实例事故的修法现场。此前只有 `reportArgsFrom` 的字段映射有单测,投递入口零覆盖。现在钉住:按 `session_id` 走 `idFromString` 命中正确实例并驱动状态机(writer 成功 → attempt `SUCCEEDED` + task `AWAITING_APPROVAL` + tokens 落库)/ 合法但空无任务的实例 → ack 且**不得有兜底查找**把状态写到别处 / workflow 抛错的 `-1` 回报 → attempt 与 task 一起 `BLOCKED` 且 error 进 `attempt.blocked` / `review-request` 重投同幂等键 → 只有一个 reviewer attempt / 未知类型 → ack 不 retry。
+
+**变异验证**(确认这套用例真能抓到它声称抓的东西):把 `queue.ts` 里三处 `idFromString(body.session_id)` 换成 `idFromName(body.task_id)` → 5 条里 **3 条红**(投递未命中 / `-1` 未落 BLOCKED / reviewer 起不来),改回即全绿。注意各自抓的是不同失效:抓 name-based 回归的是**第一条**,幽灵实例那条在 name-based 变异下**依然绿**(它同样落进空实例并 ack),它真正守的是「查不到就不写、不 retry、不猜第二个口径」。
 
 **没补、也别补**：不要为消灭噪音给测试环境加假的 `Sandbox` DO —— 只会把 `TypeError` 换成容器 HTTP 错误,噪音照旧、覆盖面不变。噪音的判读方式:命中上表三类特征的属预期;**其它**栈的 uncaught exception 意味着 workflow 里多了一条新的失败路径,应当查。`exec/extract/evidence` 三步要真实容器,只能留在 prod 取证。
 

@@ -87,6 +87,9 @@ describe("handleQueue → TaskSession 路由", () => {
     expect(snap.attempts.find((a) => a.id === attempt_id)!.tokens_used).toBe(42);
   });
 
+  // 守的是「查不到就不写、不 retry、不兜底猜第二个口径」。name-based 路由回归由
+  // 上面那条正向投递用例抓(变异实验:改成 idFromName 后这条依然绿,因为错误目标
+  // 同样落进空实例)。
   it("session_id 指向从未创建过的实例:ack 且不落到任何真实任务上", async () => {
     const real = ns().get(ns().newUniqueId());
     const realTask = crypto.randomUUID();
