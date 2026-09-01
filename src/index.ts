@@ -68,6 +68,7 @@ function landingHtml(env: Env): string {
       <dt>GET /tasks/:id/attempts/:aid/transcript</dt><dd>attempt 的 transcript 原文(verifier 为 JSON 验证报告,需鉴权)</dd>
       <dt>GET /admin/chain-check</dt><dd>校验 D1 归档的事件 hash chain(需鉴权)</dd>
       <dt>GET /admin/tasks</dt><dd>归档任务列表(需鉴权):<strong>只读</strong>投影,数据源仅为 D1 归档的 <code>tasks</code> 表 —— 任务到终态才归档,因此<strong>不含仍在 DO 中运行、尚未归档的任务</strong>(实时状态看 <code>GET /tasks/:id</code>)。按 <code>updated_at</code> 降序返回 <code>{"tasks":[{id,state,created_at,updated_at,version}],"count":N}</code>;可选 <code>?state=</code> 精确过滤(合法取值见状态机,非法 → 400)、可选 <code>?limit=</code>(默认 50,上限 200,非数字或越界 → 400)</dd>
+      <dt>GET /admin/events</dt><dd>归档事件流(需鉴权):按任务回放审计事件的 hash chain。<strong>只读</strong>投影,数据源仅为 D1 归档的 <code>events</code> 表 —— 事件随任务终态才归档,因此<strong>只含已归档(终态)任务的事件</strong>,<strong>看不到仍在 DO 中运行、尚未归档的在途事件</strong>(实时状态看 <code>GET /tasks/:id</code>)。<code>?task_id=</code>(36 字符 UUID)<strong>必填</strong>:每 task 的 <code>seq</code> 才是分页脊线,跨 task 分页无意义;缺失或畸形 → 400。按 <code>seq</code> 升序(审计回放顺序)返回 <code>{"events":[{seq,kind,digest,prev_digest,created_at,canonical}],"next_cursor":&lt;string|null&gt;}</code>。<code>canonical</code> 是 D1 <code>payload</code> 列<strong>逐字原文</strong>(即 <code>JSON.stringify({task_id,kind,payload})</code>,正是被 hash 的那个串),不解析、不重新序列化 —— 客户端因此能独立重算 <code>digest == sha256Hex((prev_digest ?? "GENESIS") + canonical)</code> 并逐条核对 <code>prev_digest</code>,即在本地重放一遍 <code>/admin/chain-check</code>。安全:审计 journal 按构造<strong>绝不携带</strong>一次性模型代理凭据 <code>proxy_token</code>(它只存在于 <code>attempts</code> 表,从不进事件链)。游标分页:<code>?limit=</code>(默认 50,上限 200,非数字或越界 → 400)、<code>?cursor=</code>(不透明游标,首页省略;畸形 → 400),<code>next_cursor</code> 为下一页起点、无后续时为 <code>null</code>;过滤不命中返回空列表而不是 404</dd>
       <dt>GET /admin/attempts</dt><dd>归档 attempt 列表(需鉴权):按任务复盘各 attempt(writer / verifier / reviewer)的终态与 token 消耗。<strong>只读</strong>投影,数据源仅为 D1 归档的 <code>attempts</code> 表 —— attempt 随任务终态才归档,因此<strong>不含尚未归档的在途 attempt</strong>(实时状态看 <code>GET /tasks/:id</code>)。按 <code>created_at</code> 降序返回 <code>{"attempts":[{id,task_id,role,state,tokens_used,max_model_tokens,max_wall_seconds,workflow_instance_id,created_at,finished_at}],"count":N}</code>(<code>count</code> 是本次返回条数,受 limit 截断)。安全投影:<code>proxy_token</code>(一次性模型代理凭据)<strong>绝不下发</strong>,内部去重用的 <code>idempotency_key</code> 同样不进投影。可选过滤器按 AND 组合:<code>?task_id=</code>(36 字符 UUID,畸形 → 400)、<code>?role=</code>(writer/reviewer/verifier)、<code>?state=</code>(RUNNING/SUCCEEDED/FAILED/BLOCKED;合法取值来自权威声明,非法 → 400,不命中返回空列表)、<code>?limit=</code>(默认 50,上限 200,非数字或越界 → 400)</dd>
     </dl>
   </div>
@@ -521,6 +522,146 @@ async function handleAdminAttempts(url: URL, env: Env): Promise<Response> {
   return Response.json({ attempts: rows.results, count: rows.results.length });
 }
 
+/**
+ * 归档事件流的投影行。D1 的 `payload` 列存的是 **canonical 串**(`appendEvent` 里
+ * 被 hash 的那个 `JSON.stringify({task_id, kind, payload})`),不是内层 payload 对象。
+ */
+interface ArchivedEventRow {
+  seq: number;
+  kind: string;
+  digest: string;
+  prev_digest: string | null;
+  created_at: string;
+  payload: string;
+}
+
+const EVENT_CURSOR_PREFIX = "evt1:";
+/** 合法游标只是 `evt1:<seq>` 的 base64url(十几个字符);超出这个长度的一定是垃圾输入。 */
+const MAX_EVENT_CURSOR_CHARS = 128;
+
+/**
+ * base64url 且无 padding:游标要原样回传进 query string,标准 base64 里的 `+` 会被
+ * query 解析成空格、`/` 与 `=` 也常在复制粘贴中出事 —— 那是分页游标最典型的一类坏法,
+ * 在编码这一侧就消掉,而不是要求客户端「记得」转义。
+ */
+function toBase64Url(text: string): string {
+  return btoa(text).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function fromBase64Url(raw: string): string {
+  const b64 = raw.replace(/-/g, "+").replace(/_/g, "/");
+  return atob(b64 + "=".repeat((4 - (b64.length % 4)) % 4));
+}
+
+function encodeEventCursor(seq: number): string {
+  return toBase64Url(`${EVENT_CURSOR_PREFIX}${seq}`);
+}
+
+/**
+ * 游标不透明:编码的是「上一页最后一条的 seq」这个位置,而不是页号。
+ * 解不开一律判非法(→ 400),绝不退化成「当作首页」—— 那会让一次拼错的翻页
+ * 静默重放已经看过的行,而回放审计最不能接受的就是「看不出漏了什么」。
+ */
+function decodeEventCursor(raw: string): number | null {
+  if (raw.length === 0 || raw.length > MAX_EVENT_CURSOR_CHARS) return null;
+  let decoded: string;
+  try {
+    decoded = fromBase64Url(raw);
+  } catch {
+    return null;
+  }
+  if (!decoded.startsWith(EVENT_CURSOR_PREFIX)) return null;
+  const digits = decoded.slice(EVENT_CURSOR_PREFIX.length);
+  if (!/^\d+$/.test(digits)) return null;
+  const seq = Number(digits);
+  return Number.isSafeInteger(seq) ? seq : null;
+}
+
+/**
+ * GET /admin/events —— 归档事件流的只读投影(数据源仅为 D1 `events` 表)。
+ *
+ * 用途是按任务回放审计 hash chain,所以刻意不做任何服务端加工:`canonical` 逐字
+ * 透出,重算 digest 留给客户端(`digest == sha256Hex((prev_digest ?? "GENESIS") +
+ * canonical)`,与 handleChainCheck 同口径、同一个 sha256Hex)。这样「端点返回的
+ * 内容」自己就是可核验的证据,而不是「服务端声称链没断」。同理,`proxy_token`
+ * 按构造不进事件链(它只存在于 attempts 表),journal 因而不是凭据的第二条出口。
+ *
+ * `?task_id=` 必填:分页脊线是每 task 的 seq(唯一索引 idx_events_task_seq),跨
+ * task 的 seq 互不相干,混在一起分页没有意义。`?limit=` 与 `/admin/tasks`、
+ * `/admin/attempts` 共用 parseAdminLimit;`?cursor=` 省略即首页。
+ *
+ * 归档只在终态发生,因此这里**看不到仍在 DO 中运行、尚未归档的在途事件** —— 实时
+ * 状态仍走 /tasks/:id。不新增状态对象,不碰状态机与归档写路径。
+ */
+async function handleAdminEvents(url: URL, env: Env): Promise<Response> {
+  const taskId = url.searchParams.get("task_id");
+  if (taskId === null) {
+    return Response.json(
+      {
+        error: {
+          type: "invalid_task_id",
+          detail: "task_id is required (pagination is keyed by per-task seq)",
+        },
+      },
+      { status: 400 },
+    );
+  }
+  if (!TASK_ID_RE.test(taskId)) {
+    return Response.json(
+      {
+        error: {
+          type: "invalid_task_id",
+          detail: "task_id must be a 36-character task uuid",
+        },
+      },
+      { status: 400 },
+    );
+  }
+
+  const rawCursor = url.searchParams.get("cursor");
+  let afterSeq = 0;
+  if (rawCursor !== null) {
+    const decoded = decodeEventCursor(rawCursor);
+    if (decoded === null) {
+      return Response.json(
+        {
+          error: { type: "invalid_cursor", detail: "cursor must be an opaque page cursor" },
+        },
+        { status: 400 },
+      );
+    }
+    afterSeq = decoded;
+  }
+
+  const { limit, error } = parseAdminLimit(url.searchParams.get("limit"));
+  if (error !== null) {
+    return Response.json({ error: { type: "invalid_limit", detail: error } }, { status: 400 });
+  }
+
+  // 值一律走占位符绑定,SQL 是固定串 —— 游标解码出的也只是数字。
+  // 多取一条只为判断「后面还有没有」:恰好取满 limit 且确实还有后续才给游标,
+  // 否则末页会返回一个指向空页的 next_cursor,客户端就永远等不到 null。
+  const rows = await env.DB.prepare(
+    "SELECT seq, kind, digest, prev_digest, created_at, payload FROM events" +
+      " WHERE task_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?",
+  )
+    .bind(taskId, afterSeq, limit + 1)
+    .all<ArchivedEventRow>();
+  const page = rows.results.slice(0, limit);
+  return Response.json({
+    events: page.map((row) => ({
+      seq: row.seq,
+      kind: row.kind,
+      digest: row.digest,
+      prev_digest: row.prev_digest,
+      created_at: row.created_at,
+      canonical: row.payload,
+    })),
+    next_cursor:
+      rows.results.length > limit ? encodeEventCursor(page[page.length - 1].seq) : null,
+  });
+}
+
 export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(req.url);
@@ -547,6 +688,10 @@ export default {
 
     if (url.pathname === "/admin/attempts" && req.method === "GET") {
       return handleAdminAttempts(url, env);
+    }
+
+    if (url.pathname === "/admin/events" && req.method === "GET") {
+      return handleAdminEvents(url, env);
     }
 
     const taskMatch =

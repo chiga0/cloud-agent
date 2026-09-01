@@ -85,6 +85,28 @@ git -C <你的仓库> checkout <candidate.base.sha> && git apply task-<task_id>-
 # 畸形值 → 400,过滤不命中 → 空列表(count 是本次返回条数,受 limit 截断,不是总匹配数)
 curl -s "localhost:8787/admin/attempts?task_id=<task_id>&role=writer" \
   -H "authorization: Bearer $TOKEN" | jq '{count, attempts: [.attempts[] | {id, state, tokens_used, finished_at}]}'
+
+# 按任务回放审计事件 hash chain —— `GET /admin/events`。
+# 同样是 D1 归档的**只读视图**(读投影,不是新的状态权威):事件随任务终态才归档,
+# 因此**只含已归档(终态)任务的事件**,**看不到仍在 DO 中运行、尚未归档的在途事件**
+# —— 在跑的任务仍看 `GET /tasks/<task_id>`。
+# `?task_id=`(36 字符 UUID)**必填**:每 task 的 `seq` 才是分页脊线,跨 task 分页没有
+# 意义;缺失或畸形 → 400。按 `seq` 升序(审计回放顺序)返回
+# `{"events":[{seq,kind,digest,prev_digest,created_at,canonical}],"next_cursor":<string|null>}`。
+# `canonical` 是 D1 `payload` 列的**逐字原文**(即被 hash 的 `JSON.stringify({task_id,kind,payload})`,
+# 不是内层 payload 对象),不解析、不重新序列化 —— 客户端因此能独立重算
+# `digest == sha256Hex((prev_digest ?? "GENESIS") + canonical)` 并逐条核对 `prev_digest`,
+# 等于在本地重放一遍 `GET /admin/chain-check`:核验依据是拿到的字节,不是服务端的一句声称。
+# 安全:审计 journal 按构造**绝不携带**一次性模型代理凭据 `proxy_token`(它只存在于
+# `attempts` 表,从不进事件链),所以这个端点不是凭据的第二条出口。
+# 游标分页:`?limit=`(默认 50,上限 200,非数字或越界 → 400)、`?cursor=`(不透明游标,
+# 首页省略;畸形 → 400);`next_cursor` 是下一页起点,无后续时为 `null`。过滤不命中 → 空列表 + null,不是 404。
+curl -s "localhost:8787/admin/events?task_id=<task_id>&limit=20" \
+  -H "authorization: Bearer $TOKEN" | jq '[.events[] | {seq, kind, digest: .digest[0:12]}]'
+# 客户端自校验:逐条用 canonical 重算 digest 并核对 prev 链接(分页时逐页核验,
+# 游标串起来就是整条链)
+curl -s "localhost:8787/admin/events?task_id=<task_id>" -H "authorization: Bearer $TOKEN" | \
+  node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",async()=>{const{events}=JSON.parse(s);const h=async c=>[...new Uint8Array(await crypto.subtle.digest("SHA-256",new TextEncoder().encode(c)))].map(b=>b.toString(16).padStart(2,"0")).join("");let prev=null;for(const e of events){if(e.prev_digest!==prev)throw new Error(`断链 @seq=${e.seq}`);if(await h((prev??"GENESIS")+e.canonical)!==e.digest)throw new Error(`digest 不符 @seq=${e.seq}`);prev=e.digest}console.log(`chain ok: ${events.length} 条`)})'
 ```
 
 ## 部署前一次性配置(需要账号操作)
