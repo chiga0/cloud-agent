@@ -578,7 +578,7 @@ qwen3.8-flash 带 reasoning,单次调用 tokens 可能很高(内部推理 + 工�
 - 写与并发 `getSnapshot` 交错 → 无撕裂读,每个快照状态一致、链不断
 - 并发 `startAttempt`(同幂等键)→ 恰好 1 个 attempt,claim 转换一次
 
-另有纯单测覆盖状态转换表合法性、rework 预算判断、watchdog 数学与组合 digest 确定性(`test/statemachine.test.ts`)、门禁分级判定(`test/gates.test.ts`),以及 reviewer 基建失败挂人工 / awaiting_human 忽略自动裁决 / 证据口径同源 / 陈旧血缘不采信(`test/session-do.test.ts`)。`npm test` 一键运行;注意测试用 `wrangler.test.jsonc`(compatibility_date 受 pool 内置 workerd 版本限制),D1 迁移由 vite `define` 在构建期内联(`test/d1.ts`)。
+另有纯单测覆盖状态转换表合法性、rework 预算判断、watchdog 数学与组合 digest 确定性(`test/statemachine.test.ts`)、门禁分级判定(`test/gates.test.ts`)、候选读模型的诚实性(`test/candidate.test.ts`)、沙箱 key 注入(`test/sandbox-env.test.ts`),以及 reviewer 基建失败挂人工 / awaiting_human 忽略自动裁决 / 证据口径同源 / 陈旧血缘不采信(`test/session-do.test.ts`);回报链路的投递入口 `handleQueue`(`session_id` → `idFromString` 路由、重投幂等、`-1` 回报进 BLOCKED)在 `test/queue-routing.test.ts`。`npm test` 一键运行;注意测试用 `wrangler.test.jsonc`(compatibility_date 受 pool 内置 workerd 版本限制),D1 迁移由 vite `define` 在构建期内联(`test/d1.ts`)。**这套绿不覆盖 `AttemptWorkflow` 的编排本身**,原因与判读方式见 §13.16。
 
 **M7 补的第三类竞态**:`alarm()` 原本游离在临界区外。DO 的 alarm 与 RPC **不互斥**,`loadAll → 判定 → saveAll` 会把并发 RPC 刚裁决完的任务改写成 BLOCKED,并把陈旧行覆盖回 D1 归档。现在 alarm 全程包在同一个 `blockConcurrencyWhile` 里,且**只有真的改了状态才回写**;超时判定与续期统一由 `statemachine.ts` 的 `attemptDeadline` / `nextWatchdogAlarm` 计算(`WALL_GRACE_SECONDS=300` 宽限 + 最小 60s 间隔),修掉了"本次触发没有 attempt 过期就不续期 → 超时兜底静默消失、任务永久挂住"。
 
@@ -655,7 +655,7 @@ checkout --quiet --detach '<sha>'
 **启用判据**(与 `REJECT_EVIDENCE_MODE` 同一套做法,但**条件互不相干,不要混淆**):≥10 个 repo attempt 中 `base_source != "unknown_legacy"` **且** `base.fallback` 由我方脚本造成 **0 次**(只允许真实 force-push 导致),才切 `enforce`;样本不足或存在自伤回落 → 保持 `shadow`。
 
 **证据现状**(2026-09-01 prod，版本 `2b8df82e`，全部 `--remote` 取证）：
-- **测试**：`npm test` → 93 passed，`tsc --noEmit` 干净。覆盖：注入样本（`a]b;c`、反引号、长度 39/41、大写）全拒、脚本内 SHA 只以 `'<sha>'` 出现且无 `repo_url`、三个 exit 码可达、**全部脚本函数体在子 shell 内且括号外无 `exit`**（§13.15 回归）、返工轮 `attempt.created.base_pin` 与首轮同 SHA、`exit 21 → BLOCKED`+`awaiting_human`+预算不变+不派 verifier/reviewer、`result_text` 为空串时 `base.failed` 仍留得下诊断、shadow 回落只记 `base.fallback`+`base.moved` 不误触熔断、verifier 血缘不匹配不采信、`reportArgsFrom` 键集与 `ReportArgs` 一致（防"静默丢字段"回归）、沙箱 key 配了独立值即不混用高权 key / 缺配回落且只在那一次告警。
+- **测试**：`npm test` → 98 passed，`tsc --noEmit` 干净。覆盖：注入样本（`a]b;c`、反引号、长度 39/41、大写）全拒、脚本内 SHA 只以 `'<sha>'` 出现且无 `repo_url`、三个 exit 码可达、**全部脚本函数体在子 shell 内且括号外无 `exit`**（§13.15 回归）、返工轮 `attempt.created.base_pin` 与首轮同 SHA、`exit 21 → BLOCKED`+`awaiting_human`+预算不变+不派 verifier/reviewer、`result_text` 为空串时 `base.failed` 仍留得下诊断、shadow 回落只记 `base.fallback`+`base.moved` 不误触熔断、verifier 血缘不匹配不采信、`reportArgsFrom` 键集与 `ReportArgs` 一致（防"静默丢字段"回归）、沙箱 key 配了独立值即不混用高权 key / 缺配回落且只在那一次告警、**`handleQueue` 投递路由 5 条**（`session_id` 命中正确实例 / 幽灵实例不误写 / `-1` 回报进 BLOCKED / 重投幂等 / 未知类型 ack，§13.16）。
 - **E1 无 repo 回归** ✅：天气任务闭环 DONE，证明基线代码路径与 key 注入没破坏非 repo writer。
 - **E2 pinned 基线端到端** ✅（`e38b8357` / `62edbba0`）：writer 与 verifier 报同一个 sha，`base.frozen` 落 `task.base`，manifest v2 带 `base`，返工轮继承同一 pin。
 - **E3 交付闭合（本轮验收终点）** ✅：`GET /tasks/:id/candidate?format=patch` 落盘 → 本地 `git checkout 762941318ee16e59dabbacb1b4049eec22f0d303 && git apply` 成功；下发的字节 sha256 与 `manifest.patch.digest` 一致（不一致会返回 `integrity_error` 而不是把未校验字节交出去）。
@@ -701,6 +701,28 @@ checkout --quiet --detach '<sha>'
 **为什么测试没抓到**：`wrangler.test.jsonc` 没有 Sandbox 绑定，单测只能断言**脚本字符串**的形状（SHA 只以 `'<sha>'` 出现、三个 exit 码可达），断不了容器语义；M6/M7 也没暴露这一类，因为那两轮的退出码全部由 **TS 侧计算**（`apply.exitCode → APPLY_FAILED_EXIT=20`），从来没有任何脚本 `exit` 过。现在 `base.test.ts` 里有一条括号深度扫描的回归：`exit` 必须出现在 `(` 之内，包装层不得把退出码吞掉。
 
 **给后续轮次的约束**：任何要经 `sandbox.exec` 执行的脚本，**退出码只能通过子 shell 产生**；需要"失败即中止"的语义优先在 TS 里判断 `exitCode`，不要在脚本顶层 `exit`。
+
+### 13.16 本地测试环境的边界：workflow orchestration 一行都没跑过 — 未解决(记录 + 部分补偿)
+
+**现象**：`npm test`(98 条)全绿且**退出码 0**,但输出里夹着 **33 行** `uncaught exception; source = Uncaught (in promise)`:
+
+| 特征 | 次数 | 成因 |
+|---|---|---|
+| `TypeError: … reading 'idFromName'`(`getContainer` ← `runQwenCodeAttempt` `src/exec/sandbox.ts:79` ← `workflow.ts:72`) | 22 | `wrangler.test.jsonc` 没有 `containers` 绑定,`env.Sandbox` 是 undefined |
+| `verify attempt requires spec.repo_url` / `writer manifest missing`(`verify.ts:42/44`) | 2 + 1 | 测试造的 verifier attempt 命中 `verify.ts` 的真实守卫 |
+| `Error: internal error; reference = …`(无栈) | 8 | 本地 Workflows 实现(workerd)自身失败,不可归因 |
+
+**为什么会打印出来**：`startAttempt` 里 `ATTEMPT_WORKFLOW.create()` 只建实例、不 await；`run()` 的 catch 回报完 DO 之后**刻意 `throw err`**(`workflow.ts:177`),让实例在 Workflows dashboard 落成 `errored` 而不是伪装成 completed。测试进程里没人接这个 rejection,vitest 的 workers pool 就只打一行,不影响结果。
+
+**它有没有污染断言?没有(实测)**。一次性探针用例(跑完已删)建一个 writer attempt 后连续观察 **40s**:`task.state` 始终 `RUNNING`,事件链始终是 `task.created, attempt.created, task.transition` —— 后台 workflow 的 `exit_code=-1` 回报**从未到达任何 DO**。所以这套绿不是靠"回报来得比断言晚"的时序侥幸;`exec` 步骤的 10s/20s 退避只是让事情更明显。
+
+**真正该记的账不是噪音**：`AttemptWorkflow.run` 的编排本身(`exec → extract → evidence → report` 四步、`slim()` 瘦身、`waitForEvent("human-approval")`、catch 的回报)**在本地完全没有执行路径** —— 容器起不来,本地 Workflows 自己还会 internal error。这条链路只有 prod E2E 一层保障。
+
+**本轮补的部分**(`test/queue-routing.test.ts`,5 条):回报链路的最后一公里 `handleQueue`,即 §13.8 幽灵实例事故的修法现场。此前只有 `reportArgsFrom` 的字段映射有单测,投递入口零覆盖。现在钉住:按 `session_id` 走 `idFromString` 命中正确实例并驱动状态机(writer 成功 → attempt `SUCCEEDED` + task `AWAITING_APPROVAL` + tokens 落库)/ 指向合法但空无任务的实例 → ack 且真实任务事件数不变(若退回 name-based id 这条即红)/ workflow 抛错的 `-1` 回报 → attempt 与 task 一起 `BLOCKED` 且 error 进 `attempt.blocked` / `review-request` 重投同幂等键 → 只有一个 reviewer attempt / 未知类型 → ack 不 retry。
+
+**没补、也别补**：不要为消灭噪音给测试环境加假的 `Sandbox` DO —— 只会把 `TypeError` 换成容器 HTTP 错误,噪音照旧、覆盖面不变。噪音的判读方式:命中上表三类特征的属预期;**其它**栈的 uncaught exception 意味着 workflow 里多了一条新的失败路径,应当查。`exec/extract/evidence` 三步要真实容器,只能留在 prod 取证。
+
+**为什么这套噪音不会红灯(A/B 实测,别误解成"vitest 不管未捕获异常")**:一次性探针在测试自身 isolate 里 `void Promise.reject(new Error("PROBE_MARKER"))` → 该用例通过但 vitest 打印 `Unhandled Errors` + `Errors 1 error` 且**退出码 1**;而 workflow 侧那 33 行同样形态的 rejection 只让 summary 保持 `7 passed / 98 passed`、**退出码 0**、无 `Errors` 计数。差别在于它们出生在 Workflows 运行时(vitest pool 之外的 workerd/miniflare 上下文),走的是 runtime 自己的错误打印,绕开了 vitest 的 per-test 异常通道。结论:机制是有的,只是覆盖不到后台 workflow —— 所以「本地跑不到 orchestration」这条账不能靠红灯兜住,只能靠上面的 `handleQueue` 用例把可本地化的那一跳拿回来。
 
 ---
 
