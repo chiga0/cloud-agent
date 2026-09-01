@@ -151,20 +151,38 @@ export interface SandboxGit extends SandboxExec {
 }
 
 /**
- * 幂等的克隆入口。workflow 的 exec step 失败会重试,而沙箱按 attemptId 键控、
- * 重试复用同一个容器:上一轮已克隆成功(或 SDK 侧 clone 超时放弃后容器内仍留下
- * 目录),再次 `gitCheckout` 必败于 "already exists",重试机制就此失效
- * (prod 实测:首次 clone 撞 SDK 600s 超时,后续两次重试全死在此错上)。
- * 先清空目标目录,让每次重试都从干净状态开始。
+ * 幂等的克隆入口。workflow 的 exec step / 整个 run 失败会重试,而沙箱按
+ * attemptId 键控、重试复用同一个容器 —— 上一轮的目录残留会让 `gitCheckout`
+ * 必败于 "already exists"(prod 实测两次:r3 撞 SDK 600s clone 超时;r6 撞
+ * run 被平台取消)。
  *
- * 清理前先把会话 cwd 挪到根目录再删:沙箱的 `exec()` 复用常驻 shell 会话,
- * 上一轮执行可能已把 cwd 停进这个目录(如 writer 的 `cd /workspace/repo &&
- * qwen`);目录本体被删后,同一会话里再 spawn 的进程(包括紧接着的克隆)会死于
- * "Unable to read current working directory"(prod 实测,两次重试全灭)。
+ * r6 还证明「先 rm 再 clone」不够:run 被取消时容器内进程并未死透,残留的
+ * qwen 及其子进程(node/vitest 等)会在 rm(exit 0)与 clone 之间重新往
+ * /workspace/repo 写文件,clone 照样报「已存在且非空」。因此:
+ * 1. 先尽力杀掉引用 repo 目录或 qwen 的残留进程(方括号模式防 pkill 自匹配);
+ * 2. 克隆进 staging 目录 —— 耗时最长的环节与任何写 REPO_DIR 的进程零竞态;
+ * 3. 单条 `rm + mv` 完成换入,竞态窗口缩到毫秒级;
+ * 4. 每步 exec 的退出码显式校验,失败大声 throw,不再带病走进克隆。
+ *
+ * 清理/换入前都先 `cd /`:沙箱的 `exec()` 复用常驻 shell 会话,上一轮可能已
+ * 把 cwd 停进 REPO_DIR(writer 的 `cd /workspace/repo && qwen`);目录本体
+ * 被删后,同一会话里再 spawn 的进程会死于 "Unable to read current working
+ * directory"(prod r4 实测)。
  */
 export async function checkoutRepo(sandbox: SandboxGit, repoUrl: string): Promise<void> {
-  await sandbox.exec(`cd / && rm -rf ${REPO_DIR}`);
-  await sandbox.gitCheckout(repoUrl, { targetDir: REPO_DIR, depth: 1 });
+  const staging = `${REPO_DIR}.new`;
+  await sandbox.exec(
+    `pkill -9 -f '/workspace/rep[o]' 2>/dev/null; pkill -9 -f '[q]wen' 2>/dev/null; true`,
+  );
+  const rm = await sandbox.exec(`cd / && rm -rf ${REPO_DIR} ${staging}`);
+  if (rm.exitCode !== 0) {
+    throw new Error(`workspace cleanup failed (exit ${rm.exitCode}): ${rm.stderr.slice(-300)}`);
+  }
+  await sandbox.gitCheckout(repoUrl, { targetDir: staging, depth: 1 });
+  const swap = await sandbox.exec(`cd / && rm -rf ${REPO_DIR} && mv ${staging} ${REPO_DIR}`);
+  if (swap.exitCode !== 0) {
+    throw new Error(`workspace swap failed (exit ${swap.exitCode}): ${swap.stderr.slice(-300)}`);
+  }
 }
 
 export type PinResult = { ok: true; base: BaseReport } | { ok: false; code: number; detail: string };
