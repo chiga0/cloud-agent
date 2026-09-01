@@ -774,6 +774,26 @@ checkout --quiet --detach '<sha>'
 
 **M9.5 修复方向**(本轮不实施):把长 exec 从「一条长 fetch」改成「后台启动 + 短轮询」—— 容器内 `nohup` 起任务、落完成标记文件,workflow 用一串短 `step.do` 轮询 + `step.sleep` 续命,每步都是秒级请求,天然绕过挂起检测且崩溃可从最近 checkpoint 恢复([Rules of Workflows](https://developers.cloudflare.com/workflows/build/rules-of-workflows/) 的标准模式)。修好前,任务规格的 `verify_command` / 单条命令按 25 分钟以内设计。
 
+### 13.19 长 exec 后台启动 + 短轮询(M9.5① / Fix C)— 已实现,r10 prod 取证暴露 SDK 契约坑后修复
+
+§13.18 记的修复方向已落地(`src/exec/longrun.ts`,提交 `716cbe6`)。长命令(qwen 主跑 / `verify_command`)不再是 workflow step 里的一条长 `await sandbox.exec`,而是「后台 `startProcess` + 短轮询」,从根上消除 §13.18 的挂起墙与 r6/r7/r8 的驱逐孤儿。
+
+**机制**:
+
+- **专用 session**:长进程跑在固定 id `longrun` 的隔离 session,default session 永不被长命令占用 —— 重试的 pkill/clone 不再排在孤儿后面(r7 实测 429s、r8 实测 415s 排队病灶消除)。
+- **幂等启动**:`launchOrReattach` 用固定 `processId=longrun` + `autoCleanup:false`;step 重试/驱逐后重放都先 `getProcess` 查记录,有记录(哪怕已终态 —— 结果绝不能丢,治 r7「exit 0 无人认领」)即重连,无记录才 `startProcess`。驱逐只重放廉价的 poll step,launch step 不重放,孤儿无从产生。
+- **脚本化启动**:启动命令固定 `bash /tmp/longrun.sh`;脚本由 `writeFile` 落盘(已实证路径),`cd`/env/重定向全收在脚本内(`{ cmd; } > stdout 2> stderr; exit $?`),不依赖 `startProcess` 端的 shell 语义。**模型凭据必须随脚本 `export` 传入** —— SDK 实证 `setEnvVars` 只作用于 default session 的 shell,专用 session 收不到。
+- **四相编排**:prepare(checkoutRepo → pinWorkspace → writeFile task.txt → writeFile longrun.sh)/ launch / poll(`step.sleep 30s` + 秒级短 RPC,逐个落 checkpoint)/ collect(`readFile` 回收两个固定输出文件,不依赖 `getProcessLogs`)。
+- **到期兜底击杀**:writer = `min(qwen 墙钟 + 3min, 预算 − 60s)`,verifier = `预算 − 120s`;到期 `killProcess(SIGKILL)`,kill/记录消失(missing)按 `exit -1` = 容量事实 → writer `BLOCKED` 转人工。**verifier `-1` 现路由仍进返工,平台错误与候选质量的分流属 M9.5②**(§13.18 末)。
+
+**r10 prod 取证暴露的 SDK 契约坑(只有真任务才暴露,提交 `34a5302` 修复)**:C4 首跑(任务 `da1ada45`,writer `c8d1dbab`)launch step 连死 3 次 → workflow Exception → writer `BLOCKED`,日志只见 `exec_step_failed stage=launch err=ProcessNotFoundError: Process longrun not found`、**无 `longrun_started`**(startProcess 从未到达)。根因:SDK 的 `getProcess(id, sessionId)` 对「进程记录不存在」**抛 `ProcessNotFoundError`**(`createErrorFromResponse` → `ErrorCode.PROCESS_NOT_FOUND`,`name` 固定),**不是返回 `null`**;而 `readProcess` 只处理了 falsy 返回,且 `launchOrReattach` 把 `readProcess` 调在它的 `try` 之外(那个 `try` 只包了 `createSession`)→ 首次启动时「查无记录」本应走 missing→startProcess,却把异常一路抛穿。
+
+这是**反模式 17 的活体标本**(见调研手册 §5):本地 23 条 longrun 单测全绿,因为测试 fake 的 `getProcess` 在不存在的分支**返回 `null`**(错误契约),恰好被 `readProcess` 的 falsy 处理接住 —— 绿的套件根本没行使 prod 失败的那条路径。修法两层:① `readProcess` 把 `getProcess` 包进 `try`,据 `err.name === "ProcessNotFoundError"` 识别为 missing(**按 name 而非 `instanceof`** —— 打包后类身份可能不是同一份,name 是稳定契约),暂态错误上抛绝不吞成 missing;② **修测试保真度**:fake 的 `getProcess` 在记录不存在时改为抛 `ProcessNotFoundError`(显式对象含畸形 `{}` 才返回),新增 3 条契约测试(name 命中→missing→启动 / 暂态错误 name≠not-found→上抛且不 startProcess / 轮询期暂态错误→上抛)。变异验证两咬人:`isProcessNotFound` 恒 false → 4 红;吞掉所有错误当 missing → 2 红。longrun 单测 23 → 26 条,全量套件 181 绿。**教训固化为:fake 必须复刻真实 SDK 的失败契约(抛 vs 返回 null),否则「绿」只是没踩到那条路。**
+
+**prod 取证状态(已闭环)**:`34a5302` 部署 `def22563`(23:31:30Z)后复验 C4(任务 `17a43e26`,r11)—— **全链绿、任务 DONE**:writer `c2c6198b` SUCCEEDED(16.8min、exit 0、6.95M tokens)、verifier `3da98ff2` SUCCEEDED(2.3min,`npm ci && tsc && npm test` → 208 测试通过)、reviewer `5e3dcd5e` approve(27s);`AttemptWorkflow.run - Ok`(非 Exception/Canceled),`longrun_started` 落日志,出站 enforce 正确(github + token-plan 放行,qwen 的 `rum.aliyuncs.com` ARMS 遥测被 allowedHosts 门拦下、无 `egress=forward`)。
+
+两个关键经验风险就此关闭:① **完成态进程记录可靠携带 exitCode** —— writer/verifier 两个 longrun 进程都以 exit 0 终态被正确读回(若缺失会被映成 `-1` → writer BLOCKED,SUCCEEDED 本身即反证);② **驱逐churn 被 durable-step 重放完全吸收** —— tail 拍到 **16 条 `getProcess - Canceled`(精确 30s 节奏 = poll 间隔)**,是 `step.sleep` 窗口里 isolate 被回收打断的轮询 RPC;但 `exec_step_failed=0`、`Exception=0`、`longrun_killed=0`,每个被取消的 poll step 都重放成功,qwen 在专用 `longrun` session 内不受 worker isolate 抖动影响跑完全程。**对照 r6/r7/r8:同样是驱逐,旧架构(单条长 exec)产出孤儿 + BLOCKED + 双烧 token,Fix C 产出零副作用的 DONE —— 这是「后台启动 + 短轮询」消灭驱逐孤儿这一类的最强实证。** 候选(`GET /admin/events`,+145 行 src/index.ts、27 新测试、base64url 不透明游标)经本地 apply→tsc→208 测试→3 条独立变异(canonical 改 parse→stringify 5 红 / ASC→DESC 10 红 / 游标 `>`→`>=` 4 红)后人工落地。
+
 ---
 
 ## 14. 延伸阅读
