@@ -6,6 +6,7 @@ import {
   DEFAULT_MAX_PATCH_BYTES,
   PATCH_PATH,
   REPO_DIR,
+  checkoutRepo,
   exportPatchScript,
   pinWorkspace,
 } from "./base";
@@ -100,7 +101,7 @@ export async function runQwenCodeAttempt(
   let base: BaseReport | undefined;
 
   if (args.repoUrl) {
-    await sandbox.gitCheckout(args.repoUrl, { targetDir: REPO_DIR, depth: 1 });
+    await checkoutRepo(sandbox, args.repoUrl);
     const pinned = await pinWorkspace(sandbox, args.basePin ?? null, pinMode(env));
     if (!pinned.ok) {
       return {

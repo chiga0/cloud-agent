@@ -145,6 +145,23 @@ export interface SandboxExec {
   exec(cmd: string): Promise<{ exitCode: number; stdout: string; stderr: string }>;
 }
 
+/** 需要 checkout 能力的沙箱接口,同样便于假沙箱单测。 */
+export interface SandboxGit extends SandboxExec {
+  gitCheckout(repoUrl: string, options?: { targetDir?: string; depth?: number }): Promise<unknown>;
+}
+
+/**
+ * 幂等的克隆入口。workflow 的 exec step 失败会重试,而沙箱按 attemptId 键控、
+ * 重试复用同一个容器:上一轮已克隆成功(或 SDK 侧 clone 超时放弃后容器内仍留下
+ * 目录),再次 `gitCheckout` 必败于 "already exists",重试机制就此失效
+ * (prod 实测:首次 clone 撞 SDK 600s 超时,后续两次重试全死在此错上)。
+ * 先清空目标目录,让每次重试都从干净状态开始。
+ */
+export async function checkoutRepo(sandbox: SandboxGit, repoUrl: string): Promise<void> {
+  await sandbox.exec(`rm -rf ${REPO_DIR}`);
+  await sandbox.gitCheckout(repoUrl, { targetDir: REPO_DIR, depth: 1 });
+}
+
 export type PinResult = { ok: true; base: BaseReport } | { ok: false; code: number; detail: string };
 
 /**

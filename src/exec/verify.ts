@@ -1,7 +1,7 @@
 import { getSandbox } from "@cloudflare/sandbox";
 import type { BaseReport, Env, TaskSpec } from "../types";
 import { putArtifact, type ArtifactRef, type EvidenceManifest } from "../audit/evidence";
-import { REPO_DIR, pinWorkspace } from "./base";
+import { REPO_DIR, checkoutRepo, pinWorkspace } from "./base";
 import type { SandboxRunResult } from "./sandbox";
 
 export interface VerifyReport {
@@ -49,7 +49,7 @@ export async function runVerifyAttempt(
   const patchText = await patchObj.text();
 
   const sandbox = getSandbox(env.Sandbox, args.attemptId);
-  await sandbox.gitCheckout(args.spec.repo_url, { targetDir: REPO_DIR, depth: 1 });
+  await checkoutRepo(sandbox, args.spec.repo_url);
 
   // v1 manifest 没有 base:只能沿用「克隆当时的默认分支」,如实标成 legacy,
   // 让报告与 /candidate 都能说明这份结论的可重放性弱一档。

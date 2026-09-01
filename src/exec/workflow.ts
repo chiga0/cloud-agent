@@ -54,38 +54,48 @@ export class AttemptWorkflow extends WorkflowEntrypoint<Env, AttemptParams> {
         "exec",
         { retries: { limit: 2, delay: "10 seconds", backoff: "exponential" } },
         async () => {
-          if (p.role === "verifier") {
-            if (!p.verify_context?.writer_manifest_key) {
-              throw new Error("verifier attempt missing verify_context.writer_manifest_key");
+          try {
+            if (p.role === "verifier") {
+              if (!p.verify_context?.writer_manifest_key) {
+                throw new Error("verifier attempt missing verify_context.writer_manifest_key");
+              }
+              return slim(
+                await runVerifyAttempt(this.env, {
+                  attemptId: p.attempt_id,
+                  taskId: p.task_id,
+                  spec: p.spec,
+                  writerManifestKey: p.verify_context.writer_manifest_key,
+                }),
+              );
             }
-            return slim(
-              await runVerifyAttempt(this.env, {
-                attemptId: p.attempt_id,
-                taskId: p.task_id,
-                spec: p.spec,
-                writerManifestKey: p.verify_context.writer_manifest_key,
-              }),
+            if (p.role === "writer") {
+              return slim(
+                await runQwenCodeAttempt(this.env, {
+                  attemptId: p.attempt_id,
+                  prompt: composeAttemptPrompt(p.spec, p.instructions, p.base_pin),
+                  model: p.model,
+                  repoUrl: p.spec.repo_url,
+                  exportPatch: Boolean(p.spec.repo_url),
+                  basePin: p.base_pin ?? null,
+                  maxWallSeconds: p.max_wall_seconds,
+                }),
+              );
+            }
+            const r = await runReviewLLM(this.env, {
+              attemptId: p.attempt_id,
+              prompt: p.spec.prompt,
+              model: p.model,
+            });
+            return { ...slim(r), reviewText: r.transcriptRaw, tokens: r.tokens };
+          } catch (err) {
+            // step 重试只把最后一次错误带进回报,中间各次的失败会被吞掉。
+            // 逐次记日志,诊断时才能分清是哪一轮执行、死于什么。
+            console.warn(
+              `exec_step_failed task=${p.task_id} attempt=${p.attempt_id} role=${p.role} ` +
+                `err=${String(err).slice(0, 500)}`,
             );
+            throw err;
           }
-          if (p.role === "writer") {
-            return slim(
-              await runQwenCodeAttempt(this.env, {
-                attemptId: p.attempt_id,
-                prompt: composeAttemptPrompt(p.spec, p.instructions, p.base_pin),
-                model: p.model,
-                repoUrl: p.spec.repo_url,
-                exportPatch: Boolean(p.spec.repo_url),
-                basePin: p.base_pin ?? null,
-                maxWallSeconds: p.max_wall_seconds,
-              }),
-            );
-          }
-          const r = await runReviewLLM(this.env, {
-            attemptId: p.attempt_id,
-            prompt: p.spec.prompt,
-            model: p.model,
-          });
-          return { ...slim(r), reviewText: r.transcriptRaw, tokens: r.tokens };
         },
       );
 
