@@ -686,6 +686,8 @@ checkout --quiet --detach '<sha>'
 
 **这条收益是有条件的**:低权 key 是**可选配置**,缺配时 `sandboxModelEnv` 回落沿用 `DASHSCOPE_API_KEY` 并打 `credential_fallback` 告警。回落 = 拆分带来的收益为零,状态与 M8 前逐字节相同。刻意不做 fail-closed:那会让一个配置层增强项阻塞基线冻结与候选交付这两个主交付物,而部署阻塞的代价是真实的(M8 曾因此停摆)。判断降权是否成立只看一处:`wrangler secret list` 里有没有 `SANDBOX_MODEL_API_KEY`,以及日志里还有没有 `credential_fallback`。
 
+**最可靠的核查是直读部署后的 binding**(`wrangler secret list` 只看当前目录配置所指向的环境,而策略开关的实际生效值在已部署的 Worker 上):`GET /accounts/<ACCOUNT_ID>/workers/scripts/cloud-agent/settings` → `result.bindings` 里 `type=plain_text` 给出 `BASE_PIN_MODE` / `REJECT_EVIDENCE_MODE` 的真值,`type=secret_text` 给出**名字**(不返回值),据此一次请求同时确认「prod 跑的是哪个模式」与「低权 key 到底铸没铸」。2026-09-01 实测:`plain_text` = `BASE_PIN_MODE=shadow` / `REJECT_EVIDENCE_MODE=shadow`,`secret_text` 只有 `DASHSCOPE_API_KEY` 与 `WORKER_API_TOKEN` —— **沙箱降权确认处于回落态**,与 E8 的 key 指纹结论一致。
+
 **M9 的最小落地顺序**:导出 `ContainerProxy` → 在 `Sandbox` 子类上设 `allowedHosts`(GitHub 域 + 包源 + 百炼 upstream)+ `interceptHttps=true` → 镜像装 CA 并 bump tag → 同批部署 → 验收**正负两条都要**:白名单内域名(如 `api.github.com`)在容器内 `curl` 成功、白名单外(如随机 VPS 或 `webhook.site`)必须失败,且 `npm install` 在预装镜像内不因 TLS 报错。
 
 ### 13.15 沙箱 `exec` 复用常驻 shell：顶层 `exit` 会杀掉会话 — 已修复（M8，prod 才发现）
