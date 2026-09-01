@@ -1,6 +1,15 @@
 import { DurableObject } from "cloudflare:workers";
-import type { AttemptParams, Env, ReviewEvidenceMode, TaskSpec, TaskState } from "../types";
-import { compositeEvidenceDigest, sha256Hex, type EvidenceManifest, type EvidencePart } from "../audit/evidence";
+import type { AttemptParams, BaseReport, Env, ReviewEvidenceMode, TaskSpec, TaskState } from "../types";
+import { InvalidBaseSha } from "../types";
+import {
+  compositeEvidenceDigest,
+  sha256Hex,
+  type BaseRef,
+  type EvidenceManifest,
+  type EvidencePart,
+} from "../audit/evidence";
+import { isValidSha, isBaseError } from "../exec/base";
+import type { CandidateDecision, CandidateEvidence } from "../audit/candidate";
 import { assertTransition, attemptDeadline, decideRework, isLegalTransition, nextWatchdogAlarm } from "./statemachine";
 import {
   assessReviewRejection,
@@ -41,6 +50,12 @@ interface TaskRecord {
   /** 熔断或 reviewer 不可用后置真:自动裁决对该任务失效,终态只能由人工给出 */
   awaiting_human: boolean;
   review_evidence_mode: ReviewEvidenceMode;
+  /**
+   * 本任务所有候选共同冻结的基线 commit。首轮由执行面解析默认分支 HEAD 得到,
+   * 之后返工轮与 verifier 一律复用它 —— 跨轮 patch_digest 比较与「候选可重放」
+   * 都以它为前提。M8 前的老记录没有这个字段,其候选按基线未固定对待。
+   */
+  base: BaseRef | null;
   /** 最近一次候选摘要(patch digest 或归一化产出),用于无进展熔断 */
   last_candidate_digest: string | null;
   /** 钉住的当前证据:审批绑定、/evidence、血缘核对的唯一口径 */
@@ -118,6 +133,8 @@ export class TaskSession extends DurableObject<Env> {
 
   private async loadAll(): Promise<SessionData> {
     const task = (await this.ctx.storage.get<TaskRecord>("task")) ?? null;
+    // M8 前的老记录没有 base 字段:归一化成 null,其候选一律按「基线未固定」对待
+    if (task && task.base === undefined) task.base = null;
     const attempts = (await this.ctx.storage.get<AttemptRecord[]>("attempts")) ?? [];
     const decisions = (await this.ctx.storage.get<DecisionRecord[]>("decisions")) ?? [];
     const events: EventRecord[] = [];
@@ -187,6 +204,11 @@ export class TaskSession extends DurableObject<Env> {
     return this.ctx.blockConcurrencyWhile(async () => {
       const s = await this.loadAll();
       if (s.task) return { task_id: s.task.id, spec_digest: s.task.spec_digest };
+      // base_sha 会被原样重放进多个新沙箱执行,校验必须在入口做,而不是在用的时候
+      const pin = (spec as { base_sha?: unknown })?.base_sha;
+      if (pin !== undefined && pin !== null && !isValidSha(pin)) {
+        throw new InvalidBaseSha("base_sha must be a full lowercase hex commit id");
+      }
       const canonical = JSON.stringify(spec);
       const specDigest = await sha256Hex(canonical);
       const now = this.now();
@@ -206,10 +228,11 @@ export class TaskSession extends DurableObject<Env> {
         awaiting_human: false,
         review_evidence_mode:
           reviewEvidenceMode ?? (this.env.REJECT_EVIDENCE_MODE === "enforce" ? "enforce" : "shadow"),
+        base: pin ? { sha: pin as string, source: "pinned" } : null,
         last_candidate_digest: null,
         current_evidence: null,
       };
-      await this.appendEvent(s, "task.created", { spec_digest: specDigest });
+      await this.appendEvent(s, "task.created", { spec_digest: specDigest, base: s.task.base });
       await this.saveAll(s);
       return { task_id: s.task.id, spec_digest: specDigest };
     });
@@ -270,10 +293,29 @@ export class TaskSession extends DurableObject<Env> {
       review: null,
     };
     s.attempts.push(record);
+
+    const spec = args.spec ?? (JSON.parse(s.task!.spec) as TaskSpec);
+    const params: AttemptParams = {
+      task_id: s.task!.id,
+      attempt_id: id,
+      role: args.role,
+      spec,
+      spec_digest: s.task!.spec_digest,
+      model: this.env.DEFAULT_MODEL,
+      session_id: this.ctx.id.toString(),
+      verify_context: args.verify_context,
+      instructions: args.instructions,
+      // 基线是执行期事实,不在冻结的 spec 里;返工轮靠这一行继承同一 commit
+      base_pin: s.task!.base?.sha ?? null,
+    };
+
+    // base_pin 进事件链:跨轮 patch_digest 比较与「这一轮验的是哪个 commit」
+    // 都必须能从审计里直接读出,而不是靠推断。
     await this.appendEvent(s, "attempt.created", {
       attempt_id: id,
       role: args.role,
       idempotency_key: args.idempotency_key,
+      base_pin: params.base_pin,
     });
 
     if (
@@ -288,18 +330,6 @@ export class TaskSession extends DurableObject<Env> {
       });
     }
 
-    const spec = args.spec ?? (JSON.parse(s.task!.spec) as TaskSpec);
-    const params: AttemptParams = {
-      task_id: s.task!.id,
-      attempt_id: id,
-      role: args.role,
-      spec,
-      spec_digest: s.task!.spec_digest,
-      model: this.env.DEFAULT_MODEL,
-      session_id: this.ctx.id.toString(),
-      verify_context: args.verify_context,
-      instructions: args.instructions,
-    };
     const instance = await this.env.ATTEMPT_WORKFLOW.create({ id, params });
     record.workflow_instance_id = instance.id;
 
@@ -319,6 +349,7 @@ export class TaskSession extends DurableObject<Env> {
     tokens?: number;
     result_text?: string | null;
     patch_digest?: string | null;
+    base?: BaseReport | null;
     review?: ReviewVerdict;
   }): Promise<{ ok: boolean; ignored?: boolean; error?: string }> {
     return this.ctx.blockConcurrencyWhile(async () => {
@@ -379,7 +410,9 @@ export class TaskSession extends DurableObject<Env> {
         manifest_key: args.manifest_key ?? null,
       });
 
-      if (attempt.role === "writer") {
+      if (isBaseError(args.exit_code)) {
+        await this.onBaseFailed(s, attempt, args);
+      } else if (attempt.role === "writer") {
         await this.onWriterReport(s, attempt, args);
       } else if (attempt.role === "verifier") {
         await this.onVerifierReport(s, attempt, args);
@@ -390,6 +423,64 @@ export class TaskSession extends DurableObject<Env> {
       await this.saveAll(s);
       return { ok: true };
     });
+  }
+
+  /**
+   * 基线材质化失败:环境事实,不是候选质量判定。重开一个沙箱在同一个 commit 上
+   * 只会同样失败,所以这里不派返工、不烧预算,直接停下转人工(与 reviewer 抖动
+   * 属同一类:没有可裁决的候选,也没有可归因给 agent 的缺陷)。
+   */
+  private async onBaseFailed(s: SessionData, attempt: AttemptRecord, args: ReportArgs): Promise<void> {
+    await this.appendEvent(s, "base.failed", {
+      attempt_id: attempt.id,
+      role: attempt.role,
+      exit_code: args.exit_code,
+      requested_base: s.task!.base?.sha ?? null,
+      // writer 角色下 result_text 恒为字符串(基线失败时提取不到 NDJSON → 空串),
+      // `??` 不认空串,会让诊断永远落成 ""。真正的 git stderr 在 transcript 产物里。
+      detail: (args.result_text?.trim() || attempt.error_tail || "").slice(0, 500),
+      manifest_key: attempt.manifest_key ?? null,
+    });
+    // 在途的其它回报不该再自动裁决:置位后 reviewer 结论只留档
+    s.task!.awaiting_human = true;
+    s.task!.pending_review = false;
+    s.task!.pending_verify = false;
+    this.setState(s, "BLOCKED");
+    await this.appendEvent(s, "task.transition", {
+      to: "BLOCKED",
+      actor: `agent:${attempt.id}`,
+      reason: `base materialization failed (exit ${args.exit_code})`,
+    });
+    await this.archiveWithRetry(s);
+  }
+
+  /**
+   * 把执行面回报的实际基线写进权威。基线一旦变化(shadow 回落、上游被重写),
+   * 跨轮 patch_digest 比较就失去意义 —— 不清零基准会把「换了基线的同等产出」
+   * 误判成无进展熔断,或反过来让真无进展躲过比较。
+   */
+  private async recordWriterBase(
+    s: SessionData,
+    attempt: AttemptRecord,
+    base: BaseReport,
+  ): Promise<void> {
+    if (!base.sha) return;
+    const next: BaseRef = { sha: base.sha, source: base.source };
+    const prev = s.task!.base;
+    if (base.fallback) {
+      await this.appendEvent(s, "base.fallback", {
+        attempt_id: attempt.id,
+        requested: prev?.sha ?? null,
+        used: next.sha,
+        detail: base.fallback.slice(0, 500),
+      });
+    }
+    if (prev && prev.sha !== next.sha) {
+      await this.appendEvent(s, "base.moved", { attempt_id: attempt.id, from: prev.sha, to: next.sha });
+      s.task!.last_candidate_digest = null;
+    }
+    s.task!.base = next;
+    await this.appendEvent(s, "base.frozen", { attempt_id: attempt.id, sha: next.sha, source: next.source });
   }
 
   /** writer 回报:失败走硬门禁返工;成功则钉证据、过无进展熔断,再派 verifier 或 reviewer。 */
@@ -422,6 +513,7 @@ export class TaskSession extends DurableObject<Env> {
       return;
     }
 
+    if (args.base) await this.recordWriterBase(s, attempt, args.base);
     if (args.result_text != null) s.task!.result_text = args.result_text;
     const candidate =
       args.patch_digest ??
@@ -503,6 +595,15 @@ export class TaskSession extends DurableObject<Env> {
       });
       return;
     }
+    if (args.base?.sha && s.task!.base && args.base.sha !== s.task!.base.sha) {
+      // 验的不是这份基线:结论与当前候选无关,不采信
+      await this.appendEvent(s, "base.lineage_mismatch", {
+        verifier_attempt_id: attempt.id,
+        verified_base: args.base.sha,
+        current_base: s.task!.base.sha,
+      });
+      return;
+    }
     if (args.manifest_digest) {
       pinned.verifier_attempt_id = attempt.id;
       pinned.verifier_manifest_digest = args.manifest_digest;
@@ -527,7 +628,7 @@ export class TaskSession extends DurableObject<Env> {
         s,
         attempt.id,
         `verify exit_code=${args.exit_code}`,
-        describeVerifyFailure(args.result_text),
+        describeVerifyFailure(args.result_text, s.task!.base?.sha ?? args.base?.sha ?? null),
       );
     }
   }
@@ -1052,6 +1153,61 @@ export class TaskSession extends DurableObject<Env> {
       writer_attempt_id: ev?.writer_attempt_id ?? null,
       verifier_attempt_id: ev?.verifier_attempt_id ?? null,
       awaiting_human: s.task.awaiting_human,
+    };
+  }
+
+  /**
+   * GET /candidate 的取数入口:只返回 refs 与摘要,R2 读取留在 Worker 侧
+   * (与 getEvidenceSummary 同构)。判定者身份必须带出来 —— verifier 的
+   * reject 意思是「候选不可重放/验收失败」,reviewer 或人工的 reject 是质量
+   * 否决,两者在交付视图里不能混成一个标签。
+   */
+  async getCandidateRefs(): Promise<{
+    found: boolean;
+    state: TaskState;
+    awaiting_human: boolean;
+    base: BaseRef | null;
+    evidence: CandidateEvidence | null;
+    decision: CandidateDecision | null;
+    binding_digest: string | null;
+  }> {
+    const s = await this.loadAll();
+    if (!s.task) {
+      return {
+        found: false,
+        state: "PENDING",
+        awaiting_human: false,
+        base: null,
+        evidence: null,
+        decision: null,
+        binding_digest: null,
+      };
+    }
+    const ev = s.task.current_evidence;
+    const last = s.decisions[s.decisions.length - 1];
+    const decider = last?.attempt_id ? s.attempts.find((a) => a.id === last.attempt_id) : undefined;
+    return {
+      found: true,
+      state: s.task.state,
+      awaiting_human: s.task.awaiting_human,
+      base: s.task.base,
+      evidence: ev
+        ? {
+            writer_attempt_id: ev.writer_attempt_id,
+            writer_manifest_key: ev.writer_manifest_key,
+            writer_manifest_digest: ev.writer_manifest_digest,
+            verifier_attempt_id: ev.verifier_attempt_id ?? null,
+            verifier_manifest_digest: ev.verifier_manifest_digest ?? null,
+          }
+        : null,
+      decision: last
+        ? {
+            decision: last.decision,
+            actor: last.actor,
+            by: decider?.role === "verifier" ? "verifier" : decider?.role === "reviewer" ? "reviewer" : "human",
+          }
+        : null,
+      binding_digest: ev ? await this.computeBindingDigest(s) : null,
     };
   }
 

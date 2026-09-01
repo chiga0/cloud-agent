@@ -167,6 +167,27 @@ describe("describeVerifyFailure:把验证报告译成修复指令", () => {
     expect(lines[0]).toContain("error: patch failed: hello.py:1");
   });
 
+  it("基线已冻结 → 指令点名该 commit,且不再让 writer 追最新分支", () => {
+    const report = JSON.stringify({
+      base: { sha: "f".repeat(40) },
+      apply: { exit_code: 1, stderr_tail: "error: patch does not apply" },
+      verify: null,
+    });
+    const lines = describeVerifyFailure(report, "a".repeat(40));
+    expect(lines[0]).toContain("f".repeat(40));
+    expect(lines[0]).not.toContain("最新默认分支");
+  });
+
+  it("无基线(legacy 任务)→ 仍给可用指令,不编造 sha", () => {
+    const report = JSON.stringify({
+      apply: { exit_code: 1, stderr_tail: "error: patch does not apply" },
+      verify: null,
+    });
+    const lines = describeVerifyFailure(report, null);
+    expect(lines[0]).toContain("重新生成可重放的补丁");
+    expect(lines[0]).not.toMatch(/[0-9a-f]{40}/);
+  });
+
   it("验证命令失败 → 指令里带上 stdout 尾部", () => {
     const report = JSON.stringify({
       apply: { exit_code: 0, stderr_tail: "" },

@@ -12,7 +12,8 @@
     "DEFAULT_MAX_MODEL_TOKENS": "5000000",
     "DEFAULT_MAX_WALL_SECONDS": "3600",
     "DEFAULT_MAX_ATTEMPTS": "3",
-    "REJECT_EVIDENCE_MODE": "shadow"
+    "REJECT_EVIDENCE_MODE": "shadow",
+    "BASE_PIN_MODE": "shadow"
   },
   "d1_databases": [
     {

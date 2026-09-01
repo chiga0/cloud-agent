@@ -1,5 +1,5 @@
 import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from "cloudflare:workers";
-import type { AttemptParams, Env } from "../types";
+import type { AttemptParams, BaseReport, Env } from "../types";
 import type { ArtifactRef } from "../audit/evidence";
 import type { ReportMessage } from "./queue";
 import { writeManifest, type EvidenceManifest } from "../audit/evidence";
@@ -15,6 +15,8 @@ interface ExecOutcome {
   transcript: ArtifactRef;
   stderr: ArtifactRef;
   patch?: ArtifactRef;
+  /** repo 任务:本次执行实际所基于的精确 commit(writer 与 verifier 必须同值) */
+  base?: BaseReport;
   /** reviewer 专用:模型正文(受 max_tokens 约束,体积小,可直接进步骤返回值) */
   reviewText?: string;
   tokens?: number;
@@ -25,8 +27,9 @@ function slim(r: {
   transcript: ArtifactRef;
   stderr: ArtifactRef;
   patch?: ArtifactRef;
+  base?: BaseReport;
 }): ExecOutcome {
-  return { exitCode: r.exitCode, transcript: r.transcript, stderr: r.stderr, patch: r.patch };
+  return { exitCode: r.exitCode, transcript: r.transcript, stderr: r.stderr, patch: r.patch, base: r.base };
 }
 
 /**
@@ -68,10 +71,11 @@ export class AttemptWorkflow extends WorkflowEntrypoint<Env, AttemptParams> {
             return slim(
               await runQwenCodeAttempt(this.env, {
                 attemptId: p.attempt_id,
-                prompt: composeAttemptPrompt(p.spec, p.instructions),
+                prompt: composeAttemptPrompt(p.spec, p.instructions, p.base_pin),
                 model: p.model,
                 repoUrl: p.spec.repo_url,
                 exportPatch: Boolean(p.spec.repo_url),
+                basePin: p.base_pin ?? null,
               }),
             );
           }
@@ -106,7 +110,7 @@ export class AttemptWorkflow extends WorkflowEntrypoint<Env, AttemptParams> {
 
       const manifestRef = await step.do("evidence", async () => {
         const manifest: EvidenceManifest = {
-          schema_version: 1,
+          schema_version: 2,
           task_id: p.task_id,
           attempt_id: p.attempt_id,
           role: p.role,
@@ -116,6 +120,7 @@ export class AttemptWorkflow extends WorkflowEntrypoint<Env, AttemptParams> {
           transcript: run.transcript,
           artifacts: [run.stderr],
           patch: run.patch,
+          base: run.base?.sha ? { sha: run.base.sha, source: run.base.source } : undefined,
         };
         return writeManifest(this.env.EVIDENCE, manifest);
       });
@@ -132,6 +137,7 @@ export class AttemptWorkflow extends WorkflowEntrypoint<Env, AttemptParams> {
         manifest_digest: manifestRef.digest,
         tokens: extracted.tokens,
         patch_digest: run.patch?.digest ?? null,
+        base: run.base ?? null,
         result_text:
           p.role === "writer" || p.role === "verifier"
             ? (extracted.text ?? "").slice(0, 32_000)

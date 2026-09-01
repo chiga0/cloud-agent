@@ -1,4 +1,4 @@
-import type { Env, TaskSpec } from "../types";
+import type { BaseReport, Env, TaskSpec } from "../types";
 import type { ReviewVerdict } from "../control/gates";
 import { TaskSession } from "../control/session";
 
@@ -11,6 +11,7 @@ interface ReviewMessage {
   idempotency_key: string;
 }
 
+/** 验证器的基线只从 writer manifest 读;消息里刻意不带 SHA,避免第二个口径。 */
 interface VerifyMessage {
   schema_version: 1;
   type: "verify-request";
@@ -36,7 +37,29 @@ export interface ReportMessage {
   result_text?: string | null;
   /** writer 导出的候选 patch 摘要(非 repo 任务为空),无进展熔断的比较基准 */
   patch_digest?: string | null;
+  /** 本次执行实际所基于的精确 commit(基线冻结的落库来源) */
+  base?: BaseReport | null;
   review?: ReviewVerdict;
+}
+
+/**
+ * exec-report 消息 → reportExecution 入参。逐字段列举意味着漏一行就静默变
+ * null(证据就是这么丢的),所以单独成函数、由单测钉住字段齐备。
+ */
+export function reportArgsFrom(body: ReportMessage): Parameters<TaskSession["reportExecution"]>[0] {
+  return {
+    attempt_id: body.attempt_id,
+    exit_code: body.exit_code,
+    error: body.error,
+    transcript_digest: body.transcript_digest ?? null,
+    manifest_key: body.manifest_key ?? null,
+    manifest_digest: body.manifest_digest ?? null,
+    tokens: body.tokens ?? 0,
+    result_text: body.result_text ?? null,
+    patch_digest: body.patch_digest ?? null,
+    base: body.base ?? null,
+    review: body.review,
+  };
 }
 
 /**
@@ -83,18 +106,7 @@ export async function handleQueue(
       }
       if (body?.type === "exec-report") {
         const session = env.TASK_SESSION.get(env.TASK_SESSION.idFromString(body.session_id));
-        await session.reportExecution({
-          attempt_id: body.attempt_id,
-          exit_code: body.exit_code,
-          error: body.error,
-          transcript_digest: body.transcript_digest ?? null,
-          manifest_key: body.manifest_key ?? null,
-          manifest_digest: body.manifest_digest ?? null,
-          tokens: body.tokens ?? 0,
-          result_text: body.result_text ?? null,
-          patch_digest: body.patch_digest ?? null,
-          review: body.review,
-        });
+        await session.reportExecution(reportArgsFrom(body));
         // reportExecution 幂等且自身不抛错;只有 DO 不可达等异常才 retry
         msg.ack();
         continue;

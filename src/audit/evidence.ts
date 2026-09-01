@@ -1,3 +1,5 @@
+import type { BaseSource } from "../exec/base";
+
 export async function sha256Hex(data: string | ArrayBuffer): Promise<string> {
   const buf = typeof data === "string" ? new TextEncoder().encode(data) : data;
   const hash = await crypto.subtle.digest("SHA-256", buf);
@@ -24,8 +26,15 @@ export async function putArtifact(
   return { key, digest, size };
 }
 
+/** 候选所基于的精确 commit。没有它,patch 只能对「当时那条默认分支」说话。 */
+export interface BaseRef {
+  sha: string;
+  source: BaseSource;
+}
+
 export interface EvidenceManifest {
-  schema_version: 1;
+  /** 写入恒为 2;v1 缺 base,读取方必须按「基线未固定」处理而非报错 */
+  schema_version: number;
   task_id: string;
   attempt_id: string;
   role: string;
@@ -36,6 +45,7 @@ export interface EvidenceManifest {
   artifacts: ArtifactRef[];
   /** writer 导出的候选变更 patch(repo 任务),供独立验证器重放 */
   patch?: ArtifactRef;
+  base?: BaseRef;
   model_calls_digest?: string;
 }
 

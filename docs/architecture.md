@@ -12,16 +12,18 @@
 
 | 维度 | 承诺 |
 |---|---|
-| **正确性** | 任务状态以 D1 为唯一权威,带 fencing version 做 CAS,任何外部视图(Workflow 历史、日志、R2 文件)都不作为仲裁依据 |
+| **正确性** | 运行中任务状态以 TaskSession DO 为唯一权威(单写者串行 + 显式转换表),终态归档 D1;任何外部视图(Workflow 历史、日志、R2 文件)都不作为仲裁依据 |
 | **可恢复** | Worker 崩溃、Sandbox 容器替换、Workflow step 重试均不丢失进度;每个 step 都是幂等可重放 |
 | **可审计** | 模型 I/O、沙箱 transcript、人工决策一律进 hash chain + 内容寻址 R2,篡改可检测 |
-| **凭据合规** | token-plan key 只注入沙箱内 agent 客户端直连百炼(token-plan 许可的用法),不经任何代理转发、不落盘、不进 API 路径 |
+| **可交付** | 每个 repo 候选绑定一个精确基线 commit(writer 与 verifier 在同一个 SHA 上工作),经 `GET /tasks/:id/candidate` 原样取回并在本地重放(§13.13) |
+| **凭据合规** | token-plan key 直连百炼、不经代理转发、不落盘(telemetry 关闭)。M8 起可分裂为两把:沙箱拿**可撤销的低权 key** `SANDBOX_MODEL_API_KEY`,高权 `DASHSCOPE_API_KEY` 留在 Worker 侧给 reviewer——低权那把是可选配置,缺配即回落共用,降权要等它真的铸出来才成立(§13.14) |
 | **成本可控** | 每个 attempt 有 token / 时长 / turn 三重预算;时长与 turn 由 qwen-code 参数硬停,token 事后记账供归因与后续决策 |
 
 ### 非目标
 
 - 不是多租户平台 — 当前单一 `WORKER_API_TOKEN` 做 API 鉴权,无用户/团队层
 - 不是 agent 框架 — agent 实现(qwen-code / 未来的 opencode、pi)由 sandbox 镜像提供,本仓不管
+- **不写外部代码托管** — 本仓的权威止于「产出可核对的候选 + 人工批准」;把批准后的精确内容送回 GitHub 需要独立的 Publisher 与受限写权限,属 M9+。沙箱一律不持有 push 能力
 - 不提供实时流式 UI — 只暴露 REST,前端后续再做
 - 不追求高并发写 — events hash chain 是防篡改,不是为吞吐优化
 
@@ -64,15 +66,22 @@
 
 | 层 | 模块 | 文件 |
 |---|---|---|
-| 入口 + 路由 | Router / Landing / API dispatch | `src/index.ts` |
-| 控制面 | 权威状态、fencing、事件链 | `src/control/authority.ts` |
+| 入口 + 路由 | Router / Landing / API dispatch(含候选交付 `handleGetCandidate`) | `src/index.ts` |
+| 控制面 | **权威**:状态机、事件链、证据钉住、决策、终态归档 | `src/control/session.ts`(TaskSession DO) |
+| 控制面 | 转换表 / watchdog 数学 / 组合 digest(纯函数) | `src/control/statemachine.ts` |
+| 控制面 | 门禁分级判定 + 返工指令生成(纯函数) | `src/control/gates.ts` |
 | 执行面 | Workflow 编排 | `src/exec/workflow.ts` |
-| 执行面 | Sandbox 启动与 transcript 处理 | `src/exec/sandbox.ts` |
+| 执行面 | 基线冻结:SHA 校验 + 材质化/导出脚本(纯函数) | `src/exec/base.ts` |
+| 执行面 | Sandbox 启动、基线材质化、transcript 处理 | `src/exec/sandbox.ts` |
+| 执行面 | 独立验证器(新沙箱重放候选) | `src/exec/verify.ts` |
+| 执行面 | reviewer(纯 LLM 直调,无工具) | `src/exec/review.ts` |
 | 执行面 | 答案提取 + token 统计(stream-json → 纯文本/用量) | `src/exec/extract.ts` |
-| 执行面 | Queue consumer(reviewer fan-out) | `src/exec/queue.ts` |
+| 执行面 | attempt prompt 组装(原始任务 + 返工指令) | `src/exec/prompt.ts` |
+| 执行面 | Queue consumer(verifier/reviewer 路由 + 回报映射) | `src/exec/queue.ts` |
 | 审计 | sha256 / R2 内容寻址 / manifest | `src/audit/evidence.ts` |
-| 类型 | Env / TaskState / AttemptParams | `src/types.ts` |
-| Schema | D1 迁移脚本 | `migrations/0001_init.sql`、`0002_add_result_text.sql` |
+| 审计 | 候选读模型投影(纯函数) | `src/audit/candidate.ts` |
+| 类型 | Env / TaskState / AttemptParams / BaseRef | `src/types.ts` |
+| Schema | D1 迁移脚本 | `migrations/0001_init.sql`、`0002_add_result_text.sql`、`0003_add_event_seq.sql` |
 | 沙箱 | 自定义镜像(qwen-code 预装) | `sandbox/Dockerfile` |
 | 部署 | Wrangler 绑定 + 容器配置 | `wrangler.jsonc` |
 
@@ -98,31 +107,37 @@
 ## 4. 核心概念
 
 ### Task
-一次用户请求(immutable spec + 可变状态)。`spec` 在创建时 JSON 序列化 + SHA-256 冻结,后续不可变。
+一次用户请求(immutable spec + 可变状态)。`spec` 在创建时 JSON 序列化 + SHA-256 冻结(`spec_digest`),后续不可变。
 
 ```ts
 // src/types.ts
 interface TaskSpec {
   prompt: string;
-  repo_url?: string;        // 可选:沙箱内 git clone 到的工作仓
-  verify_command?: string;  // 可选:执行完后跑这个命令做 verify
+  acceptance?: string[];    // 声明式验收标准;缺省时 reviewer 意见纯 advisory
+  repo_url?: string;        // 待改造仓(当前仅公开 https 匿名克隆,私有仓接入位在注释)
+  base_sha?: string;        // 人工指定的冻结基线(全长度 hex);缺省 = 执行时解析默认分支 HEAD 并固定
+  verify_command?: string;  // 独立验证器在冻结基线上重放候选后要跑的命令
   worker?: "qwen-code";
 }
 ```
 
-Task 的 `result_text` 列(`migrations/0002`)保存 agent 的最终答案纯文本,由 workflow 在 `extract` step 里写入。
+`spec_digest` 刻意只覆盖**人工意图**:执行期才解析出的基线不进 spec,而是落 `TaskRecord.base: { sha, source }`(§13.13)。Task 的 `result_text` 由回报路径写进 DO,终态随归档落 D1(`migrations/0002`)。
 
 ### Attempt
-Task 的一次执行尝试。同一 task 可能有多次 attempt(reject 后再试;或 reviewer 接力)。每个 attempt 有自己的:
+Task 的一次执行尝试。同一 task 可能有多次 attempt(rework 再试;或 verifier / reviewer 接力)。每个 attempt 有自己的:
 - `max_model_tokens` / `max_wall_seconds` — 预算(时长/turn 由 qwen-code 参数硬停;tokens 事后记账)
-- `tokens_used` — transcript 解析出的实际用量,由 workflow 的 extract step 写入
+- `tokens_used` — transcript 解析出的实际用量,由 workflow 的 extract step 统计
 - `workflow_instance_id` — 对应的 Durable Workflow 实例
-- `idempotency_key` — `task_id:attempt:N` 或 reviewer 场景的自定义键,UNIQUE 约束保证去重
+- `idempotency_key` — `task_id:attempt:N` 或 verifier/reviewer 场景的自定义键,UNIQUE 约束保证去重
+- `base_pin` — 本轮要材质化到的精确 commit;返工轮由 `TaskRecord.base` 继承,并写进 `attempt.created` 事件
 
 > `proxy_token` 列是旧代理架构的遗留(0001 schema),主流程已不使用,保留兼容。
 
 ### Decision
-人工(HITL)或系统对 attempt 的判定。当前只走 approve/reject,后续 reviewer agent 可以产出 block + reason。
+人工(HITL)或系统对 attempt 的判定。`POST /approve` 只收 `approve|reject`;落库的决策值另有两个内部产物——`accept_with_notes`(reviewer 想返工但举证不成立,降级放行、意见留档)与 `none`(reviewer 抖动或没产出结论,挂 `awaiting_human`)。任何 decision 强制绑定组合证据 digest(§13.9)。
+
+### Candidate
+repo 任务的产出物:一份基于**冻结基线**的 git patch + 它的证据血统。它**不是新的状态对象**,而是 `TaskRecord.base` + 钉住的 writer manifest + verifier 结论 + 最新 decision 的读模型投影(`src/audit/candidate.ts`),经 `GET /tasks/:id/candidate` 取回。`status` 与 `safe_to_apply` 的存在是为了让消费方一眼分清「独立验证过」和「只是产出过」——被 reject 或基线漂移的候选不能看起来像可直接提交。
 
 ### Evidence
 R2 里的内容寻址对象 + 一次 attempt 的 manifest:
@@ -177,22 +192,24 @@ reviewer 的 `decision:"none"`(基建失败或输出不可解析,见 §13.12)**�
 
 ---
 
-## 6. 控制面 — `src/control/authority.ts`
+## 6. 控制面 — `src/control/`(TaskSession DO 为唯一权威)
 
-职责:
-- **`createTask(env, spec)`** — 分配 id,sha256 冻结 spec,落 events.task.created
-- **`createAttempt(env, args)`** — 分配 id,UNIQUE 约束做幂等(proxy_token 为遗留列,继续填充但不再用于鉴权)
-- **`transition(env, args)`** — CAS 状态转换,version 不匹配 fail closed
-- **`recordDecision(env, args)`** — 写入 decisions 表,绑定 evidence_digest 与 fencing_token
-- **`finishAttempt(env, id, state)`** — 收口 attempt 状态 + finished_at
-- **`recordTokenUsage(env, id, tokens)`** — 写入 attempt 的 tokens_used(transcript 解析的事后记账)
-- **`appendEvent(env, taskId, kind, payload)`** — 追加 hash chain 事件
-- **`getTask` / `setResultText`** — 读与轻量写辅助
+M1 起权威从「Worker 直接 CAS D1 行」迁到 `TaskSession` DO,早期的 `src/control/authority.ts` 自由函数(`createTask/createAttempt/transition/recordDecision`)已删除。现存三文件分工:
+
+| 文件 | 职责 |
+|---|---|
+| `session.ts` — `TaskSession extends DurableObject` | 唯一写者:状态机、attempt 编排、证据钉住、决策、终态归档 |
+| `statemachine.ts`(纯) | 转换表合法性、`attemptDeadline` / `nextWatchdogAlarm`、`composite` 组合 digest |
+| `gates.ts`(纯) | 门禁分级判定、`describeVerifyFailure` 等返工指令生成 |
+
+**RPC 面**:写入 `createTask` / `startAttempt` / `reportExecution` / `submitDecision` / `alarm`;只读投影 `getSnapshot` / `getResultText` / `getEvidenceSummary` / `getCandidateRefs` / `getAttemptManifestKey`。Worker 侧不做任何仲裁,只做 HTTP ↔ RPC 的转换与 R2 读取。
 
 **关键设计点**:
 
-- `version` 是 fencing token。每次 transition +1,调用方必须先读后写;过期 version 立即拒绝。
-- `appendEvent` 当前用 `ORDER BY created_at DESC, rowid DESC LIMIT 1` 取 prev。**已知缺陷**:同一 task 并发 appendEvent 会让两个 worker 读到同一个 prev,各自写出 sibling,链会"分叉"。短期内靠 attempt 串行缓解,长期方案见 §11.1。
+- DO 是**运行中**任务的权威;D1 只是终态归档 + 查询视图。Workflow 历史、日志、R2 文件都不是仲裁依据。
+- 每条写路径(含 `alarm`)整体包在 `ctx.blockConcurrencyWhile()` 里完成 读 → 变更 → 写,并发不产生交错;有并发测试证明(§13.11)。
+- `version` 是 fencing token:`setState` 每次 +1,并作为 `fencing_token` 写进 decisions 与归档。它现在的作用是**让外部读到的视图可判断新旧**,不再承担"调用方先读后写"的乐观锁义务——串行化已在 DO 内部完成。
+- 事件按 task 单调 `seq` 追加、分片(每片 100 条),链内单写者。~~同一 task 并发 `appendEvent` 会读到同一个 prev 从而分叉~~ 已修(0003 加 seq + DO 串行),`GET /admin/chain-check` 可持续复核(§13.1)。
 
 ---
 
@@ -219,13 +236,15 @@ Durable Workflow 把一次 attempt 切成若干独立幂等 step,崩溃后从最
 
 `@cloudflare/sandbox` 的 `getSandbox(env.Sandbox, attemptId)` 按 attemptId 取一个一次性容器。流程:
 
-1. `setEnvVars` — 注入 `OPENAI_BASE_URL = MODEL_UPSTREAM_BASE`、`OPENAI_API_KEY = DASHSCOPE_API_KEY`(token-plan key)、`OPENAI_MODEL`,qwen-code 直连百炼
-2. 可选 `gitCheckout(repoUrl, depth=1)` 到 `/workspace/repo`,并 `git rev-parse HEAD` 记录 base SHA
-3. 写 `/workspace/task.txt` = prompt(镜像由 `sandbox/Dockerfile` 预装 qwen-code,不再现场 `npm install`;缺二进制即 `exit 127` 直接失败并落证据,不做兜底 shim)
-4. `exec` 跑 `qwen -p "$(cat task.txt)" --output-format stream-json --auth-type openai --yolo --max-session-turns 12 --max-wall-time 5m`
-5. 软失败检测:qwen 在 API 错误时仍 exit=0,但最后一条 `type=result` 的 `result` 字段会含 `[API Error:...]`。识别后上翻 exit_code=11
-6. transcript / stderr 写 R2(内容寻址);成功且为 repo 任务时导出冻结候选:`git add -A && git diff <base> --binary` → `readFile` → patch artifact(写入 manifest 的 `patch` 字段)
-7. **验证语义不在此执行**:`verify_command` 由独立 verifier 在另一沙箱重放(见 §13.10);非 repo 任务无验证
+1. (repo 任务)`gitCheckout(repoUrl, depth=1)` 到 `/workspace/repo`,再由 `pinWorkspace()`(`src/exec/base.ts`)**把工作副本材质化到冻结基线**:先解析默认分支 HEAD;任务已有基线则 `fetch --depth=1 origin '<sha>'` → 逐级 `--deepen=10/100/1000` → `checkout --detach` → 断言 `rev-parse HEAD` 等于该 sha。刻意不用 `gitCheckout({branch: <sha>})`:SDK 只把 `branch` 原样透传给容器 HTTP 接口,SHA 是否被当 ref 处理没有文档承诺,而基线是本轮权威事实,必须由自己拥有的脚本保证(该脚本已在 bash / dash 两个 shell 下实测)。
+2. **材质化失败即止**:直接返回 `exit_code=21/22/23` 加一条说明性 transcript,**不启动模型、不注入任何凭据**。失败原因可能是不可信 repo_url 根本连不上,起沙箱不等于把自己的 key 递过去。
+3. `setEnvVars` — 注入 `OPENAI_BASE_URL = MODEL_UPSTREAM_BASE`、`OPENAI_API_KEY = SANDBOX_MODEL_API_KEY`(**沙箱专用低权 key**,§13.14)、`OPENAI_MODEL`,qwen-code 直连百炼。该 secret 未配置时回落到 `DASHSCOPE_API_KEY` 并打一条 `credential_fallback` 告警——降权是配置层增强,刻意不阻塞基线冻结与候选交付这两个主交付物。
+4. 写 `/workspace/task.txt` = prompt(镜像由 `sandbox/Dockerfile` 预装 qwen-code,不再现场 `npm install`;缺二进制即 `exit 127` 直接失败并落证据,不做兜底 shim)。repo 任务的 prompt 前置【基线约束】:工作副本已 detach 到 `<sha>`,禁止 `git fetch/pull/switch/checkout` 与改写历史 —— 不写清这一点,writer 会自作主张「同步到最新」,把候选做进另一个世界。
+5. `exec` 跑 `qwen -p "$(cat task.txt)" --output-format stream-json --auth-type openai --yolo --max-session-turns 12 --max-wall-time 5m`
+6. 软失败检测:qwen 在 API 错误时仍 exit=0,但最后一条 `type=result` 的 `result` 字段会含 `[API Error:...]`。识别后上翻 exit_code=11
+7. transcript / stderr 写 R2(内容寻址);成功且为 repo 任务时导出候选 patch —— **断言式**:`cat-file -e` 确认基线对象在 → `git add -A` → `git diff '<base_sha>' --binary`,任一步非零即 `exit 23` 且**不产出半成品补丁**(宁可失败,也不交出一张不知道对谁有效的补丁)
+8. 返回 `{ exitCode, transcript, stderr, patch, base }`,`base = { sha, source }` 随证据链上翻到控制面
+9. **验证语义不在此执行**:`verify_command` 由独立 verifier 在另一沙箱**同一基线**上重放(见 §13.10);非 repo 任务无验证
 
 **软失败检测的意义**:qwen-code 把 API 错误嵌入 stream-json 的 result 事件而不是反映在退出码,如果不识别会把"401/限流"当成"任务成功"。
 
@@ -261,7 +280,7 @@ Durable Workflow 把一次 attempt 切成若干独立幂等 step,崩溃后从最
 ```
 qwen-code (沙箱内)
    │  OPENAI_BASE_URL = MODEL_UPSTREAM_BASE (https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1)
-   │  OPENAI_API_KEY  = DASHSCOPE_API_KEY (token-plan key)
+   │  OPENAI_API_KEY  = SANDBOX_MODEL_API_KEY (沙箱专用低权 key;缺配则回落 DASHSCOPE_API_KEY 并告警。高权 key 平时只在 Worker 侧给 reviewer)
    ▼
 百炼 compatible-mode API ──► 响应进 stream-json stdout ──► transcript 落 R2(审计)
                                                               │
@@ -301,7 +320,7 @@ qwen-code (沙箱内)
 
 ```ts
 interface EvidenceManifest {
-  schema_version: 1;
+  schema_version: 2;              // 写入恒为 2;读取方必须容忍 v1(缺 base,按「基线未固定」处理而非报错)
   task_id: string;
   attempt_id: string;
   role: string;                   // writer / reviewer / verifier
@@ -310,10 +329,15 @@ interface EvidenceManifest {
   model: string;
   transcript: ArtifactRef;        // qwen 的 stream-json 输出
   artifacts: ArtifactRef[];       // 当前实际只放 stderr
-  verify?: ArtifactRef;           // 可选,verify_command 的输出
+  patch?: ArtifactRef;            // writer 导出的候选变更(repo 任务),供 verifier 重放
+  base?: { sha: string; source: "resolved_default" | "pinned" };  // 该候选所基于的精确 commit
   model_calls_digest?: string;    // 预留:整轮 model call 的 Merkle 根
 }
 ```
+
+> **为什么 `base` 必须在 manifest 里**:没有它,patch 只能对「当时那条默认分支」说话 —— 跨轮 `patch_digest` 比较失去意义,证据也无法自证「基于哪个世界」。`TaskRecord.base` 是任务级权威,manifest 的 `base` 是这份候选自己的血统;两者不一致时(基线在候选产生后变了)交付视图报的是**候选的**基线。
+>
+> 历史审批绑定不受影响:`compositeEvidenceDigest` / `computeBindingDigest` 组合的是已存的 manifest digest,不是重算的 manifest 内容。
 
 ### 审计路径
 
@@ -325,7 +349,7 @@ interface EvidenceManifest {
 
 ## 10. 人工审批(HITL)与证据绑定
 
-`POST /tasks/:id/approve` 接收 `{ decision: "approve" | "accept_with_notes" | "reject", actor?: string, attempt_id, evidence_digest }`,后两者**必填**(`submitDecision` 强制):
+`POST /tasks/:id/approve` 接收 `{ decision: "approve" | "reject", actor?: string, attempt_id, evidence_digest }`,后两者**必填**(`submitDecision` 强制)。`accept_with_notes` 是控制面内部的降级决策(reject 举证不成立时由它写),**不由外部提交**;其它值 → 400 `invalid_decision`:
 
 1. `evidence_required` — 缺 `attempt_id` 或 `evidence_digest` → 400
 2. `attempt_not_writer` — attempt 必须是 writer(裁决对象是候选本身)→ 409
@@ -351,11 +375,13 @@ interface EvidenceManifest {
 |---|---|---|---|
 | GET | `/` | 无 | 落地页(环境 + 端点列表) |
 | GET | `/healthz` | 无 | `{ ok: true, env }` |
-| POST | `/tasks` | `Bearer $WORKER_API_TOKEN` | 创建 task + 首个 attempt,启动 workflow;`spec.acceptance[]`(可选,≤8 项、每项 3–500 字符,非法 → 400 `invalid_acceptance`)、顶层 `review_evidence_mode`(可选 `shadow`/`enforce`,覆盖环境变量);返回 `{ task_id, attempt_id, workflow }` |
-| GET | `/tasks/:id` | `Bearer $WORKER_API_TOKEN` | 返回 `{ task, attempts[], events[] }`,含 `task.result_text` |
+| POST | `/tasks` | `Bearer $WORKER_API_TOKEN` | 创建 task + 首个 attempt,启动 workflow;`spec.acceptance[]`(可选,≤8 项、每项 3–500 字符,非法 → 400 `invalid_acceptance`)、`spec.base_sha`(可选,全长度小写 hex;非法 → 400 `invalid_base_sha`,不落库、不起沙箱)、顶层 `review_evidence_mode`(可选 `shadow`/`enforce`,覆盖环境变量);返回 `{ task_id, attempt_id, workflow }` |
+| GET | `/tasks/:id` | `Bearer $WORKER_API_TOKEN` | 返回 `{ task, attempts[], events[] }`,含 `task.result_text` 与 `task.base` |
 | GET | `/tasks/:id/result` | `Bearer $WORKER_API_TOKEN` | `text/plain` 直出 agent 最终答案;尚未提取到返回 404 `{ error: "no_result_yet" }` |
-| POST | `/tasks/:id/approve` | `Bearer $WORKER_API_TOKEN` | 裁决 `approve`/`accept_with_notes`/`reject`,必填 `attempt_id` + `evidence_digest`(组合证据);缺 400 / 不匹配 409 |
-| GET | `/tasks/:id/evidence` | `Bearer $WORKER_API_TOKEN` | 返回最新 attempt 的 manifest JSON + `binding_digest`(approve 应提交的组合证据) |
+| POST | `/tasks/:id/approve` | `Bearer $WORKER_API_TOKEN` | 裁决 `approve`/`reject`,必填 `attempt_id` + `evidence_digest`(组合证据);缺 400 / 不匹配 409。`accept_with_notes` 是内部降级决策,不由外部提交 |
+| GET | `/tasks/:id/evidence` | `Bearer $WORKER_API_TOKEN` | 返回钉住的 writer manifest JSON + `binding_digest`(approve 应提交的组合证据) |
+| GET | `/tasks/:id/candidate` | `Bearer $WORKER_API_TOKEN` | 候选交付视图(只读投影,不新增状态对象):`{ status, verified, safe_to_apply, base, patch, writer_attempt_id, verifier_attempt_id, decision, binding_digest, warnings }`。`status ∈ unverified \| verified \| verification_failed \| approved \| rejected \| held_for_human`;`base` 是**这份候选自己的**基线(manifest 血统),与任务当前基线不一致时进 `warnings`。尚未有钉住候选 → 404 `no_candidate_yet` |
+| GET | `/tasks/:id/candidate?format=patch` | `Bearer $WORKER_API_TOKEN` | `text/plain` + `Content-Disposition: attachment; filename="task-<id>-<patch digest 前 12 位>.patch"`。**下发前重算补丁字节 sha256 并与 manifest 记录的 digest 比对**,不一致 → 500 `integrity_error`,不把未校验字节交出去。判定进响应头 `x-candidate-status` / `x-verified` / `x-safe-to-apply` / `x-base-sha`,只看头也不会把被否决的候选当成可提交成品 |
 | GET | `/tasks/:id/attempts/:aid/transcript` | `Bearer $WORKER_API_TOKEN` | 流式透传 R2 里的 transcript 原文 |
 
 ### 典型调用序列
@@ -389,6 +415,14 @@ curl -sS -X POST $BASE/tasks/$TASK/approve \
   -H "Authorization: Bearer $WORKER_API_TOKEN" \
   -H "Content-Type: application/json" \
   -d "{\"decision\":\"approve\",\"actor\":\"human:me\",\"attempt_id\":\"$WRITER_ID\",\"evidence_digest\":\"$BINDING\"}"
+
+# 5. 取回候选并在它的基线上本地重放(这一步才是"补丁 Harness"的验收终点)
+CAND=$(curl -sS $BASE/tasks/$TASK/candidate -H "Authorization: Bearer $WORKER_API_TOKEN")
+echo "$CAND" | jq '{status, verified, safe_to_apply, base, warnings}'
+BASE_SHA=$(echo "$CAND" | jq -r .base.sha)
+curl -sS -OJ "$BASE/tasks/$TASK/candidate?format=patch" -H "Authorization: Bearer $WORKER_API_TOKEN"
+git -C /path/to/repo fetch origin "$BASE_SHA" && git -C /path/to/repo checkout --detach "$BASE_SHA"
+git -C /path/to/repo apply task-$TASK-*.patch
 ```
 
 ---
@@ -407,12 +441,14 @@ curl -sS -X POST $BASE/tasks/$TASK/approve \
 | Queue | `REPORT_QUEUE` = `cloud-agent-report`,DLQ = `cloud-agent-report-dlq` | workflow → DO 回报通道(经 session_id 路由) |
 | Container | `Sandbox` = `registry.cloudflare.com/34817bdd…/cloud-agent-sandbox:qwen-0.21.10` | 自建沙箱镜像(`sandbox/Dockerfile`,base = `cloudflare/sandbox:0.8.14` + qwen-code 预装) |
 | Durable Object | `Sandbox` | 容器绑定 |
-| Secret | `DASHSCOPE_API_KEY` | 百炼 token-plan key,注入沙箱供 agent 客户端直连(不落盘) |
+| Secret | `DASHSCOPE_API_KEY` | 百炼 token-plan 高权 key,Worker 侧 reviewer 直调用;并在下一行缺配时作为沙箱回落值 |
+| Secret | `SANDBOX_MODEL_API_KEY` | 沙箱专用低权 key,注入容器当 `OPENAI_API_KEY`;可单独撤销。**可选** —— 缺配时回落上一把并打 `credential_fallback` 告警,即回到「沙箱泄露 = 控制面凭据泄露」的状态;真正的降权要等这把它配上 |
 | Secret | `WORKER_API_TOKEN` | 控制面 API token |
 | Var | `DEFAULT_MODEL` = `qwen3.8-flash` | 默认模型 |
 | Var | `DEFAULT_MAX_MODEL_TOKENS` = `5000000` | 软上限,基本不触达 |
 | Var | `DEFAULT_MAX_WALL_SECONDS` = `3600` | 单 attempt 1 小时 |
 | Var | `REJECT_EVIDENCE_MODE` = `shadow` | reviewer 证据硬校验模式:`shadow` 只记事件、`enforce` 才降级返工(§13.12) |
+| Var | `BASE_PIN_MODE` = `shadow` | 基线材质化失败的处理:`shadow` 回落已解析的默认分支并记 `base.fallback`、`enforce` 直接 `BLOCKED` 转人工(§13.13)。**两种模式都真实使用冻结基线材质化工作副本**,只在失败路径上分叉;verifier 侧恒为 enforce |
 
 ### 部署动作顺序
 
@@ -429,6 +465,13 @@ curl -sS -X POST $BASE/tasks/$TASK/approve \
 **换镜像与删冷装不要紧接在一起上线**(M7c 实测):把 `containers[0].image` 换成自建镜像的同一次部署里删掉 `npm install -g` 兜底,部署后的**头几个 attempt 会命中仍在服务旧镜像的热实例** → `qwen: command not found` → `exit_code=127`(旧镜像里没有 qwen)。平台按实例逐个换血,窗口期约几分钟;每个任务因此白烧一轮返工预算。缓解:先只部署镜像(保留兜底安装)→ 等热实例换完 → 再删兜底。
 
 **注意**:worker 启动时即查 `tasks` 等表,如果 migration 没跑,所有涉及 D1 的端点会立刻 500。先迁移、后部署。
+
+**取证与部署会撞到的平台事实**（M8 实测，逐条都卡过）：
+
+- **wrangler 的 OAuth bearer 打不通 D1 与 Workflows**。同一个 bearer 在 Workers Scripts / R2 / Queues / `/user` 上全部正常，唯独这两个产品的 API 回 `{"code":10000,"message":"Authentication error"}` —— 而 token 的 scope 列表里 `d1:write` 明明在。原因与 scope 无关，是**凭据类型**：wrangler 只发 `Authorization: Bearer`（从不发 `X-Auth-Token`），而这两类 API 只认用户 API token。解法是 `export CLOUDFLARE_API_TOKEN=cfut_…`（该环境变量**完全覆盖**已存的 OAuth 配置），此后 `d1 execute --remote` / workflow 相关命令即恢复。
+- **脚本库 UA 会被 Cloudflare bot 防护拦下**。`curl` 的默认 UA 放行（200），但 `Python-urllib` 这类库 UA 一律 `403 / error code 1010` —— 对 `*.workers.dev` 上的控制面 API 和对 `dash.cloudflare.com/oauth2/token` 都一样。表现像"token 无效"或"端点挂了"，实际是 UA 指纹，排查时先换 UA 再怀疑凭据。
+- **secret 与 plain var 不能同名**：`wrangler secret put BASE_PIN_MODE` → `code: 10053`（该名字已是 `wrangler.jsonc` 的 vars）。要临时改这类策略开关，只能改配置再部署。
+- **桶别搞错**：manifest 在 `EVIDENCE`（`cloud-agent-evidence`），transcript / stderr / patch 产物在 `ARTIFACTS`（`cloud-agent-artifacts`）。`wrangler r2 object get` **不接受** `--force`（那是 `put` 的参数），且 `--file` 失败时不会留文件，容易误判成"下载成功但内容为空"。
 
 ---
 
@@ -516,12 +559,13 @@ qwen3.8-flash 带 reasoning,单次调用 tokens 可能很高(内部推理 + 工�
 
 修复:验证语义从 writer 沙箱移出,成为独立角色纵切:
 
-1. **冻结候选**:writer 成功后导出 `git add -A && git diff <base_sha> --binary` 为 patch,内容寻址入 R2,写入 writer manifest 的 `patch` 字段
+1. **冻结候选**:writer 成功后在**已材质化到冻结基线**的工作副本上导出 `git diff '<base_sha>' --binary` 为 patch(导出前先 `cat-file -e` 断言基线对象在、`git add -A`),内容寻址入 R2,写入 writer manifest 的 `patch` 字段;任一步非零即 `exit 23` 且不产出半成品补丁
 2. **编排**:task `RUNNING → VERIFYING`,经 `REVIEW_QUEUE` 发 `verify-request`(复用现有队列,幂等键 `task:verify:<n>`);consumer 路由 DO 创建 verifier attempt
-3. **重放**:全新沙箱浅克隆默认分支 → 从 R2 取 patch → `git apply` → 跑 `verify_command`;**不跑 LLM**,transcript 即结构化报告 `{apply:{exit_code}, verify:{exit_code, stdout_tail, stderr_tail}}`
+3. **重放**:全新沙箱浅克隆 → 从 **writer manifest 的 `base.sha`** 取基线并跑与 writer **同一个** `materializeScript` 材质化到它 → 从 R2 取 patch → `git apply` → 跑 `verify_command`;**不跑 LLM**,transcript 即结构化报告 `{schema_version:2, base:{sha,source}, apply:{exit_code}, verify:{exit_code, stdout_tail, stderr_tail}}`。基线只从 manifest 读、消息里刻意不带 SHA —— 不能有两个口径
 4. **裁决**:验证通过 → 派 reviewer(输入含验证结论 + diff 摘录)→ `AWAITING_APPROVAL`;验证失败 → 按否决进 rework 闭环,预算耗尽 → REJECTED;verifier 基建错误同样按验证失败处理
 - **验收**:repo 任务(`octocat/Hello-World` + `test -f hello.txt && grep -q 'hello cloud-agent' hello.txt`)全链 `RUNNING→VERIFYING→AWAITING_APPROVAL→DONE`,验证器报告 `apply=0, verify=0`
-- **已知限制**:patch 基于浅克隆默认分支,上游在 writer→verifier 窗口期移动时 `git apply` 可能失败——按验证失败处理(证据失败,属预期语义,进 rework)
+- ~~**已知限制**:patch 基于浅克隆默认分支,上游在 writer→verifier 窗口期移动时 `git apply` 可能失败~~ → **M8 消解**:verifier 重放的是 writer 那个精确 commit,上游移动不再改变验证语义;此时 `git apply` 失败就是候选真有缺陷(见 §13.13 的文案同步)
+- **M8 引入的刻意不对称**:writer 在 `BASE_PIN_MODE=shadow` 下可以回落默认分支,verifier **永远 enforce、不回落**。理由:让验证器"自己找一个能 clone 的分支"会把基线漂移伪装成候选缺陷,烧掉一轮不可能赢的返工
 
 ### 13.11 DO 并发保护 — 已实现并有测试证明
 
@@ -572,6 +616,89 @@ qwen3.8-flash 带 reasoning,单次调用 tokens 可能很高(内部推理 + 工�
 - 非 repo 任务的候选是归一化后的回答文本,两轮完全相同的概率极低 → 熔断在这类任务上基本不触发,属预期,不引入相似度启发式;
 - `spec.acceptance` 缺省时 reviewer 无从指向"第几条标准",其 reject 一律 `no_acceptance_criteria` 降级为 advisory —— 想让门禁有牙齿就要写验收标准;
 - 原地续轮(同一沙箱内继续下一轮,省掉重新 clone/装依赖)未做:默认 `sleepAfter=10m` 下轮间存活不成立,需先实测(见 plan 的 M7b spike)。
+
+### 13.13 基线冻结 — 已实现(M8,默认影子运行)
+
+~~`sandbox.ts` 抓到 `baseSha` 后只用于本地拼 `git diff`,既不返回也不落库;`verify.ts` 独立 `gitCheckout(depth:1)` 与 writer **零 SHA 协调**——补丁能否重放取决于默认分支在两次 clone 之间有没有动,而不是候选的性质。~~
+
+不只是 `git apply` 失败会误伤:没有固定基线,M7 的跨轮 `patch_digest` 比较失去意义(两轮工作在不同的世界里),`EvidenceManifest` 也没有 commit 字段,证据无法自证「基于哪个世界」,人拿到候选在本地对不上。M8 把「这个候选基于哪个精确 commit」变成控制面权威事实。
+
+**基线为什么不进 `TaskSpec`**:`spec_digest = sha256(JSON.stringify(spec))` 是**人工意图的承诺**,已进全部历史 manifest 绑定;把执行期才解析出的 commit 塞进 spec 会让 `spec_digest` 语义漂移,并让 M7 攒下的影子语料不可比。所以运行时事实落 `TaskRecord.base: { sha, source }`,`spec.base_sha` 只在人**明确 pin** 时存在(`source="pinned"`)。`scheduleRework` 重新解析的是冻结的 `TaskRecord.spec`,基线不在里面 → 返工继承靠 `startAttemptInternal` 显式写 `params.base_pin`,且 `attempt.created` 事件带 `base_pin`,让「这一轮验的是哪个 commit」能从审计链直接读出,不靠推断。
+
+`BaseSource = "resolved_default" | "pinned" | "unknown_legacy"`。`unknown_legacy`(M8 前的老记录)是**唯一允许「无基线候选」的例外**。
+
+**不依赖 SDK 的 `gitCheckout({ branch: <sha> })`**:`@cloudflare/containers` 只是把 `branch` 透传给容器 HTTP 接口,SHA 会不会被当 ref 处理是镜像版本的经验属性、无文档承诺。统一走自己拥有的材质化阶梯(`src/exec/base.ts`,`depth:1` clone 之后逐条 `git -C /workspace/repo`):
+
+```
+fetch --depth=1 origin '<sha>'   # GitHub 等允许直接取任意可达 commit
+  ↓ 取不到
+cat-file -e '<sha>^{commit}' || 循环 --deepen=10/100/1000 把历史加深到能看见它
+  ↓ 仍取不到 → exit 21 UNREACHABLE
+checkout --quiet --detach '<sha>'
+  ↓ 最后断言 rev-parse HEAD == '<sha>',否则 exit 22 MISMATCH
+```
+
+结尾的 HEAD 断言是必要的:静默落在另一个 commit 上比失败危险得多——补丁会「看起来」通过验证而基线是假的。多一次 fetch 换确定性,符合最小复杂度。
+
+**三个专用退出码 + fail-closed 路由**:`21 UNREACHABLE` / `22 MISMATCH` / `23 PATCH_EXPORT_FAILED`。`reportExecution` 见到它们 → `base.failed` + `awaiting_human=true` + `RUNNING→BLOCKED`,**不调 `decideRework`、不递减预算**——基线材质化失败是环境事实,重开一个沙箱在同一个 commit 上必然同样失败,烧一轮预算只会得到一个更贵的 BLOCKED(与 M6 确立的「基建抖动 ≠ verdict」同类)。
+
+**shell 注入防护是硬性要求,不是加固项**:持久化的 `base_sha` 会被原样重放进**多个新沙箱**执行,那等于把一段数据库里的字符串变成跨沙箱的 shell 执行,直接击穿执行面隔离边界。三层:① HTTP 入口与 DO 入口都跑 `isValidSha`(`/^([0-9a-f]{40}|[0-9a-f]{64})$/`,长度与字符集全锚定;不合法 400,不落库、不起沙箱),② `shaLiteral` / `revLiteral` 二次校验、不合法即 throw,③ 脚本里 SHA 只以单引号字面量出现且 `base.ts` **永不接收 `repo_url`**;外加 `GIT_TERMINAL_PROMPT=0`,避免坏 ref / 私有仓触发凭据交互把沙箱挂死。
+
+**刻意不对称**:writer 在 `BASE_PIN_MODE=shadow` 下可在 `exit 21` 时回落默认分支(记 `base.fallback`);verifier **恒 enforce、不回落**,基线只从 writer manifest 读、消息里刻意不带 SHA(不能有第二个口径)。让验证器"自己找一个能 clone 的分支"会把基线漂移伪装成候选缺陷,烧掉一轮不可能赢的返工。verifier 报回的 `base.sha` 与权威不一致 → `base.lineage_mismatch` 且不采信结论。
+
+**语义随之变更**:基线冻结后 `git apply` 失败不再可能是"世界移动了",它就是候选有缺陷、该进返工。因此 `describeVerifyFailure` 的 apply 分支文案从「请基于最新默认分支重新生成补丁」改成「基线已固定为 commit `<sha>`,验证器重放的正是它……请基于该基线重做变更,不要同步或切换到其它分支」——不改文案会把 writer 推向与冻结基线不一致的第二次努力。
+
+**shadow / enforce 都真实材质化**,只在失败路径分叉。另有一条 M7 交互:`base.moved`(shadow 回落或上游重写导致基线变化)时清零 `last_candidate_digest` —— 否则跨基线的同等产出会被无进展熔断误判。
+
+**向后兼容**:`EvidenceManifest.schema_version: 2` + 可选 `base?`;所有读取方容忍 v1(`verify.ts` 读到无 base 的老 manifest 时如实标 legacy,沿用默认分支克隆)。`compositeEvidenceDigest` 组合的是**已存 digest**,历史审批绑定逐字节不变。
+
+**启用判据**(与 `REJECT_EVIDENCE_MODE` 同一套做法,但**条件互不相干,不要混淆**):≥10 个 repo attempt 中 `base_source != "unknown_legacy"` **且** `base.fallback` 由我方脚本造成 **0 次**(只允许真实 force-push 导致),才切 `enforce`;样本不足或存在自伤回落 → 保持 `shadow`。
+
+**证据现状**(2026-09-01 prod，版本 `2b8df82e`，全部 `--remote` 取证）：
+- **测试**：`npm test` → 93 passed，`tsc --noEmit` 干净。覆盖：注入样本（`a]b;c`、反引号、长度 39/41、大写）全拒、脚本内 SHA 只以 `'<sha>'` 出现且无 `repo_url`、三个 exit 码可达、**全部脚本函数体在子 shell 内且括号外无 `exit`**（§13.15 回归）、返工轮 `attempt.created.base_pin` 与首轮同 SHA、`exit 21 → BLOCKED`+`awaiting_human`+预算不变+不派 verifier/reviewer、`result_text` 为空串时 `base.failed` 仍留得下诊断、shadow 回落只记 `base.fallback`+`base.moved` 不误触熔断、verifier 血缘不匹配不采信、`reportArgsFrom` 键集与 `ReportArgs` 一致（防"静默丢字段"回归）、沙箱 key 配了独立值即不混用高权 key / 缺配回落且只在那一次告警。
+- **E1 无 repo 回归** ✅：天气任务闭环 DONE，证明基线代码路径与 key 注入没破坏非 repo writer。
+- **E2 pinned 基线端到端** ✅（`e38b8357` / `62edbba0`）：writer 与 verifier 报同一个 sha，`base.frozen` 落 `task.base`，manifest v2 带 `base`，返工轮继承同一 pin。
+- **E3 交付闭合（本轮验收终点）** ✅：`GET /tasks/:id/candidate?format=patch` 落盘 → 本地 `git checkout 762941318ee16e59dabbacb1b4049eec22f0d303 && git apply` 成功；下发的字节 sha256 与 `manifest.patch.digest` 一致（不一致会返回 `integrity_error` 而不是把未校验字节交出去）。
+- **E5 不可达基线** ✅ 双模式：`shadow` 下（`9d3a84d5` / `346a1dcb`）回落已解析的默认分支、记 `base.fallback`（detail 带 git 原文）并继续正常流程；`enforce` 下（`73fd11c4` / `c4ceadcf`）19 秒 BLOCKED，`attempts=1`、writer `tokens_used=0`（**基线不可用就不起模型**这一点被记账证实）、无 `verify.requested` / `review.requested`、预算不变。
+- **E6 注入** ✅：5 个样本（含 `a'*;touch /pwn`、39/41 位、大写）全 400 `invalid_base_sha`，D1 无记录、无沙箱。
+- **E7 向后兼容** ✅：M7 老任务 `8e8e408a` 重算 `binding_digest` = `c2582af6650e…`、writer manifest digest = `51af01939692…`，与 M7 归档**逐字节相同**（v1 manifest 无 `base`，读取路径容忍）；`GET /candidate` 对它返回 `base: null` + 警告「基线未固定：补丁只与抓取时刻的默认分支绑定，不保证能在其它 commit 上重放」，状态如实给 `held_for_human`、`safe_to_apply=false`，**没有**因为曾经 approve 就伪装成可提交。`GET /admin/chain-check` → `checked=47, broken=0`。
+- **E8 凭据** ✅（结论是**否**）：容器内 `OPENAI_API_KEY` 的 sha256 前缀与 Worker 侧 `DASHSCOPE_API_KEY` 相同 —— prod 至今没有铸 `SANDBOX_MODEL_API_KEY`，所以本轮"降权"实际收益为零，与 §13.14 写明的条件一致。
+- **修好的静默丢字段（prod 才看得见）**：`base.failed.detail` 在单测里非空、在 prod 恒为 `""`。根因是 writer 的 `result_text` 恒为字符串：基线失败时 transcript 是纯文本、提取器返回 `null`、workflow 落成 `""`，而 DO 用 `args.result_text ?? attempt.error_tail` 取值——`??` 不认空串，回落永远不执行。现改为先 `trim()` 判空再回落，并给事件补 `manifest_key` 指针。上面 `73fd11c4`（修复前，detail 空）与 `c4ceadcf`（修复后，detail `exit_code=21` + `manifest_key`）是同一条路径的前后对照样本；沿 `manifest_key → manifest.transcript → 产物` 一跳即可取到真实诊断：`pinned base deadbeef… not materializable (exit 21): fatal: remote error: upload-pack: not our ref …`。
+- **enforce 判据未达成**：判据要求 ≥10 个 repo attempt 且 `base.fallback` 由我方脚本造成 0 次。现状 = 5 个 `base.frozen` + 2 个 `base.failed`（均为刻意注入的合成样本），`base.fallback` 2 次全部来自不存在的 `deadbeef…` pin，**我方脚本造成 0 次**这一半成立，样本量那一半不成立。因此 `BASE_PIN_MODE` 保持 `shadow`。测完 enforce 已立刻改回 shadow 再部署，prod 不留 enforce 状态。
+
+**已知不覆盖**：
+- **E4「上游移动」未取证**：需要在一个**对 runner 有默认分支 push 权限**的仓库上，于 writer 执行期间再压一个与候选冲突的提交，对照 M8 前会 `APPLY_FAILED_EXIT=20`、M8 后候选仍按冻结基线通过。prod 全部 repo 样本都在 `octocat/Hello-World`（无写权限）上，因此这条只能标未覆盖。复现配方：建一个自己的 scratch 仓 → 提交任务时 pin 一个稳定 sha → 任务在跑时向默认分支 push 一个改动同一文件的提交 → 期望 verifier 仍 `exit 0`。
+- 私有仓 fetcher 未实现：只在 `TaskSpec.repo_url` 处留了接入位注释，`GIT_TERMINAL_PROMPT=0` 保证坏 ref 不会挂死，但私有仓现在一律 clone 失败。
+- **候选 patch 无大小上限**：导出走 `sandbox.readFile`（容器文件 API 的 base64 GET，**不经 shell 会话**，所以不受 §13.15 那条影响），整份读进 Worker 内存后由 `putArtifact` 落 R2 —— 只记 `size`、不设上限（我们这侧没有任何代码层阈值，超限的表现落在平台配额上）。一个含巨型二进制改动的候选会整份穿过 Worker isolate。本轮未加截断或拒绝，因为「候选被静默截断」比失败更危险，正解是给 `exportPatchScript` 加 `--stat` 预检 + 超限 fail-closed，属 M9 工作量。
+- 基线只保证「writer 与 verifier 在同一个 commit」，不保证「这个 commit 是 GitHub 当前默认分支」——`GET /candidate` 的 `base.moved` 提示负责把这一点如实告诉消费方。
+
+### 13.14 出站网络 allowlist — 未做(顺延 M9),本轮用可撤销低权 key 补偿
+
+调研与最佳实践手册都把「沙箱出站必须可治理」列为长任务前置条件,但**探针结论是本轮不该硬上**:三个坑里任何一个配错,得到的都是「看着像有门禁、实际没有」,而这比明确标未做更危险。现状事实:`src/index.ts` 只导出 `Sandbox` / `TaskSession` / `AttemptWorkflow`,**没有导出 `ContainerProxy`**——`@cloudflare/sandbox` 依赖 `@cloudflare/containers@^0.3.0` 并 re-export 了它,能力在,但链没挂上,容器出站今天完全不经过 allowlist。
+
+三个坑(实施 M9 前必须逐条过):
+
+1. **`ContainerProxy` 必须从 Worker 入口导出**。不导出时 outbound 拦截**根本不发生**——不是"配置没生效",是请求压根没进处理器链,`allowedHosts` 形同注释。
+2. **`setAllowedHosts` / `allowedHosts` 是半配置陷阱**:拦截默认只覆盖 HTTP(`interceptHttps` 默认 `false`),此时白名单设得再对,`https://` 出站照样直连。要打开必须 `allowedHosts` + `interceptHttps` 成对配置,并保留 `deniedHosts` 兜底。
+3. **`interceptHttps=true` 要求容器镜像信任 Cloudflare 的 CA**(`/etc/cloudflare/certs/cloudflare-containers-ca.crt`)。镜像不装这个证书,后果不是"拦截失效"而是**每个合法 HTTPS 请求 TLS 失败**——`npm install` / `git clone` / `curl` 全红,表现为随机基建故障。因此它是**镜像改动**:要写进 `sandbox/Dockerfile` 并随镜像 tag 一起升,同时按 §12 的排空窗口与 worker 部署同批走,否则头几个 attempt 会打到不信任 CA 的旧镜像。
+
+**本轮实际买到的东西(诚实边界)**:`SANDBOX_MODEL_API_KEY`(低权、可撤销、只注入容器)与 `DASHSCOPE_API_KEY`(高权,Worker 侧 reviewer 用)分开,方向与 M7 前相反——控制面持高权 key,沙箱持低权 key。它买到的是**撤销能力 + 爆炸半径 + 归因**(泄露时立刻撤 key、从事件链定位泄露窗口内的 attempt 集合),**不是限流**:DashScope token-plan 没有可靠的 per-key 硬额度,拿到 key 仍可花到配额上限。所以沙箱泄露的应急动作是「立刻撤销 + 圈定受影响 attempt」,不要指望"损失有上界"。
+
+**这条收益是有条件的**:低权 key 是**可选配置**,缺配时 `sandboxModelEnv` 回落沿用 `DASHSCOPE_API_KEY` 并打 `credential_fallback` 告警。回落 = 拆分带来的收益为零,状态与 M8 前逐字节相同。刻意不做 fail-closed:那会让一个配置层增强项阻塞基线冻结与候选交付这两个主交付物,而部署阻塞的代价是真实的(M8 曾因此停摆)。判断降权是否成立只看一处:`wrangler secret list` 里有没有 `SANDBOX_MODEL_API_KEY`,以及日志里还有没有 `credential_fallback`。
+
+**M9 的最小落地顺序**:导出 `ContainerProxy` → 在 `Sandbox` 子类上设 `allowedHosts`(GitHub 域 + 包源 + 百炼 upstream)+ `interceptHttps=true` → 镜像装 CA 并 bump tag → 同批部署 → 验收**正负两条都要**:白名单内域名(如 `api.github.com`)在容器内 `curl` 成功、白名单外(如随机 VPS 或 `webhook.site`)必须失败,且 `npm install` 在预装镜像内不因 TLS 报错。
+
+### 13.15 沙箱 `exec` 复用常驻 shell：顶层 `exit` 会杀掉会话 — 已修复（M8，prod 才发现）
+
+**事实**：`sandbox.exec()` → `ensureDefaultSession()` → `POST /api/execute` 的每条命令都跑在**同一个常驻 shell 会话**里（`@cloudflare/sandbox` 的 execute 路径），不是一次性进程。于是脚本里顶层的 `exit N` 退掉的是**会话本身**：SDK 不返回退出码，而是抛 `SandboxError: … Session '…' is not ready or shell has died`。
+
+这对 M8 是致命的：`base.ts` 的三个退出码（21 / 22 / 23）与 `reportExecution` 里那条「环境事实不烧返工预算、直接 BLOCKED 转人工」的路由，全部依赖脚本自己 `exit`。实际表现是 fail-closed 路径**永不执行**，任务从 workflow 的通用异常分支落成 BLOCKED，`awaiting_human=false`、诊断文本丢失——看起来"也失败了"，但审计语义完全不同。
+
+**修法**：`materializeScript` / `exportPatchScript` / `resolveScript` 的整个函数体包进子 shell `( … )`。`exit` 只结束子进程，状态码照常回传；顺带阻止 `set -eu`、`export GIT_TERMINAL_PROMPT`、`R=` 泄漏进同一会话里后续的 qwen 与 patch 导出命令。
+
+**为什么测试没抓到**：`wrangler.test.jsonc` 没有 Sandbox 绑定，单测只能断言**脚本字符串**的形状（SHA 只以 `'<sha>'` 出现、三个 exit 码可达），断不了容器语义；M6/M7 也没暴露这一类，因为那两轮的退出码全部由 **TS 侧计算**（`apply.exitCode → APPLY_FAILED_EXIT=20`），从来没有任何脚本 `exit` 过。现在 `base.test.ts` 里有一条括号深度扫描的回归：`exit` 必须出现在 `(` 之内，包装层不得把退出码吞掉。
+
+**给后续轮次的约束**：任何要经 `sandbox.exec` 执行的脚本，**退出码只能通过子 shell 产生**；需要"失败即中止"的语义优先在 TS 里判断 `exitCode`，不要在脚本顶层 `exit`。
 
 ---
 

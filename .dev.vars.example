@@ -1,3 +1,15 @@
-# 复制为 .dev.vars 供 wrangler dev 使用(不入库)
+# 复制为 .dev.vars 供 wrangler dev 使用(不入库)。
+# 远端对应 `wrangler secret put`。
+
+# 控制面(Worker)侧高权 key:给 reviewer 直调百炼用;也是下面那把缺配时的回落值
 DASHSCOPE_API_KEY=sk-你的百炼key
+
+# 沙箱专用低权 key:注入容器当 OPENAI_API_KEY。买到的是「可单独撤销 + 爆炸半径止于
+# 一把 key + 用量可归因」,不是额度硬上限(token-plan 无可靠的 per-key 硬配额)。
+# **可选**:未配置时容器沿用上面的 DASHSCOPE_API_KEY —— 那正是 M8 要消掉的状态
+# (沙箱里跑 --yolo + 任意 repo_url + 不可信代码,共用一把 = 沙箱泄露即控制面凭据泄露)。
+# 也就是说:降权只有在真的铸了第二把 key 之后才成立;回落时日志会打 credential_fallback。
+SANDBOX_MODEL_API_KEY=sk-只给沙箱用的key
+
+# 控制面 API token
 WORKER_API_TOKEN=本地调试用的控制面token

@@ -3,6 +3,7 @@ import { env } from "cloudflare:test";
 import type { TaskSession } from "../src/control/session";
 import type { ReviewVerdict } from "../src/control/gates";
 import { compositeEvidenceDigest } from "../src/audit/evidence";
+import { reportArgsFrom, type ReportMessage } from "../src/exec/queue";
 import { applyMigrations } from "./d1";
 
 /**
@@ -15,6 +16,9 @@ import { applyMigrations } from "./d1";
  */
 
 const ns = () => env.TASK_SESSION as DurableObjectNamespace<TaskSession>;
+
+// 迁移含不可重复执行的 ALTER TABLE:整个文件应用一次,而不是每个 suite 一次
+beforeAll(applyMigrations);
 
 function chainIntact(events: Array<{ prev_digest: string | null; digest: string }>): void {
   for (let i = 1; i < events.length; i++) {
@@ -156,9 +160,44 @@ function kinds(snap: NonNullable<Awaited<ReturnType<Stub["getSnapshot"]>>>): str
   return snap.events.map((e) => e.kind);
 }
 
-describe("TaskSession DO 门禁分级", () => {
-  beforeAll(applyMigrations);
+function payloads(
+  snap: NonNullable<Awaited<ReturnType<Stub["getSnapshot"]>>>,
+  kind: string,
+): Array<Record<string, unknown>> {
+  return snap.events.filter((e) => e.kind === kind).map((e) => JSON.parse(e.payload));
+}
 
+async function writerReport(
+  stub: Stub,
+  over: {
+    exit_code?: number;
+    base?: { sha: string; source: string; fallback?: string } | null;
+    patch_digest?: string | null;
+    result_text?: string;
+    role?: "writer" | "reviewer" | "verifier";
+    verify_context?: { writer_manifest_key: string };
+  } = {},
+): Promise<string> {
+  const { attempt_id } = await stub.startAttempt({
+    role: over.role ?? "writer",
+    idempotency_key: crypto.randomUUID(),
+    verify_context: over.verify_context,
+    ...BUDGET,
+  });
+  const res = await stub.reportExecution({
+    attempt_id,
+    exit_code: over.exit_code ?? 0,
+    result_text: over.result_text ?? "已按要求完成",
+    manifest_key: `manifests/task/w/${attempt_id}.json`,
+    manifest_digest: `digest-${attempt_id}`,
+    patch_digest: over.patch_digest ?? null,
+    base: over.base as never,
+  });
+  expect(res.ok).toBe(true);
+  return attempt_id;
+}
+
+describe("TaskSession DO 门禁分级", () => {
   it("reviewer 基建失败不返工,原地等人工", async () => {
     const stub = newStub();
     await createTask(stub);
@@ -368,5 +407,178 @@ describe("TaskSession DO 门禁分级", () => {
     expect(snap!.attempts.filter((a) => a.role === "writer")).toHaveLength(2);
     expect(snap!.task.state).toBe("RUNNING");
     chainIntact(snap!.events);
+  });
+});
+
+/**
+ * M8 基线冻结:候选必须说清它对哪个 commit 成立,跨轮比较与「可重放」都以此为前提。
+ * 这里钉的是控制面职责 —— 谁是基线的权威、失败时走哪条路、返工轮继承什么。
+ */
+
+const BASE_A = "a".repeat(40);
+const BASE_B = "b".repeat(40);
+
+describe("TaskSession DO 基线冻结", () => {
+  it("writer 回报的基线成为任务权威,返工轮继承同一 commit", async () => {
+    const stub = newStub();
+    await createTask(stub, { prompt: "m8", acceptance: ["脚本输出 hello world"] }, "shadow");
+
+    await writerReport(stub, {
+      patch_digest: "p-1",
+      base: { sha: BASE_A, source: "resolved_default" },
+    });
+    let snap = await stub.getSnapshot();
+    expect(snap!.task.base).toEqual({ sha: BASE_A, source: "resolved_default" });
+    expect(kinds(snap!)).toContain("base.frozen");
+    expect(snap!.task.state).toBe("AWAITING_APPROVAL");
+
+    // shadow 下成立的 reject 触发返工:新沙箱必须落回同一个 commit
+    await reviewerReport(stub, { exit_code: 0, review: { decision: "reject", reason: "没按要求" } });
+    snap = await stub.getSnapshot();
+    const writerPins = payloads(snap!, "attempt.created").filter((p) => p.role === "writer");
+    expect(writerPins).toHaveLength(2);
+    expect(writerPins[1].base_pin).toBe(BASE_A);
+    expect(kinds(snap!)).not.toContain("base.moved");
+    chainIntact(snap!.events);
+  });
+
+  it("shadow 回落默认分支:留 base.fallback + base.moved,并清零无进展基准", async () => {
+    const stub = newStub();
+    await createTask(
+      stub,
+      { prompt: "m8", base_sha: BASE_A, acceptance: ["脚本输出 hello world"] },
+      "shadow",
+    );
+    // 人工指定的基线在入口处即成为任务事实
+    expect((await stub.getSnapshot())!.task.base).toEqual({ sha: BASE_A, source: "pinned" });
+
+    await writerReport(stub, { patch_digest: "p-1", base: { sha: BASE_A, source: "pinned" } });
+    await reviewerReport(stub, { exit_code: 0, review: { decision: "reject", reason: "没按要求" } });
+
+    // 第二轮:pinned 基线不可达,执行面按 shadow 回落默认分支并如实报告
+    await writerReport(stub, {
+      patch_digest: "p-1",
+      base: { sha: BASE_B, source: "resolved_default", fallback: "pinned base unreachable" },
+    });
+
+    const snap = await stub.getSnapshot();
+    expect(kinds(snap!)).toContain("base.fallback");
+    expect(kinds(snap!)).toContain("base.moved");
+    expect(snap!.task.base).toEqual({ sha: BASE_B, source: "resolved_default" });
+    // 基线换了还拿旧基准比,会把正常努力误判成无进展熔断
+    expect(kinds(snap!)).not.toContain("gate.no_progress");
+    chainIntact(snap!.events);
+  });
+
+  it("基线材质化失败 fail-closed:BLOCKED 转人工,不烧返工预算、不派下游", async () => {
+    const stub = newStub();
+    await createTask(stub, {
+      prompt: "m8",
+      repo_url: "https://example.invalid/r.git",
+      base_sha: BASE_A,
+    });
+    const { attempt_id } = await stub.startAttempt({
+      role: "writer",
+      idempotency_key: crypto.randomUUID(),
+      ...BUDGET,
+    });
+    const res = await stub.reportExecution({
+      attempt_id,
+      exit_code: 21,
+      result_text: "base materialization failed: unreachable",
+    });
+    expect(res.ok).toBe(true);
+
+    const snap = await stub.getSnapshot();
+    expect(kinds(snap!)).toContain("base.failed");
+    expect(snap!.task.state).toBe("BLOCKED");
+    expect(snap!.task.awaiting_human).toBe(true);
+    // 环境事实不是候选质量判定:重开沙箱在同一个 SHA 上必然同样失败
+    expect(snap!.attempts.filter((a) => a.role === "writer")).toHaveLength(1);
+    expect(kinds(snap!)).not.toContain("writer.rework_scheduled");
+    expect(kinds(snap!)).not.toContain("verify.requested");
+    expect(kinds(snap!)).not.toContain("review.requested");
+    // 失败不改写基线权威,人工据此重指
+    expect(snap!.task.base).toEqual({ sha: BASE_A, source: "pinned" });
+    chainIntact(snap!.events);
+  });
+
+  it("result_text 为空串时 base.failed 仍留得下诊断(prod 实际形态)", async () => {
+    const stub = newStub();
+    await createTask(stub, {
+      prompt: "m8",
+      repo_url: "https://example.invalid/r.git",
+      base_sha: BASE_A,
+    });
+    const { attempt_id } = await stub.startAttempt({
+      role: "writer",
+      idempotency_key: crypto.randomUUID(),
+      ...BUDGET,
+    });
+    // 基线失败时 transcript 是纯文本,提取器返回 null,workflow 落成 ""(非 null)
+    await stub.reportExecution({
+      attempt_id,
+      exit_code: 21,
+      result_text: "",
+      manifest_key: "manifests/task/w/x.json",
+    });
+
+    const [payload] = payloads((await stub.getSnapshot())!, "base.failed");
+    expect(payload.detail).not.toBe("");
+    expect(payload.detail).toContain("exit_code=21");
+    expect(payload.manifest_key).toBe("manifests/task/w/x.json");
+  });
+
+  it("verifier 报的基线与任务不符 → 结论不采信", async () => {
+    const stub = newStub();
+    await createTask(stub, { prompt: "m8", repo_url: "https://example.invalid/r.git" });
+    const writerId = await writerReport(stub, {
+      patch_digest: "p-1",
+      base: { sha: BASE_A, source: "pinned" },
+    });
+
+    const stale = await writerReport(stub, {
+      role: "verifier",
+      verify_context: { writer_manifest_key: `manifests/task/w/${writerId}.json` },
+      base: { sha: BASE_B, source: "pinned" },
+      result_text: '{"apply":{"exit_code":0},"verify":{"exit_code":0}}',
+    });
+
+    const snap = await stub.getSnapshot();
+    expect(kinds(snap!)).toContain("base.lineage_mismatch");
+    expect(kinds(snap!)).not.toContain("verify.completed");
+    expect((await stub.getEvidenceSummary()).verifier_attempt_id).toBeNull();
+    expect(stale).toBeTruthy();
+    chainIntact(snap!.events);
+  });
+});
+
+describe("exec-report 消息映射", () => {
+  it("逐字段转发,新增字段漏映射即红", () => {
+    const body: ReportMessage = {
+      schema_version: 1,
+      type: "exec-report",
+      task_id: "t1",
+      session_id: "sess",
+      attempt_id: "att",
+      exit_code: 0,
+      error: "none",
+      transcript_digest: "td",
+      manifest_key: "mk",
+      manifest_digest: "md",
+      tokens: 7,
+      result_text: "done",
+      patch_digest: "pd",
+      base: { sha: BASE_A, source: "resolved_default" },
+      review: { decision: "approve", reason: "ok" },
+    };
+    const args = reportArgsFrom(body);
+    expect(args.base).toEqual(body.base);
+    expect(args.patch_digest).toBe("pd");
+    const forwarded = Object.keys(args).sort();
+    const expected = Object.keys(body)
+      .filter((k) => !["schema_version", "type", "task_id", "session_id"].includes(k))
+      .sort();
+    expect(forwarded).toEqual(expected);
   });
 });

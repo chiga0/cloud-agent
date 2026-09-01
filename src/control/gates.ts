@@ -135,6 +135,7 @@ export function isNoProgress(prev: string | null | undefined, next: string | nul
 }
 
 interface VerifyReportShape {
+  base?: { sha?: string | null };
   apply?: { exit_code?: number; stderr_tail?: string };
   verify?: { exit_code?: number; stdout_tail?: string; stderr_tail?: string } | null;
 }
@@ -143,8 +144,15 @@ interface VerifyReportShape {
  * 把独立验证报告译成下一轮 writer 能直接照做的指令。
  * 返工一轮 = 新沙箱 + 重新 clone + 重灌上下文,只带一句 "verify exit_code=1"
  * 等于让 agent 从零猜哪里坏了。报告解析不出来时退化为兜底文案,不返回空数组。
+ *
+ * `currentBase` 是控制面冻结的基线:基线已固定的前提下 apply 失败不再可能是
+ * 「上游移动了」,它就是指候选本身有问题 —— 文案必须把这一点说清,否则 writer
+ * 会去追一条根本不存在的「最新分支」。
  */
-export function describeVerifyFailure(reportText: string | null | undefined): string[] {
+export function describeVerifyFailure(
+  reportText: string | null | undefined,
+  currentBase?: string | null,
+): string[] {
   const fallback = [
     "独立验证未通过(无法解析验证报告)。请在干净环境重放你的变更后自行运行仓库的验证命令再提交。",
   ];
@@ -156,12 +164,17 @@ export function describeVerifyFailure(reportText: string | null | undefined): st
     return fallback;
   }
 
+  const base = report.base?.sha ?? currentBase ?? null;
   const lines: string[] = [];
   const applyCode = report.apply?.exit_code ?? 0;
   if (applyCode !== 0) {
     lines.push(
-      `候选变更无法在干净克隆的默认分支上 git apply(exit_code=${applyCode}),说明补丁与上游基线冲突或格式损坏。` +
-        `请基于最新默认分支重新生成补丁。git 输出:\n${tail(report.apply?.stderr_tail)}`,
+      `候选变更无法在冻结基线上 git apply(exit_code=${applyCode})。` +
+        (base
+          ? `基线已固定为 commit ${base},验证器重放的正是它 —— 补丁与这份基线冲突或格式损坏才是失败原因,` +
+            `请基于该基线重做变更,不要同步或切换到其它分支。`
+          : `补丁与基线冲突或格式损坏,请重新生成可重放的补丁。`) +
+        `git 输出:\n${tail(report.apply?.stderr_tail)}`,
     );
     return lines;
   }

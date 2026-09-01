@@ -3,6 +3,8 @@ import { handleQueue } from "./exec/queue";
 import { TaskSession } from "./control/session";
 import type { EvidenceManifest } from "./audit/evidence";
 import { sha256Hex } from "./audit/evidence";
+import { assembleCandidate, candidateFileName } from "./audit/candidate";
+import { isValidSha } from "./exec/base";
 
 export { AttemptWorkflow } from "./exec/workflow";
 export { Sandbox } from "@cloudflare/sandbox";
@@ -56,8 +58,10 @@ function landingHtml(env: Env): string {
       <dt>POST /tasks</dt><dd>创建任务(需要 <code>Authorization: Bearer WORKER_API_TOKEN</code>)</dd>
       <dt>GET /tasks/:id</dt><dd>查询任务、attempts 与事件链(需鉴权)</dd>
       <dt>GET /tasks/:id/result</dt><dd>读取 agent 最终答案(纯文本,需鉴权)</dd>
-      <dt>POST /tasks/:id/approve</dt><dd>审批(必须带 attempt_id + evidence_digest,需鉴权)</dd>
+      <dt>POST /tasks/:id/approve</dt><dd>审批,只收 <code>approve</code> / <code>reject</code>(必须带 attempt_id + evidence_digest,需鉴权;<code>accept_with_notes</code> 是控制面内部降级决策,不由外部提交)</dd>
       <dt>GET /tasks/:id/evidence</dt><dd>钉住的候选 manifest + approve 所需 attempt_id / binding_digest(需鉴权)</dd>
+      <dt>GET /tasks/:id/candidate</dt><dd>候选交付视图:基线 commit、patch 引用、判定标签与诚实性告警(需鉴权)</dd>
+      <dt>GET /tasks/:id/candidate?format=patch</dt><dd>下载补丁正文(<code>curl -o candidate.patch</code> 后本地 <code>git apply</code>);下发前重算 sha256,状态在 <code>x-candidate-status</code> / <code>x-safe-to-apply</code> 头里</dd>
       <dt>GET /tasks/:id/attempts/:aid/transcript</dt><dd>attempt 的 transcript 原文(verifier 为 JSON 验证报告,需鉴权)</dd>
       <dt>GET /admin/chain-check</dt><dd>校验 D1 归档的事件 hash chain(需鉴权)</dd>
     </dl>
@@ -97,6 +101,18 @@ function validateAcceptance(acceptance: unknown): string | null {
   return null;
 }
 
+/**
+ * `base_sha` 与 prompt 不同:它会被控制面持久化并重放进每个新沙箱的 shell,
+ * 因此入口就必须按最严的规格校验(DO 侧同规则再校验一次作为权威兜底)。
+ */
+function validateBaseSha(baseSha: unknown): string | null {
+  if (baseSha == null) return null;
+  if (!isValidSha(baseSha)) {
+    return "base_sha must be a full lowercase hex commit id (40 or 64 chars)";
+  }
+  return null;
+}
+
 async function handleCreateTask(req: Request, env: Env): Promise<Response> {
   const body = (await req.json()) as {
     spec: TaskSpec;
@@ -110,6 +126,10 @@ async function handleCreateTask(req: Request, env: Env): Promise<Response> {
   const acceptanceError = validateAcceptance(body.spec.acceptance);
   if (acceptanceError) {
     return Response.json({ error: { type: "invalid_acceptance", detail: acceptanceError } }, { status: 400 });
+  }
+  const baseShaError = validateBaseSha(body.spec.base_sha);
+  if (baseShaError) {
+    return Response.json({ error: { type: "invalid_base_sha", detail: baseShaError } }, { status: 400 });
   }
   const mode =
     body.review_evidence_mode === "enforce" || body.review_evidence_mode === "shadow"
@@ -168,6 +188,78 @@ async function handleGetEvidence(env: Env, taskId: string): Promise<Response> {
     digest: res.digest,
     binding_digest: res.binding_digest,
     manifest,
+  });
+}
+
+/**
+ * GET /tasks/:id/candidate —— 候选交付接口(只读,不写任何外部系统)。
+ *
+ * 下发补丁前必须重算字节 sha256 并与 manifest 记录的 digest 比对:内容寻址
+ * 只在写入时成立,把未校验的字节交出去等于让「拿到的补丁」和「验证过的补丁」
+ * 之间没有可核对的链接。status / base 同时进响应头,`curl -O` 的人不看 body
+ * 也不会把被否决的候选当成可直接提交的成品。
+ */
+async function handleGetCandidate(env: Env, taskId: string, format: string | null): Promise<Response> {
+  if (format !== null && format !== "patch") {
+    return Response.json(
+      { error: { type: "invalid_format", detail: "only ?format=patch is supported" } },
+      { status: 400 },
+    );
+  }
+  const refs = await TaskSession.from(env, taskId).getCandidateRefs();
+  if (!refs.found) return Response.json({ error: { type: "not_found" } }, { status: 404 });
+  const manifestKey = refs.evidence?.writer_manifest_key;
+  if (!manifestKey) {
+    return Response.json({ error: { type: "no_candidate_yet" } }, { status: 404 });
+  }
+  const manifestObj = await env.EVIDENCE.get(manifestKey);
+  if (!manifestObj) {
+    return Response.json({ error: { type: "evidence_missing", detail: manifestKey } }, { status: 404 });
+  }
+  const manifest = (await manifestObj.json()) as EvidenceManifest;
+  const view = assembleCandidate({
+    task_id: taskId,
+    state: refs.state,
+    awaiting_human: refs.awaiting_human,
+    base: refs.base,
+    candidate_base: manifest.base ?? null,
+    evidence: refs.evidence,
+    patch: manifest.patch ?? null,
+    decision: refs.decision,
+    binding_digest: refs.binding_digest,
+  });
+  if (format === null) return Response.json(view);
+
+  if (!view.patch) {
+    return Response.json(
+      { error: { type: "no_patch", detail: "该候选没有补丁文件", status: view.status, warnings: view.warnings } },
+      { status: 404 },
+    );
+  }
+  const patchObj = await env.ARTIFACTS.get(view.patch.key);
+  if (!patchObj) {
+    return Response.json({ error: { type: "artifact_missing", detail: view.patch.key } }, { status: 404 });
+  }
+  const body = await patchObj.arrayBuffer();
+  const digest = await sha256Hex(body);
+  if (digest !== view.patch.digest) {
+    return Response.json(
+      {
+        error: { type: "integrity_error", key: view.patch.key, expected: view.patch.digest, actual: digest },
+      },
+      { status: 500 },
+    );
+  }
+  return new Response(body, {
+    headers: {
+      "content-type": "text/plain; charset=utf-8",
+      "content-disposition": `attachment; filename="${candidateFileName(taskId, digest)}"`,
+      "x-candidate-status": view.status,
+      "x-verified": String(view.verified),
+      "x-safe-to-apply": String(view.safe_to_apply),
+      "x-base-sha": view.base?.sha ?? "unpinned",
+      "x-patch-digest": digest,
+    },
   });
 }
 
@@ -274,7 +366,8 @@ export default {
       return handleChainCheck(env);
     }
 
-    const taskMatch = /^\/tasks\/([0-9a-f-]{36})(\/approve|\/result|\/evidence)?$/.exec(url.pathname);
+    const taskMatch =
+      /^\/tasks\/([0-9a-f-]{36})(\/approve|\/result|\/evidence|\/candidate)?$/.exec(url.pathname);
     if (taskMatch) {
       if (req.method === "GET" && !taskMatch[2]) return handleGetTask(env, taskMatch[1]);
       if (req.method === "GET" && taskMatch[2] === "/result") {
@@ -282,6 +375,9 @@ export default {
       }
       if (req.method === "GET" && taskMatch[2] === "/evidence") {
         return handleGetEvidence(env, taskMatch[1]);
+      }
+      if (req.method === "GET" && taskMatch[2] === "/candidate") {
+        return handleGetCandidate(env, taskMatch[1], url.searchParams.get("format"));
       }
       if (req.method === "POST" && taskMatch[2] === "/approve") {
         return handleApprove(req, env, taskMatch[1]);
