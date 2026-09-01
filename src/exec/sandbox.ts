@@ -3,6 +3,7 @@ import type { BasePinMode, BaseReport, Env } from "../types";
 import { putArtifact, type ArtifactRef } from "../audit/evidence";
 import {
   BASE_ERRORS,
+  DEFAULT_MAX_PATCH_BYTES,
   PATCH_PATH,
   REPO_DIR,
   exportPatchScript,
@@ -132,10 +133,12 @@ export async function runQwenCodeAttempt(
 
   let patch: ArtifactRef | undefined;
   if (exitCode === 0 && args.exportPatch && args.repoUrl && base?.sha) {
-    const exp = await sandbox.exec(exportPatchScript(base.sha));
+    const exp = await sandbox.exec(
+      exportPatchScript(base.sha, Number(env.MAX_PATCH_BYTES) || DEFAULT_MAX_PATCH_BYTES),
+    );
     if (exp.exitCode !== 0) {
-      // 基线对象已不在(通常是 agent 改写了历史):宁可不产出候选,也不给下游一个
-      // 无法重放的半成品 —— 半成品会被验成「通过」,那才是真事故。
+      // 容量事实不产候选:基线对象被 agent 改写历史丢掉,或补丁超出大小上限。
+      // 宁可不产出候选,也不给下游一个无法重放/回传的半成品。
       return {
         exitCode: exp.exitCode || BASE_ERRORS.PATCH_EXPORT_FAILED,
         transcript,

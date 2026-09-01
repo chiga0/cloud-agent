@@ -20,7 +20,12 @@ export const BASE_ERRORS = {
   MISMATCH: 22,
   /** 候选导出失败(基线对象在导出前已消失 / git 命令报错) */
   PATCH_EXPORT_FAILED: 23,
+  /** 补丁超出大小上限:容量事实,同 21–23 一样不进返工闭环 */
+  PATCH_TOO_LARGE: 24,
 } as const;
+
+/** 补丁字节上限的回落默认值;可被 env.MAX_PATCH_BYTES 覆盖(可选 + 回落)。 */
+export const DEFAULT_MAX_PATCH_BYTES = 1_048_576;
 
 export const REPO_DIR = "/workspace/repo";
 export const PATCH_PATH = "/tmp/patch.diff";
@@ -93,8 +98,15 @@ export function materializeScript(sha: unknown): string {
 /**
  * 导出冻结候选。基线对象在导出前必须仍在(防 agent 改写历史把 SHA 丢掉);
  * agent 在自己的提交上继续工作属正常,diff 以基线为准即可。
+ *
+ * `maxBytes` 上限在容器内预检(`wc -c`),超限以 24 退出且把实际字节数写进
+ * stderr —— 超大补丁绝不回传:控制面用的是非流式 `readFile`,把失控的
+ * `--binary` diff 读进 isolate 内存才是真正的事故。
  */
-export function exportPatchScript(sha: unknown): string {
+export function exportPatchScript(sha: unknown, maxBytes: number): string {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) {
+    throw new Error(`invalid maxBytes: ${maxBytes}`);
+  }
   const lit = shaLiteral(sha);
   return wrap(
     [
@@ -104,6 +116,11 @@ export function exportPatchScript(sha: unknown): string {
       `git -C $R cat-file -e ${revLiteral(sha)} || exit ${BASE_ERRORS.PATCH_EXPORT_FAILED}`,
       `git -C $R add -A || exit ${BASE_ERRORS.PATCH_EXPORT_FAILED}`,
       `git -C $R diff ${lit} --binary > ${PATCH_PATH} || exit ${BASE_ERRORS.PATCH_EXPORT_FAILED}`,
+      `SIZE=$(wc -c < ${PATCH_PATH})`,
+      `[ "$SIZE" -le ${maxBytes} ] || {`,
+      `  echo "patch too large: $SIZE bytes > ${maxBytes} limit" >&2`,
+      `  exit ${BASE_ERRORS.PATCH_TOO_LARGE}`,
+      `}`,
     ].join("\n"),
   );
 }
@@ -118,7 +135,8 @@ export function isBaseError(exitCode: number): boolean {
   return (
     exitCode === BASE_ERRORS.UNREACHABLE ||
     exitCode === BASE_ERRORS.MISMATCH ||
-    exitCode === BASE_ERRORS.PATCH_EXPORT_FAILED
+    exitCode === BASE_ERRORS.PATCH_EXPORT_FAILED ||
+    exitCode === BASE_ERRORS.PATCH_TOO_LARGE
   );
 }
 

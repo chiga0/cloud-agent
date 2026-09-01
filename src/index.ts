@@ -7,7 +7,8 @@ import { assembleCandidate, candidateFileName } from "./audit/candidate";
 import { isValidSha } from "./exec/base";
 
 export { AttemptWorkflow } from "./exec/workflow";
-export { Sandbox } from "@cloudflare/sandbox";
+export { ContainerProxy } from "@cloudflare/sandbox";
+export { Sandbox } from "./exec/sandbox-do";
 export { TaskSession } from "./control/session";
 
 function unauthorized(): Response {

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   BASE_ERRORS,
+  DEFAULT_MAX_PATCH_BYTES,
   REPO_DIR,
   exportPatchScript,
   isBaseError,
@@ -103,7 +104,7 @@ describe("materializeScript", () => {
 });
 
 describe("exportPatchScript", () => {
-  const script = exportPatchScript(SHA40);
+  const script = exportPatchScript(SHA40, DEFAULT_MAX_PATCH_BYTES);
 
   it("导出前先确认基线对象仍在(基线 diff 才有意义)", () => {
     expect(script.indexOf("cat-file")).toBeLessThan(script.indexOf("-C $R diff"));
@@ -114,6 +115,26 @@ describe("exportPatchScript", () => {
     expect(script).toMatch(new RegExp(`git -C \\$R diff '${SHA40}' --binary`));
     expect(script).not.toMatch(/diff HEAD/);
   });
+
+  it("导出后先量尺寸再放行:超限以 24 退出,超大字节永不回传", () => {
+    // 预检必须发生在导出之后 —— 先有文件才能量
+    expect(script.indexOf("-C $R diff")).toBeLessThan(script.indexOf("wc -c"));
+    expect(script).toContain(`exit ${BASE_ERRORS.PATCH_TOO_LARGE}`);
+    // 超限诊断带实际字节数,人工据此定上限
+    expect(script).toContain("patch too large: $SIZE bytes");
+  });
+
+  it("上限值原样内嵌进脚本,审计者无需回源码核对", () => {
+    expect(exportPatchScript(SHA40, 4096)).toContain("-le 4096");
+    expect(script).toContain(`-le ${DEFAULT_MAX_PATCH_BYTES}`);
+  });
+
+  it("非法上限在拼接前就拒绝,而不是把 Infinity/NaN 写进脚本", () => {
+    expect(() => exportPatchScript(SHA40, Number.NaN)).toThrow(/invalid maxBytes/);
+    expect(() => exportPatchScript(SHA40, -1)).toThrow(/invalid maxBytes/);
+    expect(() => exportPatchScript(SHA40, 1.5)).toThrow(/invalid maxBytes/);
+    expect(() => exportPatchScript(SHA40, Number.POSITIVE_INFINITY)).toThrow(/invalid maxBytes/);
+  });
 });
 
 describe("会话安全(prod 回归)", () => {
@@ -121,7 +142,7 @@ describe("会话安全(prod 回归)", () => {
   // 「Session … is not ready or shell has died」,退出码永远回不到控制面。
   const scripts: Array<[string, string]> = [
     ["materializeScript", materializeScript(SHA40)],
-    ["exportPatchScript", exportPatchScript(SHA40)],
+    ["exportPatchScript", exportPatchScript(SHA40, DEFAULT_MAX_PATCH_BYTES)],
     ["resolveScript", resolveScript()],
   ];
 
@@ -141,12 +162,13 @@ describe("会话安全(prod 回归)", () => {
     }
   });
 
-  it("三个基线退出码都仍由脚本自身产生(包装没有把它们吞掉)", () => {
+  it("四个容量退出码都仍由脚本自身产生(包装没有把它们吞掉)", () => {
     const mat = materializeScript(SHA40);
-    const exp = exportPatchScript(SHA40);
+    const exp = exportPatchScript(SHA40, DEFAULT_MAX_PATCH_BYTES);
     expect(mat).toContain(`exit ${BASE_ERRORS.UNREACHABLE}`);
     expect(mat).toContain(`exit ${BASE_ERRORS.MISMATCH}`);
     expect(exp).toContain(`exit ${BASE_ERRORS.PATCH_EXPORT_FAILED}`);
+    expect(exp).toContain(`exit ${BASE_ERRORS.PATCH_TOO_LARGE}`);
   });
 });
 
@@ -170,10 +192,11 @@ describe("parseSha", () => {
 });
 
 describe("isBaseError", () => {
-  it("只认基线专用码,不把质量失败混进来", () => {
+  it("只认容量事实专用码,不把质量失败混进来", () => {
     expect(isBaseError(BASE_ERRORS.UNREACHABLE)).toBe(true);
     expect(isBaseError(BASE_ERRORS.MISMATCH)).toBe(true);
     expect(isBaseError(BASE_ERRORS.PATCH_EXPORT_FAILED)).toBe(true);
+    expect(isBaseError(BASE_ERRORS.PATCH_TOO_LARGE)).toBe(true);
     expect(isBaseError(0)).toBe(false);
     expect(isBaseError(1)).toBe(false);
     expect(isBaseError(-1)).toBe(false);

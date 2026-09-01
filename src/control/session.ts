@@ -8,7 +8,7 @@ import {
   type EvidenceManifest,
   type EvidencePart,
 } from "../audit/evidence";
-import { isValidSha, isBaseError } from "../exec/base";
+import { BASE_ERRORS, isValidSha, isBaseError } from "../exec/base";
 import type { CandidateDecision, CandidateEvidence } from "../audit/candidate";
 import { assertTransition, attemptDeadline, decideRework, isLegalTransition, nextWatchdogAlarm } from "./statemachine";
 import {
@@ -446,10 +446,14 @@ export class TaskSession extends DurableObject<Env> {
     s.task!.pending_review = false;
     s.task!.pending_verify = false;
     this.setState(s, "BLOCKED");
+    const reason =
+      args.exit_code === BASE_ERRORS.PATCH_TOO_LARGE
+        ? `patch exceeds size cap (exit ${args.exit_code})`
+        : `base materialization failed (exit ${args.exit_code})`;
     await this.appendEvent(s, "task.transition", {
       to: "BLOCKED",
       actor: `agent:${attempt.id}`,
-      reason: `base materialization failed (exit ${args.exit_code})`,
+      reason,
     });
     await this.archiveWithRetry(s);
   }

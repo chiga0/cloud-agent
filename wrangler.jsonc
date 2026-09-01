@@ -13,7 +13,9 @@
     "DEFAULT_MAX_WALL_SECONDS": "3600",
     "DEFAULT_MAX_ATTEMPTS": "3",
     "REJECT_EVIDENCE_MODE": "shadow",
-    "BASE_PIN_MODE": "shadow"
+    "BASE_PIN_MODE": "shadow",
+    "EGRESS_MODE": "enforce",
+    "EGRESS_GIT_HOSTS": "github.com"
   },
   "d1_databases": [
     {

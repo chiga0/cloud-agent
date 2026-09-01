@@ -449,6 +449,9 @@ git -C /path/to/repo apply task-$TASK-*.patch
 | Var | `DEFAULT_MAX_WALL_SECONDS` = `3600` | 单 attempt 1 小时 |
 | Var | `REJECT_EVIDENCE_MODE` = `shadow` | reviewer 证据硬校验模式:`shadow` 只记事件、`enforce` 才降级返工(§13.12) |
 | Var | `BASE_PIN_MODE` = `shadow` | 基线材质化失败的处理:`shadow` 回落已解析的默认分支并记 `base.fallback`、`enforce` 直接 `BLOCKED` 转人工(§13.13)。**两种模式都真实使用冻结基线材质化工作副本**,只在失败路径上分叉;verifier 侧恒为 enforce |
+| Var | `EGRESS_MODE` = `enforce` | 沙箱出站策略:`shadow` 只记账放行、`enforce` 白名单拒绝(§13.14)。有否决权的策略,先 shadow 取样再翻 |
+| Var | `EGRESS_GIT_HOSTS` = `github.com` | 出站白名单的代码托管主机(逗号分隔);模型主机从 `MODEL_UPSTREAM_BASE` 推导,不经此变量 |
+| Var | `MAX_PATCH_BYTES`(未设,代码默认 `1048576`) | 候选 patch 字节上限,**可选 + 回落**;超限在容器内 `exit 24`、不回传字节(§13.17) |
 
 ### 部署动作顺序
 
@@ -669,26 +672,42 @@ checkout --quiet --detach '<sha>'
 **已知不覆盖**：
 - **E4「上游移动」未取证**：需要在一个**对 runner 有默认分支 push 权限**的仓库上，于 writer 执行期间再压一个与候选冲突的提交，对照 M8 前会 `APPLY_FAILED_EXIT=20`、M8 后候选仍按冻结基线通过。prod 全部 repo 样本都在 `octocat/Hello-World`（无写权限）上，因此这条只能标未覆盖。复现配方：建一个自己的 scratch 仓 → 提交任务时 pin 一个稳定 sha → 任务在跑时向默认分支 push 一个改动同一文件的提交 → 期望 verifier 仍 `exit 0`。
 - 私有仓 fetcher 未实现：只在 `TaskSpec.repo_url` 处留了接入位注释，`GIT_TERMINAL_PROMPT=0` 保证坏 ref 不会挂死，但私有仓现在一律 clone 失败。
-- **候选 patch 无大小上限**：导出走 `sandbox.readFile`（容器文件 API 的 base64 GET，**不经 shell 会话**，所以不受 §13.15 那条影响），整份读进 Worker 内存后由 `putArtifact` 落 R2 —— 只记 `size`、不设上限（我们这侧没有任何代码层阈值，超限的表现落在平台配额上）。一个含巨型二进制改动的候选会整份穿过 Worker isolate。本轮未加截断或拒绝，因为「候选被静默截断」比失败更危险，正解是给 `exportPatchScript` 加 `--stat` 预检 + 超限 fail-closed，属 M9 工作量。
+- **候选 patch 无大小上限 — 已实现上限(§13.17)**:导出走 `sandbox.readFile`(容器文件 API 的 base64 GET,**不经 shell 会话**,所以不受 §13.15 那条影响),整份读进 Worker 内存后由 `putArtifact` 落 R2。M9 前的状态是只记 `size`、不设上限,一个含巨型二进制改动的候选会整份穿过 Worker isolate。当时的判断是「候选被静默截断」比失败更危险,所以不做截断、只做容器内预检 + 超限显式失败 —— 现已按该正解落地:`exportPatchScript` 在容器内 `wc -c` 预检,超限 `exit 24` 走容量事实路由,**字节根本不回传**,见 §13.17。
 - 基线只保证「writer 与 verifier 在同一个 commit」，不保证「这个 commit 是 GitHub 当前默认分支」——`GET /candidate` 的 `base.moved` 提示负责把这一点如实告诉消费方。
 
-### 13.14 出站网络 allowlist — 未做(顺延 M9),本轮用可撤销低权 key 补偿
+### 13.14 出站网络 allowlist — 已实现(M9,prod `enforce`)
 
-调研与最佳实践手册都把「沙箱出站必须可治理」列为长任务前置条件,但**探针结论是本轮不该硬上**:三个坑里任何一个配错,得到的都是「看着像有门禁、实际没有」,而这比明确标未做更危险。现状事实:`src/index.ts` 只导出 `Sandbox` / `TaskSession` / `AttemptWorkflow`,**没有导出 `ContainerProxy`**——`@cloudflare/sandbox` 依赖 `@cloudflare/containers@^0.3.0` 并 re-export 了它,能力在,但链没挂上,容器出站今天完全不经过 allowlist。
+原状(本节旧版)是「未做,顺延 M9」。2026-09-01 落地并翻转 `enforce`,实现与证据如下。
 
-三个坑(实施 M9 前必须逐条过):
+**实现面**:
 
-1. **`ContainerProxy` 必须从 Worker 入口导出**。不导出时 outbound 拦截**根本不发生**——不是"配置没生效",是请求压根没进处理器链,`allowedHosts` 形同注释。
-2. **`setAllowedHosts` / `allowedHosts` 是半配置陷阱**:拦截默认只覆盖 HTTP(`interceptHttps` 默认 `false`),此时白名单设得再对,`https://` 出站照样直连。要打开必须 `allowedHosts` + `interceptHttps` 成对配置,并保留 `deniedHosts` 兜底。
-3. **`interceptHttps=true` 要求容器镜像信任 Cloudflare 的 CA**(`/etc/cloudflare/certs/cloudflare-containers-ca.crt`)。镜像不装这个证书,后果不是"拦截失效"而是**每个合法 HTTPS 请求 TLS 失败**——`npm install` / `git clone` / `curl` 全红,表现为随机基建故障。因此它是**镜像改动**:要写进 `sandbox/Dockerfile` 并随镜像 tag 一起升,同时按 §12 的排空窗口与 worker 部署同批走,否则头几个 attempt 会打到不信任 CA 的旧镜像。
+- `src/index.ts` 补导出 `ContainerProxy`(`@cloudflare/sandbox` re-export)。SDK 经 `ctx.exports.ContainerProxy` 挂拦截,缺这个导出拦截**根本不发生**(旧版坑 1,源码 `container.js:1173` 实证)。
+- 新增 `src/exec/sandbox-do.ts`:`Sandbox` 子类(DO 类名不变,wrangler 绑定/迁移不动)。两档策略由 `EGRESS_MODE` 切换,共用同一套拦截机器,`interceptHttps=true` 两档都开(流量几乎全是 HTTPS,不拦 HTTPS 就等于没观测也没治理):
+  - `shadow`:不设 `allowedHosts`、`enableInternet=true`,所有出站经 catch-all 记 `egress=forward host=…` 后放行 —— 积累「封了会打到谁」的样本,同时让 CA 信任问题在观测期就暴露;
+  - `enforce`:`allowedHosts` 白名单 + `enableInternet=false`,未列名主机在处理器链第 2 步(白名单门)即被拒,HTTP 520 `Origin is disallowed`,连 catch-all 都不到。
+- 白名单内容(`egressAllowedHosts`):模型主机从 `MODEL_UPSTREAM_BASE` 推导(与既有变量同源,避免两处维护)+ `EGRESS_GIT_HOSTS`(逗号分隔,缺省仅 `github.com`)。列表必须**静态可审计**:不按任务 `repo_url` 动态放行 —— 那是外带通道。
 
-**本轮实际买到的东西(诚实边界)**:`SANDBOX_MODEL_API_KEY`(低权、可撤销、只注入容器)与 `DASHSCOPE_API_KEY`(高权,Worker 侧 reviewer 用)分开,方向与 M7 前相反——控制面持高权 key,沙箱持低权 key。它买到的是**撤销能力 + 爆炸半径 + 归因**(泄露时立刻撤 key、从事件链定位泄露窗口内的 attempt 集合),**不是限流**:DashScope token-plan 没有可靠的 per-key 硬额度,拿到 key 仍可花到配额上限。所以沙箱泄露的应急动作是「立刻撤销 + 圈定受影响 attempt」,不要指望"损失有上界"。
+**原文三个坑的落地结论**:1、2 照旧成立并已按原文实施;3 需要修正 —— **不需要改镜像装 CA**:官方基镜像 `cloudflare/sandbox:0.8.14` 已信任平台注入的 `cloudflare-containers-ca.crt`,我们的镜像 FROM 它即继承。prod 实证:shadow 期(拦截全开)与 enforce 期的 repo 任务 `git clone` → 模型调用 → 候选导出 → 验证全链绿。原文「镜像装 CA 并 bump tag」从 M9 工序中删除,无 Dockerfile 改动。
+
+**实施中新发现的两个坑**:
+
+4. **`static outbound = fn` 类字段会遮蔽基类静态 setter**(M9 shadow 首轮零日志的根因):类字段初始化是 [[DefineOwnProperty]],直接盖掉基类 `Container` 提供的静态访问器,`outboundHandlersRegistry` 永远空着 —— 拦截照常安装、流量照进代理,但处理器链第 3–6 步全部落空,shadow 流量从第 8 步 `enableInternet=true` 静默直出,呈现「部署成功、任务全绿、一条日志没有」的假象。修法是 `static { this.outbound = fn }`([[Set]] → 基类 setter 真正注册)。机制测试钉住 `Object.hasOwn(Sandbox, "outbound") === false`,变异验证:改回字段即红。
+5. **模式翻转无需迁移**:每个 attempt 是全新 DO 实例,类字段在构造期求值(基类构造器先让出微任务等子类字段初始化完再读取,官方模式),翻 `EGRESS_MODE` 对后续 attempt 即时生效,不存在存量实例按旧模式跑的问题。
+
+**shadow → enforce 过程**(有否决权的策略先观测再启用):
+
+- shadow 样本(prod):恰好 3 个主机 —— `github.com`、`token-plan.cn-beijing.maas.aliyuncs.com`、`gb4w8c3ygj-default-sea.rum.aliyuncs.com`(qwen-code 内置的阿里云 RUM 遥测,与任务成败无关)。决策:遥测不加白、直接封。**加白零新增**。
+- 正向用例(prod,`EGRESS_MODE=enforce`):完整 repo 任务全绿 —— clone → 基线冻结 → writer → verifier `passed=true` → reviewer approve,同时证明 CA 信任继承与白名单充分性(一条任务两证)。
+- 负向用例(prod):任务 prompt 要求在沙箱内 `curl -sS https://example.com` 并把结果写进产物 —— transcript 里记录到 `HTTP 520`、响应体 `Origin is disallowed`(20 字节),请求未出网,证据由任务自己的产出固化。
+- 记账对账(`wrangler tail`):enforce 窗内 `github.com` / `token-plan` 的每个请求都伴随 `egress=forward` 记账日志;RUM 遥测请求**无记账日志** —— 被白名单门在第 2 步拦掉、根本没进处理器,与 520 语义一致,不是「放行了只是没记」。
+
+**诚实边界**:allowlist 是主机粒度,不是路径粒度;白名单内的 `token-plan` 主机本身仍是花钱通道(与下文「降权 ≠ 限流」同构)。出站治理与凭据降权是两条独立防线,互不替代。
+
+**凭据降权是另一条独立防线**(原「未做」时期的补偿措施,保留现状):`SANDBOX_MODEL_API_KEY`(低权、可撤销、只注入容器)与 `DASHSCOPE_API_KEY`(高权,Worker 侧 reviewer 用)分开,方向与 M7 前相反——控制面持高权 key,沙箱持低权 key。它买到的是**撤销能力 + 爆炸半径 + 归因**(泄露时立刻撤 key、从事件链定位泄露窗口内的 attempt 集合),**不是限流**:DashScope token-plan 没有可靠的 per-key 硬额度,拿到 key 仍可花到配额上限。所以沙箱泄露的应急动作是「立刻撤销 + 圈定受影响 attempt」,不要指望"损失有上界"。
 
 **这条收益是有条件的**:低权 key 是**可选配置**,缺配时 `sandboxModelEnv` 回落沿用 `DASHSCOPE_API_KEY` 并打 `credential_fallback` 告警。回落 = 拆分带来的收益为零,状态与 M8 前逐字节相同。刻意不做 fail-closed:那会让一个配置层增强项阻塞基线冻结与候选交付这两个主交付物,而部署阻塞的代价是真实的(M8 曾因此停摆)。判断降权是否成立只看一处:`wrangler secret list` 里有没有 `SANDBOX_MODEL_API_KEY`,以及日志里还有没有 `credential_fallback`。
 
 **最可靠的核查是直读部署后的 binding**(`wrangler secret list` 只看当前目录配置所指向的环境,而策略开关的实际生效值在已部署的 Worker 上):`GET /accounts/<ACCOUNT_ID>/workers/scripts/cloud-agent/settings` → `result.bindings` 里 `type=plain_text` 给出 `BASE_PIN_MODE` / `REJECT_EVIDENCE_MODE` 的真值,`type=secret_text` 给出**名字**(不返回值),据此一次请求同时确认「prod 跑的是哪个模式」与「低权 key 到底铸没铸」。2026-09-01 实测:`plain_text` = `BASE_PIN_MODE=shadow` / `REJECT_EVIDENCE_MODE=shadow`,`secret_text` 只有 `DASHSCOPE_API_KEY` 与 `WORKER_API_TOKEN` —— **沙箱降权确认处于回落态**,与 E8 的 key 指纹结论一致。
-
-**M9 的最小落地顺序**:导出 `ContainerProxy` → 在 `Sandbox` 子类上设 `allowedHosts`(GitHub 域 + 包源 + 百炼 upstream)+ `interceptHttps=true` → 镜像装 CA 并 bump tag → 同批部署 → 验收**正负两条都要**:白名单内域名(如 `api.github.com`)在容器内 `curl` 成功、白名单外(如随机 VPS 或 `webhook.site`)必须失败,且 `npm install` 在预装镜像内不因 TLS 报错。
 
 ### 13.15 沙箱 `exec` 复用常驻 shell：顶层 `exit` 会杀掉会话 — 已修复（M8，prod 才发现）
 
@@ -725,6 +744,35 @@ checkout --quiet --detach '<sha>'
 **没补、也别补**：不要为消灭噪音给测试环境加假的 `Sandbox` DO —— 只会把 `TypeError` 换成容器 HTTP 错误,噪音照旧、覆盖面不变。噪音的判读方式:命中上表三类特征的属预期;**其它**栈的 uncaught exception 意味着 workflow 里多了一条新的失败路径,应当查。`exec/extract/evidence` 三步要真实容器,只能留在 prod 取证。
 
 **为什么这套噪音不会红灯(A/B 实测,别误解成"vitest 不管未捕获异常")**:一次性探针在测试自身 isolate 里 `void Promise.reject(new Error("PROBE_MARKER"))` → 该用例通过但 vitest 打印 `Unhandled Errors` + `Errors 1 error` 且**退出码 1**;而 workflow 侧那 33 行同样形态的 rejection 只让 summary 保持 `7 passed / 98 passed`、**退出码 0**、无 `Errors` 计数。差别在于它们出生在 Workflows 运行时(vitest pool 之外的 workerd/miniflare 上下文),走的是 runtime 自己的错误打印,绕开了 vitest 的 per-test 异常通道。结论:机制是有的,只是覆盖不到后台 workflow —— 所以「本地跑不到 orchestration」这条账不能靠红灯兜住,只能靠上面的 `handleQueue` 用例把可本地化的那一跳拿回来。
+
+### 13.17 候选 patch 大小上限 — 已实现(M9,容器内预检 + 容量事实路由)
+
+问题即 §13.13 记的那条:`readFile` 非流式(约 0.6 MB/s),一个失控的 `--binary` diff 会整份穿过 Worker isolate。修法遵循当时记下的正解 —— **不做截断**(静默截断比失败更危险),只在容器内预检、超限显式失败,**字节根本不回传**:
+
+- `src/exec/base.ts`:`BASE_ERRORS.PATCH_TOO_LARGE = 24`;`exportPatchScript(sha, maxBytes)` 在 `git diff > $PATCH_PATH` 之后 `SIZE=$(wc -c < $PATCH_PATH)`,超限 `exit 24`,stderr 带实际字节数。脚本仍是纯字符串构造(可穷举单测),子壳包裹规则(§13.15)不变;`maxBytes` 非法(NaN/负数/非整数/Infinity)直接 throw,不进拼接。
+- `src/exec/sandbox.ts`:`maxBytes = Number(env.MAX_PATCH_BYTES) || DEFAULT_MAX_PATCH_BYTES`(1 MiB)。`MAX_PATCH_BYTES` 是**可选 + 回落**配置,`wrangler.jsonc` 刻意不设(用代码默认),调参时才写。
+- **路由零改动**:`isBaseError(24)` 自动走既有 `onBaseFailed` —— 容量事实 ≠ 候选质量判定,重开沙箱在同一个任务上必然产出同样大的补丁,返工无意义:`BLOCKED` + `awaiting_human`,不烧返工预算、不派下游。唯一改动是审计诚实:`transition.reason` 按退出码区分(`patch exceeds size cap` vs `base materialization failed`),两种失败在事件链里可分辨。
+
+**测试与变异验证**:脚本字符串断言(`wc -c` 在 `diff` 之后、`-le ${maxBytes}` 插值审计、`exit 24`)、非法 `maxBytes` throw、`isBaseError(24)`、DO 路由测试(24 → `base.failed` + `BLOCKED` + `awaiting_human` + 单 writer attempt + 无 `rework_scheduled`/`verify.requested` + reason 可区分)。变异两条:删脚本预检行、改坏 `isBaseError` —— 对应测试变红后还原。
+
+**诚实边界**:prod 尚无超限样本(现有任务补丁都是几百字节级),门禁的可达性由测试证明,prod 触发要等真实大 diff 任务。上限是保护控制面的容量闸,不是质量信号 —— 被 24 拦住的任务转人工后,合理处置是人工拆分任务或调高 `MAX_PATCH_BYTES`,不是返工。
+
+### 13.18 长任务生命周期探针 — 失败(发现 ~30 分钟挂起墙,修复顺延 M9.5)
+
+探针设计:`verify_command: "sleep 1920 && echo long-ok"`、`budget.max_wall_seconds: 3600`,问「单次 >30min 的 exec 能否穿过容器 + workflow step + DO 回报链」。**答案:不能,在 ~30 分钟处被平台杀掉。**
+
+**时间线**(全部来自事件链与 `wrangler tail`,可回放):
+
+- 15:24:05Z:verifier 沙箱完成 clone + `git apply`(5 秒),开始执行 `sleep 1920`;
+- 15:53:53Z(**exec 开始后 29 分 48 秒**):workerd 报 `The Workers runtime canceled this request because it detected that your Worker's code had hung` —— 执行 `exec` 步骤的那条请求被运行时挂起检测杀掉;
+- workflow 的 catch 如实回报,attempt 落 `BLOCKED`,error = `Attempt failed due to internal workflows error`;
+- 随后控制面派了 **writer 返工**(137K tokens 重做了一遍同样的活),第二轮 verify 再跑同一个 1920 秒 —— 按同一堵墙的确定性,会原样再失败,直至 `DEFAULT_MAX_ATTEMPTS=3` 耗尽、任务 `BLOCKED`。
+
+**根因判定**:不是 Workflows 文档里的 step 限制([官方限制页](https://developers.cloudflare.com/workflows/reference/limits/)写明 step 墙钟无限、只限 CPU 秒),而是 **workerd 的挂起检测容不下单一长挂起 fetch** —— `step.do("exec")` 里一条 `await sandbox.exec(...)` 挂了 ~30 分钟,运行时就当代码死了。[workerd#6925](https://github.com/cloudflare/workerd/issues/6925) 里同款错误文案的讨论佐证了这条检测的存在与误伤面。保守安全线:**单条命令 ≤ 25 分钟**,超过必须拆。
+
+**顺带暴露的路由语义问题**(M9.5 一起修):验证器的平台级失败目前按「验证失败」进 writer 返工闭环(`session.ts:388` 的既有设计)。在瞬时抖动下这是对的 —— 换个沙箱重验有意义;但在**确定性容量失败**下纯属浪费,还把平台错误字符串原样塞进 writer 的修复指令(语义污染)。容量/拓扑事实 ≠ 候选质量判定,这条原则在基线路由上是清楚的,在验证器路径上还没贯彻。
+
+**M9.5 修复方向**(本轮不实施):把长 exec 从「一条长 fetch」改成「后台启动 + 短轮询」—— 容器内 `nohup` 起任务、落完成标记文件,workflow 用一串短 `step.do` 轮询 + `step.sleep` 续命,每步都是秒级请求,天然绕过挂起检测且崩溃可从最近 checkpoint 恢复([Rules of Workflows](https://developers.cloudflare.com/workflows/build/rules-of-workflows/) 的标准模式)。修好前,任务规格的 `verify_command` / 单条命令按 25 分钟以内设计。
 
 ---
 

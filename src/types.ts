@@ -25,6 +25,15 @@ export interface Env {
   REJECT_EVIDENCE_MODE: string;
   /** 基线材质化失败的处理:"shadow"(回落默认分支并留痕) | "enforce"(直接 BLOCKED 转人工) */
   BASE_PIN_MODE: string;
+  /**
+   * 沙箱出站策略:"shadow"(全部放行但记录每个出站主机) | "enforce"(仅允许
+   * 白名单主机)。可选,缺省按 shadow —— 有否决权的开关先观测再启用。
+   */
+  EGRESS_MODE?: string;
+  /** enforce 白名单中的代码托管主机,逗号分隔。可选,缺省仅 "github.com"。 */
+  EGRESS_GIT_HOSTS?: string;
+  /** 补丁字节上限。可选,缺配/非法回落 1 MiB(见 base.ts DEFAULT_MAX_PATCH_BYTES)。 */
+  MAX_PATCH_BYTES?: string;
 
   /** Worker 侧高权 key:给 reviewer 用;也是沙箱 key 缺配时的回落值 */
   DASHSCOPE_API_KEY: string;

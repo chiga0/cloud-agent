@@ -503,6 +503,41 @@ describe("TaskSession DO 基线冻结", () => {
     chainIntact(snap!.events);
   });
 
+  it("补丁超限(24)同属容量事实:BLOCKED 转人工,不返工,reason 与基线失败可区分", async () => {
+    const stub = newStub();
+    await createTask(stub, {
+      prompt: "m9",
+      repo_url: "https://example.invalid/r.git",
+    });
+    const { attempt_id } = await stub.startAttempt({
+      role: "writer",
+      idempotency_key: crypto.randomUUID(),
+      ...BUDGET,
+    });
+    const res = await stub.reportExecution({
+      attempt_id,
+      exit_code: 24,
+      result_text: "",
+      error: "patch too large: 9999999 bytes > 1048576 limit",
+    });
+    expect(res.ok).toBe(true);
+
+    const snap = await stub.getSnapshot();
+    expect(kinds(snap!)).toContain("base.failed");
+    expect(snap!.task.state).toBe("BLOCKED");
+    expect(snap!.task.awaiting_human).toBe(true);
+    // 超限不是质量判定:不给「缩小 diff」的返工,人决定调上限还是拆任务
+    expect(snap!.attempts.filter((a) => a.role === "writer")).toHaveLength(1);
+    expect(kinds(snap!)).not.toContain("writer.rework_scheduled");
+    expect(kinds(snap!)).not.toContain("verify.requested");
+    const [transition] = payloads(snap!, "task.transition").filter(
+      (p) => p.to === "BLOCKED",
+    );
+    expect(transition.reason).toContain("patch exceeds size cap");
+    expect(transition.reason).not.toContain("base materialization");
+    chainIntact(snap!.events);
+  });
+
   it("result_text 为空串时 base.failed 仍留得下诊断(prod 实际形态)", async () => {
     const stub = newStub();
     await createTask(stub, {

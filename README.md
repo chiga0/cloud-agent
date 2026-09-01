@@ -97,24 +97,28 @@ git -C <你的仓库> checkout <candidate.base.sha> && git apply task-<task_id>-
 
 ## 已知边界(对应调研 §10)
 
-- Sandbox 单实例生命周期/空闲超时对长任务的影响未验证——PoC 第一件事就是跑一个 30min+ 任务观察。
+- 长任务实测边界(2026-09-01 探针):**单条命令 ≤ 25 分钟** —— ~30 分钟处 workerd 挂起检测会杀掉 workflow 的长挂起请求(§13.18),修复(后台启动 + 短轮询)排在 M9.5。容器本身在 30+ 分钟内存活无问题,墙在执行面那侧。
 - 容器可被替换:attempt 重建靠 spec+command digest,不依赖进程句柄。
 - qwen-code 的 `--auth-type openai` 与 stream-json 标志以本机 `qwen --help` 为准(sandbox.ts 中有集中定义)。
 - Sandbox 1.0 Preview(`@next`)API 已发布,稳定线 SDK 与镜像 tag 需对齐;升级时一起动。
 - D1 高并发写争用未压测;events hash chain 是防篡改检测,不是防平台方的密码学证明。
 - M7 的 fail-closed 是刻意的:reviewer 基建抖动或两轮候选无进展 → 任务挂 `awaiting_human` 等人工,绝不自动放行。代价是这类任务会堆积,`GET /tasks` 还没有 `awaiting_human` 过滤,只能逐个任务从事件里看。
-- **沙箱出站目前没有 allowlist**:`ContainerProxy` 未从 Worker 入口导出,容器 HTTPS 直连不受治理。计划的补偿是"沙箱只拿可撤销的低权 key",但它目前是**可选配置**——prod 尚未铸第二把 key,容器仍回落共用高权 key(日志 `credential_fallback`),所以这项收益现在为 0。即便配上,买到的也只是撤销能力 + 爆炸半径 + 归因,**不是限流**(token-plan 无可靠的 per-key 硬额度)。三个实施坑见 `docs/architecture.md` §13.14,做在 M9。
+- **沙箱出站已上 allowlist**(M9,prod `EGRESS_MODE=enforce`):`ContainerProxy` 已导出,`Sandbox` 子类 `interceptHttps` 全拦,白名单 = 模型主机(从 `MODEL_UPSTREAM_BASE` 推导)+ `EGRESS_GIT_HOSTS`(缺省 `github.com`),未列名主机一律 520。负向用例已在沙箱内固化证据(`curl example.com` → 520 `Origin is disallowed`),实施坑(含 `static outbound` 字段遮蔽基类 setter 那个)见 `docs/architecture.md` §13.14。凭据降权仍是独立的另一条防线且**处于回落态**:低权 `SANDBOX_MODEL_API_KEY` 尚未铸造,容器共用高权 key(日志 `credential_fallback`)。
 - 基线冻结默认 `BASE_PIN_MODE=shadow`:writer 在 pinned 基线不可达时回落已解析的默认分支并记 `base.fallback`,verifier **恒 enforce、不回落**。老任务(M8 前)是 `unknown_legacy`,候选如实标注「基线未固定,不保证可重放」。
 - 换沙箱镜像有热实例排空窗口:与"删掉冷装兜底"同批部署会让头几个 attempt 打到旧镜像(`exit 127`)。顺序见 `docs/architecture.md` §12。
 
 ## 验收
 
-对照最佳实践手册 §7 的 PoC 验收矩阵逐条过:DO/Workflow 崩溃恢复、Queue 重投幂等、Sandbox 容器替换、**非 allowlist 网络拒绝(未覆盖 —— `ContainerProxy` 尚未导出,顺延 M9,见 §13.14)**、token-plan key 仅注入沙箱供 agent 客户端直连(不经代理/不落盘)、时长与 turn 超限由 qwen-code 参数硬停、审批 HITL(或 reviewer agent 自动裁决)、digest 篡改检测、stale fencing 拒绝、events 链并发无分叉。
+对照最佳实践手册 §7 的 PoC 验收矩阵逐条过:DO/Workflow 崩溃恢复、Queue 重投幂等、Sandbox 容器替换、**非 allowlist 网络拒绝(已覆盖 —— M9 起 `EGRESS_MODE=enforce`,沙箱内 `curl example.com` 得 520 `Origin is disallowed`,见 §13.14)**、token-plan key 仅注入沙箱供 agent 客户端直连(不经代理/不落盘)、时长与 turn 超限由 qwen-code 参数硬停、审批 HITL(或 reviewer agent 自动裁决)、digest 篡改检测、stale fencing 拒绝、events 链并发无分叉。
 
 M6 追加(均已验收):**失败门禁**(writer 失败产物不可被批准,只能 rework/BLOCKED)、**独立验证器**(冻结候选在独立沙箱重放,结构化报告入证)、**组合证据强制绑定**(缺证据 400 / 伪证据 409,裁决绑定 `[writer, verifier?, reviewer?]`)、**DO 并发保护**(并发创建/读取/启动测试证明无交错写)。
 
 M7 追加(2026-09-01 prod 验收,详见 `docs/architecture.md` §13.12):**门禁分级**(机械硬门禁保留否决权;reviewer 的 reject 需 `failed_criteria` + 可执行 `fix_instructions` + 材料内可核对 `quote`,默认 `shadow` 只记事件)、**返工带走证据**(验证失败的 stderr 原文翻成修复指令进下一轮 prompt → repo 任务两轮闭环,reviewer 的"额外字段"异议只作为意见不再开轮)、**无进展熔断**(两轮候选 patch digest 相同即停,不再派 verifier/reviewer,`awaiting_human` 后终态只能人工给)、**证据口径单一来源**(`current_evidence` 钉住,`/evidence` 与 `/approve` 同口径,R2 独立重算逐字节一致;陈旧血缘 409 `attempt_not_current_writer`)、**预装镜像**(自建 `sandbox/Dockerfile` 镜像上 Cloudflare managed registry,去掉每 attempt 的 `npm install -g`)。影子期尚无 reject 样本,`enforce` 保持关闭;`GET /admin/chain-check` = `broken: 0`。
 
 M8 追加(**2026-09-01 prod 验收**,详见 `docs/architecture.md` §13.13 / §13.15):**基线冻结**(`TaskRecord.base` 为任务级权威;writer 与 verifier 材质化到同一个精确 commit,`fetch --depth=1 → --deepen 阶梯 → checkout --detach → HEAD 断言`;`21/22/23` 按环境事实 fail-closed 进 `BLOCKED`,不烧返工预算、不派下游;`base_sha` 因会被重放进新沙箱的 shell,入口与 DO 双重严格校验)、**候选交付接口**(`GET /tasks/:id/candidate` 只读投影,`status`/`safe_to_apply` 区分"独立验证过"与"只是产出过";`?format=patch` 下发前重算 sha256,不一致即 `integrity_error`)、**沙箱凭据降权(可选)**(容器优先用可撤销的低权 `SANDBOX_MODEL_API_KEY`,高权 `DASHSCOPE_API_KEY` 留在 Worker 侧给 reviewer;低权那把缺配时回落共用并打 `credential_fallback` 告警 —— 刻意不 fail-closed,**prod 当前就是回落态**)、**apply 失败语义变更**(基线固定后 `git apply` 失败即候选缺陷,返工指令改为「基于该基线重做」而非「同步最新默认分支」)。
+
+M9 追加(安全三件,**2026-09-01 prod 验收**,详见 `docs/architecture.md` §13.14 / §13.17):**出站 allowlist**(`ContainerProxy` 导出 + `Sandbox` 子类两档策略;按惯例先 `shadow` 取样 —— prod 样本恰好 3 个主机,其中 qwen-code 的阿里云 RUM 遥测定性为非必要、不加白,加白零新增 —— 再翻 `enforce`。正向:完整 repo 任务在 enforce 下全绿,同时证明基镜像已继承平台 CA、无需改 Dockerfile;负向:沙箱内 `curl https://example.com` 得 `520 / Origin is disallowed`,证据固化在任务自己的产物里;`wrangler tail` 对账:放行主机条条有 `egress=forward` 记账,被拒主机零记账 —— 门禁在第 2 步就拦,不进处理器)、**补丁大小上限**(容器内 `wc -c` 预检,超限 `exit 24` → 容量事实路由 `BLOCKED` 转人工,不返工;默认 1 MiB,`MAX_PATCH_BYTES` 可选回落;字节不回传,杜绝巨型 `--binary` diff 撑爆 worker isolate)、**长任务生命周期探针(失败,但失败得有价值)**:单条 ~30 分钟的 `sandbox.exec` 在 29:48 处被 workerd 挂起检测杀掉(不是文档里的 step 限制),保守安全线 = 单条命令 ≤ 25 分钟;顺带暴露「验证器平台错误进 writer 返工」的浪费路径。全部事实与 M9.5 修复方向见 §13.18。实施中新抓一个 SDK 级坑并修掉:`static outbound = fn` 类字段遮蔽基类静态 setter → 处理器注册表恒空、观测静默失效,改 `static { this.outbound = fn }` 并有机制测试钉住。
+
+M9 prod 取证:`npm test` → 110 passed、`tsc --noEmit` 干净(噪音形态仍是 §13.16 记录的三类,无形态变化;「本地跑不到执行面」的边界不变 —— A/B 的门禁语义只有 prod 一层证据)。出站治理:shadow 样本 3 主机 → enforce 翻转 → 正向全绿 + 负向 520 各一 + `wrangler tail` 记账对账。补丁上限:本地测试 + 变异证明门禁可达,**prod 无超限样本**(现有任务补丁都是几百字节级)。长任务:如上,探针失败,安全线 25 分钟写进 §13.18。两条旧账未动:`BASE_PIN_MODE` / `REJECT_EVIDENCE_MODE` 仍 `shadow`(样本判据未达成),`SANDBOX_MODEL_API_KEY` 仍未铸造(日志仍有 `credential_fallback`)。
 
 prod 取证结果:`npm test` → 98 passed、`tsc --noEmit` 干净;E1 无 repo 回归 / E2 pinned 双端同 SHA / E3 **候选取回本地在冻结基线上 `git apply` 成功**(本轮验收终点)/ E5 shadow 回落与 enforce fail-closed 双模式(19 秒 BLOCKED、writer `tokens_used=0`、预算不变)/ E6 注入 5 样本全 400 / E7 历史 `binding_digest` 逐字节不变 + 老任务如实标注基线未固定 + `chain-check broken=0` / E8 容器 key 指纹 = 高权 key(**降权收益目前为零**)。E4「上游移动」未取证:需要 runner 有默认分支 push 权限的仓库,现有样本都在 `octocat/Hello-World` 上。两条只有 prod 才暴露的问题已修:`sandbox.exec` 复用常驻 shell、脚本顶层 `exit` 会**杀掉会话**(退出码永不回传,改整段包进子 shell,§13.15);`base.failed.detail` 因 `??` 不认空串而恒为 `""`(改判空回落 + 事件带 `manifest_key` 指针)。**套件全绿不等于执行面被验证过**:`AttemptWorkflow` 的 `exec/extract/evidence/report` 要求真实容器,本地一行跑不到(本地 `npm test` 输出里那批 `uncaught exception` 就是这些被遗弃的本地 run,已实测不会写进 DO,计数与判读见 §13.16;能本地化的那一跳已补成 `test/queue-routing.test.ts` 的 5 条 `handleQueue` 投递用例)。**`BASE_PIN_MODE` 与 `REJECT_EVIDENCE_MODE` 均保持 `shadow`**:`BASE_PIN_MODE` 的样本量判据(≥10 个 repo attempt)未达成(自伤回落已确认为 0),`REJECT_EVIDENCE_MODE` 仍是 0 条 reject 样本 —— 两个开关的启用条件互不相干。
