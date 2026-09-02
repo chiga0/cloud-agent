@@ -14,6 +14,9 @@
     // 真实折扣以百炼控制台为准)。未设/非法值回落代码里的 0.2,不影响主流程。
     "CACHE_READ_COST_FACTOR": "0.2",
     "DEFAULT_MAX_WALL_SECONDS": "3600",
+    // writer 墙钟安全上限从代码缺省 25 提到 40:C7 纵切规格的 writer 在 25min 钳制下
+    // 三连 exit 55(每轮精确 ~25min20s,task 0c4a7281 取证),25min 装不下纵切量级。
+    "MAX_WRITER_WALL_MINUTES": "40",
     "DEFAULT_MAX_ATTEMPTS": "3",
     "REJECT_EVIDENCE_MODE": "shadow",
     "BASE_PIN_MODE": "shadow",
