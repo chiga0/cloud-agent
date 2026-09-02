@@ -116,6 +116,44 @@ curl -s "localhost:8787/admin/events?task_id=<task_id>" -H "authorization: Beare
   node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",async()=>{const{events}=JSON.parse(s);const h=async c=>[...new Uint8Array(await crypto.subtle.digest("SHA-256",new TextEncoder().encode(c)))].map(b=>b.toString(16).padStart(2,"0")).join("");let prev=null;for(const e of events){if(e.prev_digest!==prev)throw new Error(`断链 @seq=${e.seq}`);if(await h((prev??"GENESIS")+e.canonical)!==e.digest)throw new Error(`digest 不符 @seq=${e.seq}`);prev=e.digest}console.log(`chain ok: ${events.length} 条`)})'
 ```
 
+## 候选落地(`scripts/land.mjs`)
+
+平台侧只读、不持任何 push 凭据;落地端是唯一能写远端的地方,所以它把「人工取证据 → 核 digest → 干净树 apply → 本地验证 → commit → push」写成一条**先证明再动手**的链。守门判定全在 `scripts/land-gate.mjs`(纯函数 + 依赖注入,由 `test/land-gate.test.ts` 钉不变量),`land.mjs` 只是接 git/npm/HTTP 的薄壳。
+
+```bash
+export WORKER_API_TOKEN=…                      # 平台 API token;缺失即 fail-closed(退出码 3)
+node scripts/land.mjs --task <task_id>          # 默认 dry-run:五道门全跑,绝不 commit/push
+node scripts/land.mjs --task <task_id> --execute # 通过后在临时 worktree 里 commit
+node scripts/land.mjs --task <task_id> --execute --push   # 再 git push origin HEAD:main
+# 可选:--api <url>(默认 https://cloud-agent.aflow.workers.dev)、--token-env <NAME>
+#       (默认 WORKER_API_TOKEN)、--worktree <dir>(固定目录;失败现场保留,缺省放系统临时目录且结束回收)
+```
+
+五道门按序执行,任一步失败立即停,后续步骤一次都不执行:
+
+1. `done_state` —— `GET /tasks/:id` 的 `state` 必须是 `DONE`(平台不变量:进 DONE 必经决策记录),且 `base.sha` 是全长 commit sha。
+2. `manifest_cross` —— `GET /tasks/:id/evidence` 的 `digest` 必须等于 `task.current_evidence.writer_manifest_digest`(证据口径单一来源,不一致即有一边被换过)。
+3. `digest_ok` —— `GET /tasks/:id/candidate?format=patch` 的**响应体字节**本地重算 sha256,与 `manifest.patch.digest` 逐字符比对。这是防篡改硬门:材料是拿到的字节,不是服务端的声称。
+4. `apply_ok` —— `git fetch origin` 后在 `<base_sha>` 上开 detached worktree,`git apply --check` 通过再 `git apply`(patch 走 stdin,不在工作树里留文件)。
+5. `tests_ok` —— worktree 内 `npm ci --no-audit --no-fund` → `npm run typecheck` → `npm test`。
+
+全绿且带 `--execute` 才 commit,提交信息逐字含四要素(task / base sha 全长 / patch sha256 / binding digest)加一行真实验证摘要;`--push` 必须与 `--execute` 同传,且 push 只在**已 commit** 后发生。push 失败(含非快进)直接报错退出,**绝不 `--force`**。
+
+| 退出码 | 含义 |
+| --- | --- |
+| 0 | 成功。dry-run 表示「可以落地」;`--execute` 表示已 commit(`--push` 则已 push) |
+| 1 | 执行期故障:网络、子进程、`npm ci`、commit/push 本身失败 —— 报的是环境,不是对候选的裁决 |
+| 2 | 守门拒绝:五道门(`done_state`/`manifest_cross`/`digest_ok`/`apply_ok`/`tests_ok`)任一不过 |
+| 3 | 环境或参数错误:usage 错误(只传 `--push`、未知参数、缺 `--task`…)、token 环境变量缺失、目标不是 git 仓库 |
+
+过程日志走 stderr(`[land] <step> ok|fail <detail>`),终局摘要走 stdout 一行 JSON —— 退出码 3 时不输出摘要(一道门也没评估过):
+
+```json
+{"task":"…","gate":{"done_state":true,"manifest_cross":true,"digest_ok":true,"apply_ok":true,"tests_ok":true},"committed":false,"pushed":false,"commit_sha":null}
+```
+
+边界:不做并发落地锁(假设单机单循环,一次只 land 一个 task),不做 `--next`/轮询(下一期),不缓存凭据(每个请求从 env 现读)。`git`/`npm` 真实进程行为不在单测里 mock —— 第一次在新任务上跑请先 dry-run,看五道门是否如预期。
+
 ## 部署前一次性配置(需要账号操作)
 
 1. `npx wrangler login`
