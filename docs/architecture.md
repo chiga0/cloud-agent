@@ -168,15 +168,15 @@ digest = sha256(prev_digest || canonical({task_id, kind, payload}))
 | from \ to | RUNNING | VERIFYING | AWAITING_APPROVAL | DONE | REJECTED | BLOCKED |
 |---|---|---|---|---|---|---|
 | **PENDING** | ✅(writer claim) | | | | | ✅ |
-| **RUNNING** | ✅(rework 下一 writer) | ✅(writer 成功,派验证器) | ✅(非 repo 任务 / verify fan-out 降级,派 reviewer;无进展熔断直接挂起) | | | ✅(workflow 错误 / writer 失败耗尽) |
-| **VERIFYING** | ✅(验证失败,预算内 rework) | | ✅(验证通过,派 reviewer) | | ✅(验证失败且预算耗尽) | ✅(验证器基建错误耗尽 / 超时) |
+| **RUNNING** | ✅(rework 下一 writer) | ✅(writer 成功,派验证器) | ✅(非 repo 任务 / verify fan-out 降级,派 reviewer;无进展熔断直接挂起) | | | ✅(workflow 错误 / writer 失败耗尽 / writer 预算到期 exit 53·55) |
+| **VERIFYING** | ✅(验证失败,预算内 rework;env 签名样本仍走此路,§13.21) | | ✅(验证通过,派 reviewer) | | ✅(验证失败且预算耗尽) | ✅(验证器基建错误耗尽 / 超时) |
 | **AWAITING_APPROVAL** | ✅(reviewer reject 且证据契约成立,预算内 rework) | | | ✅(approve / accept_with_notes) | ✅(reject) | ✅(超时兜底) |
 | **DONE / REJECTED / BLOCKED** | — | — | — | — | — | —(终态) |
 
 语义区分:
 - **REJECTED** = 质量否决(reviewer/verifier 判定候选不合格,且 rework 预算耗尽)
-- **BLOCKED** = 执行故障(writer 反复失败耗尽、workflow/基建错误、超时),证据链可定位原因
-- writer `exit_code != 0` **绝不**进入审批流(硬门禁),只能 rework 或 BLOCKED
+- **BLOCKED** = 执行故障(writer 反复失败耗尽、workflow/基建错误、超时、预算到期),证据链可定位原因
+- writer `exit_code != 0` **绝不**进入审批流(硬门禁),只能 rework 或 BLOCKED;其中 `exit 53/55`(qwen 预算执法)**只能** BLOCKED 转人工,不派同规格返工(§13.21)
 - **`accept_with_notes`**(M7)→ DONE:reviewer 想返工但拿不出可核对的证据(影子期之外的 enforce 模式)或任务已 `awaiting_human` 时 reviewer 给出 advisory,均属此类(§13.12)
 - **`task.awaiting_human`**(M7)= fail-closed 挂起标记:reviewer 基建不可用或无进展熔断命中时置位,此后 reviewer 的结论只记事件不裁决,终态只能由 `submitDecision` 人工给出
 
@@ -194,13 +194,14 @@ reviewer 的 `decision:"none"`(基建失败或输出不可解析,见 §13.12)**�
 
 ## 6. 控制面 — `src/control/`(TaskSession DO 为唯一权威)
 
-M1 起权威从「Worker 直接 CAS D1 行」迁到 `TaskSession` DO,早期的 `src/control/authority.ts` 自由函数(`createTask/createAttempt/transition/recordDecision`)已删除。现存三文件分工:
+M1 起权威从「Worker 直接 CAS D1 行」迁到 `TaskSession` DO,早期的 `src/control/authority.ts` 自由函数(`createTask/createAttempt/transition/recordDecision`)已删除。现存文件分工(路由判据独立放在 `src/routing/`,与 `src/control/` 同属控制面权威侧):
 
 | 文件 | 职责 |
 |---|---|
 | `session.ts` — `TaskSession extends DurableObject` | 唯一写者:状态机、attempt 编排、证据钉住、决策、终态归档 |
 | `statemachine.ts`(纯) | 转换表合法性、`attemptDeadline` / `nextWatchdogAlarm`、`composite` 组合 digest |
 | `gates.ts`(纯) | 门禁分级判定、`describeVerifyFailure` 等返工指令生成 |
+| `../routing/classify.ts`(纯) | 失败性质 → 路由动作:预算到期 / 环境签名 / 质量兜底三档判据 + 模式表(§13.21) |
 
 **RPC 面**:写入 `createTask` / `startAttempt` / `reportExecution` / `submitDecision` / `alarm`;只读投影 `getSnapshot` / `getResultText` / `getEvidenceSummary` / `getCandidateRefs` / `getAttemptManifestKey`。Worker 侧不做任何仲裁,只做 HTTP ↔ RPC 的转换与 R2 读取。
 
@@ -938,6 +939,72 @@ r11 向量自检:`factor=1` → 6,949,711,**恰等于 raw total**(「缓存与 f
 **刻意不做**:`max_model_tokens` 仍是纯记录字段,**不新增执法、路由或预算拦截逻辑** —— 它与 `tokens_used` 同源于失真的 raw total,拿它执法等于拿失真值执法。四列**不给 `DEFAULT 0`**:旧行 NULL 表示「当时未记录」;`result.captured` 事件同步带 `cost_weighted_tokens`(无 usage → null)。台账在终态转换前就落定,所以 SUCCEEDED/FAILED/BLOCKED 三种终态都有数 —— 到期击杀的 attempt 钱已经花了,台账不能空白。
 
 验证:`npm run typecheck && npm test` 全绿(15 文件 230 测试,新增 22 条:提取/加权向量 17 + DO 落库 4 + 读端投影 1)。
+
+---
+
+### 13.21 平台路由分流:预算到期与环境故障不再当质量失败(M9.5②③)— 已实现
+
+§13.18 末记下、§13.19 明确顺延的那条账:「验证器平台错误按验证失败进 writer 返工」。本期落地的是**路由侧**的处置分流,执行面一行未动。
+
+**要治的病(2026-09-02 prod 死亡螺旋,任务 `6d4574df-1a25-48dc-8bd9-c2449f21ddf7`)**:一次失败在控制面只有一种解释 —— 终态非 0 即质量失败 —— 于是「环境坏了」与「agent 做错了」共用同一条返工链路,而这两类失败的返工收益一个是零、一个是正。
+
+**标本时间线**(全部来自事件链;`verifier attempt = f1673050`):
+
+| 时刻 | 事实 | 当时的处置 | 应有的处置 |
+|---|---|---|---|
+| t+0 ~ +14min | writer 一次成功,候选导出、证据钉住 | ✅ 正常 | ✅ |
+| ~t+15min | verifier:`apply.exit_code=0`(**补丁完好、可重放**),`verify.exit_code=1`,`stderr_tail` 里是 `[ensure-deps] 缺少 node_modules/.bin/tsc, …` → `npm install` → `npm error code ECONNRESET` / `npm error network aborted` / `npm error network This is a problem related to network connectivity.` | 当质量失败 | 重试 verifier,或 BLOCKED 转人工 |
+| +1 | `verify.rework_scheduled` → writer 全量返工 #2(新沙箱 + 重新 clone + 重灌上下文) | 跑满 2400s 墙钟 → **exit 55** | — |
+| +2 | exit 55 又被当成失败 → 返工 #3 | 再跑满 2400s → **exit 55** | — |
+| +3 | `DEFAULT_MAX_ATTEMPTS=3` 耗尽 → 熔断 `BLOCKED` | ≈50 分钟 + 数 M token 白烧 | 第一次 exit 55 就该停下 |
+
+三次错误定性叠成一条链:**环境故障没被识别 → 烧掉一轮返工;预算到期没被识别 → 再烧两轮**。预算不会因为重开沙箱而多出一分,所以「再返工一轮试试」在这两类上的期望收益恒为零。
+
+**分类判据**(`src/routing/classify.ts`,纯函数:不读 env、不碰 DO、不写事件,输入全注入,可与将来的 Supervisor 共用同一份口径):
+
+| kind | rule | action | 默认档 | 判据 |
+|---|---|---|---|---|
+| `budget_turns` | `writer_exit_53_session_turns` | `blocked` | **enforce** | role=writer 且 `exit_code=53`(qwen 0.22.3 `nonInteractiveCli.ts` 的 `enforceSessionTurnLimit`) |
+| `budget_abort` | `writer_exit_55_budget_abort` | `blocked` | **enforce** | role=writer 且 `exit_code=55`(qwen `chunk-DJPASAUV.js:42029-42032`,`--max-wall-time` / `--max-tool-calls` 超限;**不是 token 预算** —— token 侧从不执法,§13.20) |
+| `env_transient` | `verifier_env_network_signature` | `none`(不主张改动) | **shadow** | role=verifier 且 `apply.exit_code=0` 且 `verify.exit_code≠0` 且 `verify.stderr_tail` 命中依赖安装阶段的网络签名 |
+| `quality` | `quality_fallback` | `rework` | enforce(= 既有语义) | 其余一切:writer 的质量失败、verifier 的 apply 失败(候选不可重放)、非环境签名的 verify 失败、验证器基建错误(`-1`) |
+
+`action` 三取值:`blocked` 改路由(停下转人工)/ `rework` 主张返工(现状)/ `none` 表示分类器**不主张**改动 —— shadow 档用它:分类照记,处置权留在既有链路上。下一期把某条规则切 enforce 时,改的是这张表里的动作与模式,**接线点不动**。
+
+**网络签名的三条通道**(`ENV_NETWORK_SIGNATURES`)都取 npm 自己给错误归类的产物:裸 errno 词 `ECONNRESET` / `ENOTFOUND` / `ETIMEDOUT`;`npm error code <网络码>`(显式枚举 `ECONNRESET|ECONNABORTED|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|ETIMEDOUT|ENETUNREACH|ENETDOWN|ENETRESET|EHOSTUNREACH|ESOCKET|EPROTO|ERR_SOCKET_TIMEOUT`);`npm error network …` 行前缀。刻意**不是**「以 E 开头就算」:`ERESOLVE`(依赖树冲突)、`EACCES`、`ENOENT` 同样是 E 前缀却与网络无关,误命中会把该返工的缺陷洗成环境问题。同理,任务自己的测试连不上本地服务时那句裸 `connect ECONNREFUSED 127.0.0.1:5432` 不命中 —— 只有带 `npm error code` 前缀的那条才等于 npm 自己出不了网。
+
+**接线三处**(都落在「即将派返工」的那一刻;分类器是唯一的改路由来源):
+
+- `onWriterReport` 的 `exit_code≠0` 分支(`writer.failed` 之后、`scheduleRework` 之前)→ 命中预算档即 `BLOCKED`,**绝不** rework 同规格;
+- `onVerifierReport` 的验证失败分支(`verify.completed(passed=false)` 之后、`onVerifyFailed` 之前),输入含 `parseVerifyReport(result_text)`;
+- `reportExecution` 的 `exit_code<0` verifier 分支:被到期击杀的 verify 进程照样回报了结构化报告(`verify.exit_code=-1`),它的 `stderr_tail` 里也可能带网络签名 —— 这类样本也要攒进链里。§13.19 说的「verifier `-1` 现路由仍进返工」本期**未改**,只是让它从此可被计数。
+
+`TaskSession.routeFailure()` 是无条件的一跳:分类 → 落事件 → 只有 `action=blocked` 才改路由。`blockByRoute()` 与 `onBaseFailed` 同族 —— 不派返工、不递减 `DEFAULT_MAX_ATTEMPTS`、置 `awaiting_human`、`BLOCKED` 即归档。`task.transition.reason` 按 kind 分别措辞(`budget_turns` 指向 `DEFAULT_MAX_SESSION_TURNS`,`budget_abort` 指向 `MAX_WRITER_WALL_MINUTES` 并写明「不是 token 预算」),人在 BLOCKED 那头不必反查 exit code 的语义。**没有登记理由的 kind 一律 throw**:将来若新判据也主张 blocked 却没在这里登记理由,必须当场炸,不能顶着「预算到期」的旧说法进归档。
+
+与 §13.20 的分工要说清:那一节立的规矩是「不拿 token 台账执法」,本期没有违反 —— 执法依据是 qwen 自己下发的退出码,`max_model_tokens` 与四列台账在任何路由判据里都不出现。
+
+**事件形状**(进 DO 事件 hash chain —— append-only 权威层,不改链的 digest 语义;终态归档后 `/admin/events` 读得到):
+
+```json
+{"kind": "route_decision", "payload": {
+  "attempt_id": "…", "role": "writer|verifier", "exit_code": 55,
+  "outcome_kind": "budget_turns|budget_abort|env_transient|quality",
+  "rule": "writer_exit_55_budget_abort", "action": "blocked|rework|none",
+  "enforced": true
+}}
+```
+
+`enforced` 读的是 `ROUTE_RULE_MODES[rule] === "enforce"` —— **模式表的取值,不是调用点的心情**。enforce 与 shadow 都发事件,shadow 事件 `enforced=false`。
+
+**为什么两条 exit code 判据可以默认 enforce**:退出码是平台自己下发给控制面的语义,不是从自由文本里猜出来的信号。53/55 只可能由 qwen 的预算执法产生 —— 那条命令是我们亲手拼的(`src/exec/sandbox.ts:qwenCommand` 显式带 `--max-session-turns` / `--max-wall-time`)。判据里没有启发式,因此没有误报面,不需要观测期。
+
+**为什么这两条只在 writer 侧生效**:只有 writer 的退出码来自那条我们拼的命令。verifier 的 `exit_code` 就是任务自己那条 `verify_command` 的退出码,任意脚本都可能吐 53/55;拿它当「预算到期」会把真质量失败洗白成平台问题(比返工更糟:任务被静默停成 BLOCKED 而无人复核)。
+
+**为什么环境签名必须 shadow**:它是错误文本的启发式匹配,存在真实误报面。仓内惯例是「有否决权的开关先攒样本再 enforce」—— `REJECT_EVIDENCE_MODE`(§13.12)、`BASE_PIN_MODE`(§13.13)、`EGRESS_MODE`(§13.14)皆如此,本条同一口径。**切 enforce 的判据先写死,以免将来靠感觉**:`route_decision ∧ outcome_kind=env_transient` 的样本 ≥10 条、且人工复核误报率 <10%,才谈处置;而届时的处置首选**重试 verifier**(换容器重验有意义),不是 BLOCKED 转人工,更不是返工 writer。
+
+**刻意不做**:不改 exit 53/55 的产生侧(qwen 的预算机制不动);不写 env_transient 的 enforce 与 `retry_verifier` 分支(样本未够,不写半截的 retry);不动 evidence / binding / digest / 审批逻辑;不改 writer/verifier 的执行行为本身(只改它们结束后的路由);不做 Supervisor 与外圈告警(下一期,与本 case 正交)。
+
+**验证与边界**(2026-09-02 本地):`npm run typecheck` 干净;`npm test` → 21 文件 **354** 条全绿(基线 323 + 新增 31:`test/routing-classify.test.ts` 22 条判据穷举 + `test/routing-do.test.ts` 9 条真 DO 路由)。新增夹具 `test/fixtures/env-transient-report.ts` 保存标本的 `stderr_tail` 形态(四处引文原样保留,其余按 npm 10 的既有输出形态补全,夹具里写明了保真度边界)。DO 侧钉法:`exit 55` → `route_decision{budget_abort,blocked,enforced=true}` + `BLOCKED` + `awaiting_human` + writer attempt 数不变 + 无 `writer.rework_scheduled`;`exit 53` 与 `exit 55` 的 reason 可分辨;shadow 环境签名与同形普通质量失败的**路由行为逐字段等值**(事件种类序列、`verify.rework_scheduled` 的字段集 / reason / attempt_number、attempt 计数、`task.state`),只有分类字段不同;`route_decision` 在链上的位置(`writer.failed` 之后、`task.transition` 之前)、seq 单调、digest 前继,以及 BLOCKED 归档后从 D1 `events` 读回的 canonical 原文与 digest 同值。质量路径一条断言未改即全绿 —— 那就是「语义不变」的回归证据。**变异验证五条**(逐条改坏判据,确认用例真能抓到它声称抓的东西;数字为变红条数,还原后全绿):`EXIT_BUDGET_ABORT` 55→54 → 5 红;删掉环境判据的 `apply.exit_code!==0` 约束 → 1 红(apply 失败被洗成环境问题);`quality_fallback` 模式 enforce→shadow → 4 红(`enforced=true` 断言);删掉 verifier 侧接线 → 3 红(`route_decision` 缺失);预算判据放开到两个角色 → 2 红(role 区分失守 —— verifier 的 53/55 会被当预算到期停成 BLOCKED,把真质量失败洗白)。**prod 未取证**:53/55 分流的可达性由测试证明,真实命中要等下一个撞预算的 attempt;`env_transient` 的 shadow 样本从本版本部署起才开始积累。
 
 ---
 

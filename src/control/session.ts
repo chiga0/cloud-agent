@@ -23,6 +23,13 @@ import {
   type ReviewSource,
   type ReviewVerdict,
 } from "./gates";
+import {
+  classifyAttemptFailure,
+  parseVerifyReport,
+  ruleMode,
+  type RouteDecision,
+  type VerifyReportSignals,
+} from "../routing/classify";
 
 /**
  * 每任务一个 TaskSession DO:任务状态机、事件 hash chain、决策、重试策略的
@@ -140,6 +147,31 @@ interface SessionData {
 type ReportArgs = Parameters<TaskSession["reportExecution"]>[0];
 
 const EVENTS_PER_SHARD = 100;
+
+/**
+ * BLOCKED 的结论原文(进事件链与 D1 归档)。刻意自带「该动哪个旋钮」:转人工之后,
+ * 读事件的人不必再反查 exit code 的语义才能决定下一步。
+ *
+ * 兜底分支抛错而非给个通用文案:将来若有新判据也主张 blocked 却没在这里登记理由,
+ * 必须立刻炸出来,不能让它顶着「预算到期」的说法进归档 —— 那是把新问题洗成旧问题。
+ */
+function blockedRouteReason(decision: RouteDecision, exitCode: number): string {
+  switch (decision.kind) {
+    case "budget_turns":
+      return (
+        `budget_turns (exit ${exitCode}): qwen --max-session-turns 触顶,不是候选质量失败。` +
+        `同规格返工必然再撞同一堵墙 → 转人工(可调 DEFAULT_MAX_SESSION_TURNS,或拆小任务)`
+      );
+    case "budget_abort":
+      return (
+        `budget_abort (exit ${exitCode}): qwen 墙钟/工具次数预算到期` +
+        `(来源 --max-wall-time / --max-tool-calls,不是 token 预算),不是候选质量失败。` +
+        `同规格返工必然再撞同一堵墙 → 转人工(可调 MAX_WRITER_WALL_MINUTES,或拆小任务)`
+      );
+    default:
+      throw new Error(`no BLOCKED reason registered for route kind ${decision.kind}`);
+  }
+}
 
 export class TaskSession extends DurableObject<Env> {
   /** 以 taskId 作为 name-based DO id 取 stub(同 task 恒映射同一实例)。 */
@@ -460,8 +492,18 @@ export class TaskSession extends DurableObject<Env> {
           });
           await this.archiveWithRetry(s);
         } else if (attempt.role === "verifier") {
-          // 验证器基建错误按验证失败处理,进入 rework 闭环
-          await this.onVerifyFailed(s, args.attempt_id, args.error ?? "verifier workflow error", null);
+          // 验证器基建错误按验证失败处理,进入 rework 闭环。分类照做:被到期击杀的
+          // verify 进程照样回报了结构化报告(verify.exit_code=-1),它的 stderr_tail
+          // 里也可能带网络签名 —— 这一类的样本也要攒进链里。
+          const routed = await this.routeFailure(s, {
+            attempt,
+            role: "verifier",
+            exit_code: args.exit_code,
+            verify_report: parseVerifyReport(args.result_text),
+          });
+          if (!routed) {
+            await this.onVerifyFailed(s, args.attempt_id, args.error ?? "verifier workflow error", null);
+          }
         }
         await this.saveAll(s);
         return { ok: true };
@@ -540,6 +582,72 @@ export class TaskSession extends DurableObject<Env> {
   }
 
   /**
+   * 失败回报的路由分类(M9.5②③):分类 → **无条件**落一条 `route_decision` 事件
+   * (enforce 与 shadow 都记)→ 命中强制档且主张 blocked 时把任务停下转人工。
+   *
+   * 返回 true = 本次失败已被路由成 BLOCKED,调用方不得再派返工。shadow 档规则
+   * (现只有验证器环境签名,`action: "none"`)永远返回 false:分类照记,处置权仍留在
+   * 既有链路上 —— 攒的就是这些事件,下一期按 kind 计数决定是否切 enforce。
+   *
+   * 为什么预算到期绝不能返工:exit 53/55 是 qwen 自己的预算执法下发的码,与候选质量
+   * 零相关。2026-09-02 标本(verifier f1673050 之后)两轮返工各跑满 2400s、各以 exit 55
+   * 收场 —— 重开沙箱不会多出预算,返工只是把同一个失败买贵一次(≈50min + 数 M token)。
+   */
+  private async routeFailure(
+    s: SessionData,
+    args: {
+      attempt: AttemptRecord;
+      role: "writer" | "verifier";
+      exit_code: number;
+      verify_report?: VerifyReportSignals | null;
+    },
+  ): Promise<boolean> {
+    const decision = classifyAttemptFailure({
+      role: args.role,
+      exit_code: args.exit_code,
+      verify_report: args.verify_report ?? null,
+    });
+    await this.appendEvent(s, "route_decision", {
+      attempt_id: args.attempt.id,
+      role: args.role,
+      exit_code: args.exit_code,
+      outcome_kind: decision.kind,
+      rule: decision.rule,
+      action: decision.action,
+      enforced: ruleMode(decision.rule) === "enforce",
+    });
+
+    if (decision.action !== "blocked") return false;
+    await this.blockByRoute(s, args.attempt, decision, args.exit_code);
+    return true;
+  }
+
+  /**
+   * 分类主张 blocked 的终态。与 `onBaseFailed` 同族:环境/预算事实不是候选质量判定,
+   * 所以不派返工、不递减 `DEFAULT_MAX_ATTEMPTS`,置 `awaiting_human` 后停下转人工。
+   *
+   * reason 按 kind 分别措辞:turns 上限与墙钟到期的旋钮不是同一个,人在 BLOCKED 那头
+   * 要能一眼看出该调哪个(或拆任务),而不是自己从 exit code 反推语义。
+   */
+  private async blockByRoute(
+    s: SessionData,
+    attempt: AttemptRecord,
+    decision: RouteDecision,
+    exitCode: number,
+  ): Promise<void> {
+    s.task!.awaiting_human = true;
+    s.task!.pending_review = false;
+    s.task!.pending_verify = false;
+    this.setState(s, "BLOCKED");
+    await this.appendEvent(s, "task.transition", {
+      to: "BLOCKED",
+      actor: `agent:${attempt.id}`,
+      reason: blockedRouteReason(decision, exitCode),
+    });
+    await this.archiveWithRetry(s);
+  }
+
+  /**
    * 把执行面回报的实际基线写进权威。基线一旦变化(shadow 回落、上游被重写),
    * 跨轮 patch_digest 比较就失去意义 —— 不清零基准会把「换了基线的同等产出」
    * 误判成无进展熔断,或反过来让真无进展躲过比较。
@@ -580,6 +688,9 @@ export class TaskSession extends DurableObject<Env> {
         attempt_id: attempt.id,
         exit_code: args.exit_code,
       });
+      // 分流在返工之前:预算到期(exit 53/55)是同规格返工必然复现的失败,烧掉的是一整轮
+      // 沙箱 + clone + 上下文。2026-09-02 标本正是这里没分流,两轮返工各跑满 2400s。
+      if (await this.routeFailure(s, { attempt, role: "writer", exit_code: args.exit_code })) return;
       await this.scheduleRework(s, {
         decider: `agent:${attempt.id}`,
         reason: `writer exit_code=${args.exit_code}`,
@@ -709,6 +820,16 @@ export class TaskSession extends DurableObject<Env> {
         passed: false,
         exit_code: args.exit_code,
       });
+      // 分类器目前不会在 verifier 侧主张 blocked(环境签名是 shadow 档,action=none),
+      // 这一跳现在的全部产出就是那条 route_decision 事件 —— 但接线必须在这里,
+      // 否则将来把签名规则切 enforce 时又要改一次接线点(改漏一处就是继续烧返工)。
+      const routed = await this.routeFailure(s, {
+        attempt,
+        role: "verifier",
+        exit_code: args.exit_code,
+        verify_report: parseVerifyReport(args.result_text),
+      });
+      if (routed) return;
       await this.onVerifyFailed(
         s,
         attempt.id,
