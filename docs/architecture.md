@@ -448,7 +448,7 @@ obs/<task_id>/<attempt_id>/index.json                   每 attempt 一份:段�
 
 - **不建 hash chain**:防篡改是权威层(§4 Event / §9)的职责;观测事件的价值是「现在在干什么」,要的是读得到、读得快。信封里既没有 `digest` 也没有 `prev_digest`。
 - **不参与状态机、不改执行行为**:摄取失败(读文件错、解析错、R2 抖)只记 `obs_ingest_failed` 并跳过本轮,下一轮从已存游标重试 —— 把 attempt 弄成 BLOCKED 是权威层的事,旁路不该改变结论。
-- **不做 Supervisor / 告警 / 分流**(下一期),**不做 SSE / Live UI**(下下期)。本期只交付数据路径与 RUNNING 期间可读的出口。
+- **不做 Supervisor / 告警 / 分流**(下一期)。SSE 投影已落地(§9.6),Live UI 仍是下一期;本节只交付数据路径与 RUNNING 期间可读的出口。
 - **不做事件回放改写/删除**:段文件 append-only。
 
 ### 取证日志
@@ -460,6 +460,156 @@ obs/<task_id>/<attempt_id>/index.json                   每 attempt 一份:段�
 | `obs_ingest_failed` | 本轮摄取失败已跳过(带 `action=skip_round_retry_next`) |
 | `obs_index_malformed` / `obs_index_inconsistent` / `obs_commit_seq_discontinuity` / `obs_segment_count_drift` | 游标自洽性被破坏 → 整轮拒写 |
 | `obs_read_attempt_failed` | 读端点遇到坏 journal,降级为「列出该 attempt 但不返回其事件」 |
+
+---
+
+## 9.6 SSE 投影 —— 在途事件的流式读出口(非权威)`src/obs/stream.ts`
+
+一句话:把 §9.5 那条只能一页页拉的在途事件流,改成**按位置游标往前推**的 SSE。它一个字节都不写,权威仍是 §4 / §6 的 hash chain。
+
+数据源与 §9.5 的读端点**完全相同**(同一个 `readObsAttemptEvents`、同一份 R2 段文件 journal、同一套扁平序),差别只在拉与推。
+
+### 定位:四层可观测里的第四层,而且是投影
+
+| 层 | 出口 | 数据源 | 权威? | 任务 `RUNNING` 期间有内容? |
+|---|---|---|---|---|
+| ① 控制面快照 | `GET /tasks/:id` | TaskSession DO `getSnapshot()` | **读的就是权威本人** | 有,但只有粗粒度 `state`(C2-r6 的病灶,§9.5) |
+| ② 归档读视图 | `GET /admin/events`、`/admin/attempts` | D1 终态归档 | 否(投影) | **无** —— 事件/attempt 随终态才归档 |
+| ③ 在途只读投影 | `GET /tasks/:id/events` | R2 `obs/` 段文件 journal | 否(投影) | 有,拉取式,单次 ≤2000 条 |
+| ④ 在途流式投影 | **`GET /tasks/:id/events/stream`** | 同一份 journal(经 ③ 的同一个读函数) | **否(投影)** | 有,推送式,每拍只读增量 |
+
+本节是第④层的**上半**;下半(Live UI / `/live`)是下一期,本期不产任何 HTML。
+
+**「投影」的操作性定义,不是修辞**:本端点不写任何权威状态 —— 不碰 TaskSession DO 的 storage、不追加事件、不动 D1、不新增 R2 对象。全部副作用 = 每轮一次 `getSnapshot()` 短读 + 若干次 journal 读。因此删掉这条端点不影响任何执行结论,也不使任何已归档证据变得不完整。反过来这也界定了它**不能**承担什么:帧里没有 `digest`/`prev_digest`,不构成可核验的审计序列;要举证仍以 hash chain(`GET /admin/events`)为准。
+
+为什么值得单独一条流,而不是用 ③ 分页全量重放:③ 单次上限 `MAX_OBS_LIMIT=2000`,而一次 40 分钟的长跑实测 **450+ 条且仍在涨** —— 靠「翻到最后一页看尾部」来回答「现在在干什么」,每轮都要付整段下载的代价(O(total))。流式投影把成本降到 O(new)。
+
+为什么是**独立端点**而不是把 `/events` 改成「可选流式」:后者的 `Content-Type` 与响应形状会随 query 变化,同一个 URL 两种契约最容易让客户端猜错;而 SSE 的连接生命周期(取消、保活、终止帧)是一整套自己的约定,值得单独一个路径。
+
+### 帧格式
+
+```
+HTTP/1.1 200 OK
+content-type: text/event-stream; charset=utf-8
+cache-control: no-cache, no-transform     ← 一条被中间盒攒住的 SSE 与没有 SSE 等价
+x-accel-buffering: no
+
+id: 3
+event: agent
+data: {"v":1,"task_id":"…","attempt_id":"…","generation":1,"seq":3,"ts":"…","kind":"tool_use","payload":{…}}
+
+: ping                                    ← 一轮无新事件的保活注释帧:**没有 id 行**
+
+id: 450
+event: end
+data: {"v":1,"task_id":"…","events":450,"unreadable_attempts":[]}
+```
+
+- 事件帧的 `data` 就是 `AgentEventV1` 原文(§9.5 的信封),**不解析、不加工、不重排字段** —— 脱敏已在 ingress 完成,读端点再加工就是第二个口径。
+- `event:` 名固定 `agent`(事件帧)与 `end`(终止帧);`end` 的 `data` 形状版本 `v` 是 `OBS_SSE_FRAME_V`,与 `AgentEventV1.v` **各自独立演进**。
+- **`data:` 恒为一行**。一个裸换行会把一条事件切成两帧、把后续行当新帧解析 —— 那是 SSE 注入。`JSON.stringify` 已把 `\n`/`\r` 转义成两字符序列,注入这条路天然封死;剩下 U+2028/U+2029:对 JSON 合法、对 SSE 分行规则非法,而不少语言的分句函数(Python 的 `splitlines` 即一例)会当换行处理 —— 而 payload 里装的正是 agent 的任意自由文本。所以 `sseData()` 显式转义这两个码位,让「一帧一个 data 行」对任何客户端都成立(测试逐帧断言 `data:` 行数为 1)。
+
+### 帧 id 与 `Last-Event-ID` 的口径:已读条数,与 `GET /events` 的 `after` 完全同源
+
+**口径一句话**:帧的 `id` = **该帧之后已读的事件条数** = 全 attempt 扁平序(§9.5 的排序:attempt 创建序 + attempt 内 `generation`、`seq` 升序)上的 **1-based 位置**。客户端断线时按标准把最后看到的 `id` 回传成 `Last-Event-ID`,服务端把该值当**已读条数**消耗,于是下一帧的 id = 该值 + 1。`end` 帧的 id 同口径(= 当前扁平总条数),拿它当续传点再连,正好接在最后读过的那条之后。
+
+**为什么不是 0-based 索引 —— 上一版实现正是这么错的**:
+
+| 口径 | 断线续传的后果 |
+|---|---|
+| `id` = 索引 p(0-based) | 索引 p 之后已读 p+1 条,而服务端把 id 当已读条数消耗 → **位置 p 那条被重发一次** |
+| 第一帧 `id: 0` | 浏览器重连回传 `Last-Event-ID: 0` = 「一条都没读过」→ **全量重放整条流** |
+| `id` = 已读条数(现状) | 续传点之后第一条就是没读过的那条:不重发,也不漏读 |
+
+两套口径的代价不是「有点吵」,是「同一事件出现两次、另一次永远看不到」,而这两者都不报错、都在客户端表现成一条正常增长的流 —— 只有拿它做去重或计数时才暴露,那时已经分不清哪一份是真的。
+
+**同源靠的是同一个算法,不是靠注释**:本端点的每轮差分(`累计 before`、`skip = max(0, position - before)`)与 `handleGetTaskEvents` 的 `after` 分配规则**逐字相同**。两处各写一份迟早漂移,而漂移的表现就是上面那张表。可执行证据在 `test/obs-stream-api.test.ts`:「往返自洽」(最后一帧的 id 喂给 `?after=` 与当 `Last-Event-ID`,两边都读出 0 条)与「中间帧 id=2 时两种读法逐条相同」两条用例把这条口径钉成断言,而不是留给读者比对。
+
+**入参校验**:
+
+- header 不在 = 缺省 = 0 = 从流头回放已有全部事件。**header 出现了但值为空不是「缺省」** → 400 `invalid_last_event_id`(与 `?after=` 空值同理:把空值当 0 会让一次写错的续传从头重放整条流)。
+- 比 `Number(raw)` 更严:只接受 `^\d+$` 且落在安全整数范围。`Number` 会把 `0x10` 读成 16、`1e3` 读成 1000 —— 一个续传游标被**悄悄换算**的后果是漏读(位置 16 之前全被跳过),而这条路径上没有任何东西会发现。
+- 起始位置超过总条数(客户端拿着未来的游标重连)→ 零帧、正常收尾,不是错误。
+- 装配层拿着畸形起始值 → `createObsStreamSession` 直接 throw `obs_stream_bad_start_position`:那是装配 bug,不该退化成「从头全量重放」。
+
+鉴权与错误形状同其余任务端点:同一条 `checkApiToken` 路径(缺/错 token → 401);任务不存在 → 404,且**必须在建流之前判掉** —— 流一旦 200 就没法再补状态码。
+
+### 为什么绝不把长连接挂进 TaskSession DO
+
+§6 的定稿禁令,这里说清它针对什么。TaskSession 是 `blockConcurrencyWhile` 的**重度单写者**:`createTask` / `startAttempt` / `reportExecution` / `submitDecision` / `alarm` 每条写路径都把「读 → 变更 → 写」整体圈进临界区(§13.11 花力气消掉的就是这类交错)。一条活几分钟到几十分钟的 SSE 若驻留在 DO 里,它占住的并发槽位就会**挤占权威写路径** —— writer 的回报会被一条只读连接挡在后面,而回报正是状态机唯一的前进输入。
+
+所以泵跑在**普通 worker handler 的 `ReadableStream`** 上,每轮只做一次**短读** `getSnapshot()`(只取 `state` 与 attempts 清单,`ObsStreamSnapshot` 刻意比快照窄:流不需要 events 与预算)。禁令的对象是「连接挂进 DO」,不是「周期性地短暂读一下 DO」—— 短读进出临界区的时长与一次普通 HTTP 请求同级。
+
+这条边界值得写明白,否则下一棒容易矫枉过正:把 attempt 清单缓存进 worker 内存以「减少 DO 读」,就会多出第二个清单口径,而扁平序的正确性恰恰依赖它与 `GET /tasks/:id` 同源。
+
+### 尾读节奏、保活与终止条件
+
+| 规则 | 取值 | 为什么 |
+|---|---|---|
+| 尾读节拍 | `OBS_SSE_TAIL_INTERVAL_MS = 3000` | 它**不是新数据的来源**:journal 每 30s 才被 `poll-i` 推进一次(§9.5)。3s 只决定「事件落地后多久被流看见」。取 3s 而非 30s,是为了让尾部延迟由**摄取周期**主导,而不是由本端点的轮询节拍主导 |
+| 保活 | 一轮零新增 → `: ping\n\n` | 让代理链与客户端都知道连接还活着。注释帧没有 `id:` 行,因此**不移动续传点**(浏览器保留上一个事件帧的 id) |
+| 终止 | `state != RUNNING` **且**本轮增量已推完 → 一帧 `end` 后 `close()` | 只有 `RUNNING` 是「还在往前流」。`AWAITING_APPROVAL`、`BLOCKED`、各终态一律收尾:旁路不预测终态之后还有没有事件,收尾让客户端按标准带 `Last-Event-ID` 重连(拿 404)或转 ③ 复核 |
+| 读写顺序 | 先读快照、后读 journal | 这样「快照已非 RUNNING」与「本轮增量已推完」在**同一轮**里同时成立,终止判定不需要再多等一拍确认 |
+| 快照读不到(任务被删/DO 不可用) | 发 `end` 收尾 | 没有任何可信的前进依据,不该空转到天荒地老 |
+| 快照读抛错 | 记 `obs_stream_pump_failed` 后关流(**无 `end` 帧**) | 大声失败,让 EventSource 按标准自己重连,而不是留一条永远不出声的 200 |
+| 输出队列 | 刻意**不设上限** | 每轮产出受 journal 增量约束(30s 一轮、单轮条数有限),消费方是一个总在读的浏览器。真正的上限是「终态即收尾」,不是缓冲区大小 |
+
+一条连接一个泵,不做多客户端扇出:要 N 个读者就 N 条连接,读的都是同一份 append-only journal,彼此不影响。
+
+`AWAITING_APPROVAL` 也收尾值得单独说一句:按 §5 的转换表它可能因 reviewer 成立的 reject 回到 `RUNNING`(rework)。收尾**不丢事件** —— journal 继续增长,客户端带最后看到的 `id` 重连即从同一位置接上(位置口径与 ③ 同源,正是它保证这件事成立)。选择收尾而不是挂一条可能永远不醒的连接,是「旁路不预测权威接下来做什么」的同一取向。
+
+### 降级语义
+
+某 attempt 的 journal 读不到(index 坏了 / R2 抖)→ **不杀流**:记一条 `obs_stream_attempt_unreadable` warn,把该 attempt 列进本轮 `unreadable` 集合,`continue` 推其余 attempt。与 ③ 的 `unreadable_attempts` 同一处置逻辑:**静默少一批事件比报错更糟** —— 视图不完整必须出声,并且随 `end` 帧把 `unreadable_attempts` 交给客户端。下一轮它翻回可读即从集合移除(集合只反映「截至收尾那一刻还读不到的」)。
+
+副作用要如实记一句:扁平位置以「本轮读到的 attempt 清单」为准,所以某 attempt 从不可读**翻转为可读**会让位置重排。③ 同口径同表现,这不是本端点新增的偏差,实际也不会发生(index 坏了只会被下一轮摄取重写)。
+
+### teardown 不变量:cancel 必须 settle 泵等待中的那一拍
+
+本端点**头号的验收钉**,也是它前一版死掉的原因。
+
+`stop()` 只做 `clearTimeout` 是不够的:那一拍写成 `await new Promise(resolve => { timer = schedule(..., resolve) })`,cancel 之后 fire 永不执行 → `resolve` 永不被调用 → 泵那个 async 帧**永久悬挂**,每次客户端断开漏一个。workerd 按 IoContext 追踪未完成的异步工作,teardown 时判定 hung 并取消整个请求:
+
+```
+jsg.Error: The Workers runtime canceled this request because it detected
+that your Worker's code had hung
+```
+
+**实测标本(前一版)**:**48 条 `EnvironmentTeardownError`**,容器侧 **925s** 才收尾 —— 同一份套件本地 **4.5s 全绿**。后果不是「慢」,是**验证器连测试 summary 都打不出来**:被墙钟吃掉的是取证本身。这是 §13.16「这套绿不覆盖 orchestration」的镜像形态:**本地绿 ≠ 容器绿**,更准确地说是「本地绿也 ≠ 验证器能跑完」。
+
+结构上的修法:「等一拍」抽成 `createObsStreamWaiter()` —— 一个定时器 + 一个可被 cancel 立刻了结的 promise。`cancel()` 既 `timer.cancel()` **也自己 `resolve()`**(不等 fire 来),泵因此立刻回到 `while (!stopped)` 判定。它单独导出、`ObsStreamHandle.settled` 也存在,唯一意义就是把这条不变量变成**可断言的东西**:`test/obs-stream.test.ts` 的假 `schedule` 与 workerd 的 `setTimeout` 同构 —— `cancel()` **只清登记,绝不触发 fire** —— 所以任何「靠 fire 才 settle」的实现会在 teardown 用例里**快速变红**,而不是悬挂到超时(后者才是本地那 4.5s 全绿骗过人的形态)。
+
+> 两半都要守住,只做对一半本地仍然全绿:装配层(`src/index.ts` 的 `schedule`)必须真 `clearTimeout`,否则断开后定时器还在推进泵;`stream.ts` 的 `stop()` 必须真 settle 那一拍,否则断开后留一个悬挂帧。测试侧同理 —— `test/sse.ts` 的注释写明:**每个打开过 200 流的用例都必须 `cancel()`**。
+
+### 取证日志
+
+| 前缀 | 含义 |
+|---|---|
+| `obs_stream_attempt_unreadable` | 某 attempt 本轮读不到,已跳过(视图不完整,进 `end` 帧) |
+| `obs_stream_pump_failed` | 泵自身抛错(快照读失败)→ 记警告并关流 |
+| `obs_stream_bad_start_position` | 装配层喂进畸形起始位置 → throw,**不降级成全量重放** |
+
+### 为什么 docs 单独一棒
+
+这条端点是**「一个棒次里塞实现 + 测试 + 文档」连续撞墙两次**之后的拆分结果,不是格式洁癖:
+
+| 棒次 | 交付范围 | 结局 |
+|---|---|---|
+| C9 原规格 | 代码 + 测试 + docs 一棒交付 | **40 分钟撞墙**(task `f78b622f`) |
+| r2 | 同上,未拆 | 后台套件跑 **13 分钟颗粒无收**,被墙钟击杀(task `76464e22`) |
+| c9a-r3 | 只交付代码 + 测试 | 全绿,verifier 全量回归通过 |
+| c9a-r4(本节) | 只交付 docs | —— |
+
+拆分判据:**代码与测试的产出可以边跑边验,文档的产出只在收尾那一刻兑现**。把只在最后一步兑现的东西排在会被墙钟击杀的位置,等于把它做成下一次的 40 分钟。
+
+拆成两棒也有代价,要如实标出:本节读的是**已合入的实现与测试**,不是当时的设计意图。口径若与代码有冲突,以 `src/obs/stream.ts` 顶部注释与 `test/obs-stream*.test.ts` 为准 —— 它们是可执行的,本节不是。
+
+### 这一层刻意不做什么
+
+- **不产任何 HTML、不挂 `/live`**(第④层的下半,下一期)。落地页也**不列**这个端点:`test/obs-stream-api.test.ts` 钉住首页 HTML 里既不出现 `/events/stream` 也不出现 `text/event-stream` —— 「本期只交付数据路径」是可回归的,不只是声明。
+- **不写权威状态、不参与状态机**(见上「定位」)。
+- **不做背压/上限队列**、**不做多客户端扇出**。
+- **不预测终态之后的事件**:离开 `RUNNING` 即收尾,由客户端决定要不要重连。
 
 ---
 
@@ -499,6 +649,7 @@ obs/<task_id>/<attempt_id>/index.json                   每 attempt 一份:段�
 | GET | `/tasks/:id/candidate` | `Bearer $WORKER_API_TOKEN` | 候选交付视图(只读投影,不新增状态对象):`{ status, verified, safe_to_apply, base, patch, writer_attempt_id, verifier_attempt_id, decision, binding_digest, warnings }`。`status ∈ unverified \| verified \| verification_failed \| approved \| rejected \| held_for_human`;`base` 是**这份候选自己的**基线(manifest 血统),与任务当前基线不一致时进 `warnings`。尚未有钉住候选 → 404 `no_candidate_yet` |
 | GET | `/tasks/:id/candidate?format=patch` | `Bearer $WORKER_API_TOKEN` | `text/plain` + `Content-Disposition: attachment; filename="task-<id>-<patch digest 前 12 位>.patch"`。**下发前重算补丁字节 sha256 并与 manifest 记录的 digest 比对**,不一致 → 500 `integrity_error`,不把未校验字节交出去。判定进响应头 `x-candidate-status` / `x-verified` / `x-safe-to-apply` / `x-base-sha`,只看头也不会把被否决的候选当成可提交成品 |
 | GET | `/tasks/:id/events` | `Bearer $WORKER_API_TOKEN` | **在途事件流**(§9.5):直接读 R2 的 `obs/` 段文件 journal,**不经 D1 终态归档**,所以任务 `RUNNING` 期间就有内容。返回 `{ task_id, state, events: AgentEventV1[], count, total, next_cursor, unreadable_attempts }`;按 attempt 创建序、attempt 内按 `generation`/`seq` 升序。`?after=`(扁平流上已读的条数,缺省 0)、`?limit=`(缺省 500,上限 2000;非法 → 400 `invalid_after`/`invalid_limit`)。任务不存在 → 404;从未摄取过 → 空列表 |
+| GET | `/tasks/:id/events/stream` | `Bearer $WORKER_API_TOKEN` | **在途事件的 SSE 投影**(§9.6):`text/event-stream`,与 `/events` 同一份 journal、同一个位置游标的两种读法(推/拉),互为恢复源。帧 `id` = **该帧之后已读的条数**(扁平序 1-based 位置),与 `?after=` 完全同口径 → 断线带 `Last-Event-ID: <id>` 续传不重发也不漏读(header 缺省 = 0 = 从头回放;值为空或畸形 → 400 `invalid_last_event_id`)。每拍 3s 尾读增量,零新增发 `: ping` 注释帧;任务离开 `RUNNING` 且增量推完 → 一帧 `event: end`(id = 总条数,`data` 带 `unreadable_attempts`)后关流。某 attempt 的 journal 读不到只列进 `unreadable_attempts`,**不杀流**。任务不存在 → 404(在建流之前判定)。**只读投影:不写任何权威状态** |
 | GET | `/tasks/:id/attempts/:aid/transcript` | `Bearer $WORKER_API_TOKEN` | 流式透传 R2 里的 transcript 原文 |
 
 ### 典型调用序列

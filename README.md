@@ -75,6 +75,8 @@ curl -s localhost:8787/tasks/<task_id>/candidate -H "authorization: Bearer $TOKE
 curl -s -OJ "localhost:8787/tasks/<task_id>/candidate?format=patch" -H "authorization: Bearer $TOKEN"
 git -C <你的仓库> checkout <candidate.base.sha> && git apply task-<task_id>-<patch前12位>.patch
 
+curl -N localhost:8787/tasks/<task_id>/events/stream -H "authorization: Bearer $TOKEN"   # GET /tasks/:id/events/stream:SSE 在途事件流(第④层可观测的投影,**非权威**,不写任何状态)—— 帧 id = 该帧之后已读的条数,与 /events 的 `?after=` 完全同口径,断线带 `Last-Event-ID` 续传不重发不漏读;每拍 3s 推增量,任务离开 RUNNING 且增量推完则一帧 `end` 后关流(详见 docs/architecture.md §9.6)
+
 # 复盘各 attempt(writer/verifier/reviewer)的终态与 token 消耗 —— `GET /admin/attempts`。
 # 它是 D1 归档的**只读视图**(读投影,不是新的状态权威):attempt 随任务终态才归档,
 # 因此**不含尚未归档的在途 attempt** —— 在跑的任务仍看 `GET /tasks/<task_id>`。
