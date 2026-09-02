@@ -347,6 +347,121 @@ interface EvidenceManifest {
 
 ---
 
+## 9.5 Observation 层 —— 在途事件流(非权威)`src/obs/`
+
+一句话:把 Fix C 的 30s 轮询顺手看到的 transcript 增量,变成**任务 RUNNING 期间就读得到**的事件流。它不改任何执行结论,只解决「外圈看不进来」。
+
+### 为什么要单独一层
+
+C2-r6 那次单次模型调用悬挂 24 分钟(§13.19)。当时外圈能拿到的只有:`GET /tasks/:id` 的粗粒度 `state: RUNNING`,以及 `/admin/events`、`/admin/attempts` —— 后两者读的是 D1 **终态归档**,任务没跑完就是空列表。于是「悬挂 24 分钟」与「正常干活 24 分钟」在事件层面完全同形。
+
+**本层的验收基准一句话:同样的悬挂重现,外圈凭事件流 5 分钟内能发现。** 它是下一期无人值守监督(Supervisor)的数据底座 —— 本期只做数据路径,不做判定与分流。
+
+### 数据路径(基准对应的每一跳)
+
+```
+qwen stream-json ──► /tmp/longrun-stdout(专用 session 的后台进程追加写)
+        │
+        │  poll-i step(workflow,每 30s 一拍):pollLongRun → ingestTranscript
+        ▼
+src/obs/ingest.ts ──► 按 index.json 的字节偏移取新增完整行 ──► AgentEventV1(ingress 白名单 + 脱敏)
+        │
+        │  commitObsRound:段文件先写、index.json 后写(提交点)
+        ▼
+R2  obs/<task_id>/<attempt_id>/g<generation>-seg<N>.jsonl  +  index.json
+        │
+        │  GET /tasks/:id/events?after=&limit=(直接读 R2,不经 D1)
+        ▼
+外圈 / 下一期 Supervisor
+```
+
+| 时刻 | 发生什么 | 外圈看到什么 |
+|---|---|---|
+| t=0 | 模型调用挂住,qwen 不再往 stdout 写任何字节 | — |
+| t≤30s | `poll-i` 读到 0 条新增完整行 → **不落任何写**(空轮询不该刷 R2 小对象) | 事件流尾部不再增长 |
+| t=30s..N | 每拍如此:进程 `status=running`,事件数恒定 | `state=RUNNING` + `total` 不变 |
+| 任意时刻 | `GET /tasks/:id/events` | 最后一条事件的 `ts` 停在 t≈0,与当前时刻的差单调增大 |
+
+判据是 **「最新事件 `ts` 距今 > 若干个 30s 轮询周期,而 attempt 仍 RUNNING」**,而不是「没有事件」(第一轮轮询之前本来就没有事件)。按 3 个周期(90s)无新增 + 外圈 60s 拉一次算,最坏 150s 出结论 —— 相对 5 分钟基准有 2 倍裕度。摄取与轮询在**同一个 step、同一拍**发生,所以「轮询节奏 == 摄取节奏」由构造保证:悬挂时不会混淆「进程还活着但观测层静默」与「观测层还在写但写的都是旧行」。
+
+### 事件 schema:`AgentEventV1`
+
+```ts
+interface AgentEventV1 {
+  v: 1;
+  task_id: string;
+  attempt_id: string;
+  generation: number;   // attempt 内代数:durable 重放复用同一 attempt_id 时用来区分轮次
+  seq: number;          // (attempt, generation) 内单调递增,从 1 起
+  ts: string;           // ISO8601,**摄取时刻**(不是模型侧时间):外圈要的是「何时能知道」
+  kind: ObsEventKind;
+  payload: Record<string, unknown>;   // 已过白名单,见下面「脱敏」小节
+}
+```
+
+| kind | 来源 transcript 行 |
+|---|---|
+| `system` | `type: "system"`(init 等) |
+| `assistant` | `type: "assistant"` 且不含 tool_use 块 |
+| `tool_use` | `type: "assistant"` 且含 tool_use 块 —— 语义是「发起了一个工具调用」;悬挂最典型的样子正是「最后一次 tool_use 之后再无事件」 |
+| `tool_result` | `type: "user"` 且含 tool_result 块 |
+| `user` | `type: "user"` 的其它块 |
+| `result` | `type: "result"` 正常收尾 |
+| `error` | 任一行 `is_error: true` 或 `subtype` 以 `error` 开头 |
+| `raw` | **认不出的行,含非 JSON 行** —— 不丢:`payload.raw_type` 留原 type,`payload.unparseable` 标记非 JSON |
+
+### 段布局与幂等
+
+```
+obs/<task_id>/<attempt_id>/g<generation>-seg<N>.jsonl   每段定长 200 条事件(JSONL)
+obs/<task_id>/<attempt_id>/index.json                   每 attempt 一份:段清单 + 摄取游标
+```
+
+- **段清单**每段记 `{seg, generation, key, first_seq, last_seq, count}`;读端点靠它按序拼接、按 `after` 整段跳过(被跳过的段不下载)。
+- **游标**(`offset_bytes` / `max_seq` / `head_len` / `head_digest`)存在 index.json 里,**不存在 workflow 的 step 返回值里**。这是幂等的关键:durable 重放会让同一 attempt 上的 `poll-i` 被多次执行(step 重试、isolate 驱逐后从 checkpoint 续跑),携带式游标在重放下必然滞后 → 重发旧事件。每轮从**已存状态**续读,同一批字节喂第二次就是第二次 0 条。字节偏移只按**完整行**推进:尾部半行留作余量等下一轮拼齐(顺带也躲开了 UTF-8 多字节字符被从中间切断的问题 —— 那只能发生在未终止的最后一行里)。
+- **R2 没有 append 原语**:一段在写满前是同一 key 的重写(内容只增不减,已可见事件的字节不变),**写满 200 条即封盘,永不再动**。`index.json` 是提交点:段先写、index 后写;中途崩溃只会让下一轮重写同一批段,既不重号也不留空洞。
+- **换代(generation + 1)只在旧字节偏移失去意义时发生**:① transcript 比游标短(`longrun.sh` 的 `>` 重定向在重新启动时就会清零);② 前 4 KiB 前缀指纹变了(文件被换成另一轮执行的输出)。换代即开新段命名空间 `g<新代>-seg1`,seq 从 1 重开,旧代段一个字节都不动。若换代时还没有完整行可写,游标也得单独提交(`commitObsCursor`),否则每轮都会重复判成换代。
+- **写入前自洽检查**:`index.max_seq` 必须等于段清单推出来的最后 seq,且新事件第一条的 seq 必须等于 `max_seq + 1`,否则整轮拒写并记 stderr —— 这是「换代不串号」的最后防线:重叠的 seq 区间会让分页静默重放或漏读。
+
+`obs/` 前缀复用现有 `ARTIFACTS` 桶(内容寻址制品桶),**不新增 R2 绑定、不新增 D1 表**。
+
+### 脱敏白名单(在 ingress,不在读端点)
+
+自由文本一旦以明文落进 R2,后面所有读取方与整个保留期都成了泄露面 —— 所以清洗发生在写之前。这里**没有黑名单**:白名单漏一个字段只是少一个观测维度,黑名单漏一个字段就是凭据外流。
+
+| 通道 | 规则 |
+|---|---|
+| 枚举标量 | 只留白名单内的键:`subtype` / `uuid` / `session_id` / `model` / `stop_reason` / `is_error` / `num_turns` / `duration_ms` / `duration_api_ms` / `total_cost_usd` / `exit_code`,且类型对得上才留 |
+| token 用量 | `payload.usage` 只留 `input_tokens` / `cache_read_input_tokens` / `output_tokens` / `total_tokens` 四个**数值**字段(与 §7.3 台账同口径,不重命名) |
+| 工具调用 | 只留 `tool_names`;**参数一律丢弃** —— `write_file` 的 input 里通常是整个文件内容 |
+| 自由文本 | 唯一出口是 `payload.text`:先按已知凭据精确打码,**再**截断到 ≤2048 字符(顺序反了会把凭据截成半个身子仍留在串里) |
+| 凭据值 | `obsSecretValues(env)` = 平台注入沙箱的 `SANDBOX_MODEL_API_KEY` / `DASHSCOPE_API_KEY` 与 `WORKER_API_TOKEN` 的**值**,精确子串替换为 `***REDACTED***`。按值匹配而不是按字段名:transcript 里出现的是 key 的值,而不是 `OPENAI_API_KEY` 这个名字。短于 8 字符的值不参与(那会把正文打成筛子) |
+
+`tool_result` 的输出摘要走的也是「截断 + 打码」通道:它能看出「跑了什么、结果形状如何」,但搬不走一个文件。
+
+### 读端点
+
+`GET /tasks/:id/events?after=<n>&limit=<n>` —— 鉴权与其余任务端点走同一条 `checkApiToken` 路径。按 DO 里 `attempts` 的创建序拼接各 attempt 的事件,attempt 内按 `generation`、`seq` 升序。`after` 是**扁平有序流上已读的条数**(不是 `seq`:`seq` 只在 (attempt, generation) 内单调,跨 attempt 当游标会静默漏读),`limit` 缺省 500、上限 2000。任务不存在 → 404;从未摄取过事件 → 空列表而不是 404(第一轮轮询还没跑完是常态)。某 attempt 的 journal 读坏不会瞎掉整个任务:该 attempt 进 `unreadable_attempts`,其余照常返回,同时记 `obs_read_attempt_failed`。
+
+### 这一层刻意不做什么
+
+- **不建 hash chain**:防篡改是权威层(§4 Event / §9)的职责;观测事件的价值是「现在在干什么」,要的是读得到、读得快。信封里既没有 `digest` 也没有 `prev_digest`。
+- **不参与状态机、不改执行行为**:摄取失败(读文件错、解析错、R2 抖)只记 `obs_ingest_failed` 并跳过本轮,下一轮从已存游标重试 —— 把 attempt 弄成 BLOCKED 是权威层的事,旁路不该改变结论。
+- **不做 Supervisor / 告警 / 分流**(下一期),**不做 SSE / Live UI**(下下期)。本期只交付数据路径与 RUNNING 期间可读的出口。
+- **不做事件回放改写/删除**:段文件 append-only。
+
+### 取证日志
+
+| 前缀 | 含义 |
+|---|---|
+| `obs_ingest` | 一轮摄取的账:任务/attempt/代/事件数/游标推进/余量字节/写了几个段 |
+| `obs_generation_bump` | 换代及其原因(`transcript_shrunk` / `transcript_replaced`) |
+| `obs_ingest_failed` | 本轮摄取失败已跳过(带 `action=skip_round_retry_next`) |
+| `obs_index_malformed` / `obs_index_inconsistent` / `obs_commit_seq_discontinuity` / `obs_segment_count_drift` | 游标自洽性被破坏 → 整轮拒写 |
+| `obs_read_attempt_failed` | 读端点遇到坏 journal,降级为「列出该 attempt 但不返回其事件」 |
+
+---
+
 ## 10. 人工审批(HITL)与证据绑定
 
 `POST /tasks/:id/approve` 接收 `{ decision: "approve" | "reject", actor?: string, attempt_id, evidence_digest }`,后两者**必填**(`submitDecision` 强制)。`accept_with_notes` 是控制面内部的降级决策(reject 举证不成立时由它写),**不由外部提交**;其它值 → 400 `invalid_decision`:
@@ -382,6 +497,7 @@ interface EvidenceManifest {
 | GET | `/tasks/:id/evidence` | `Bearer $WORKER_API_TOKEN` | 返回钉住的 writer manifest JSON + `binding_digest`(approve 应提交的组合证据) |
 | GET | `/tasks/:id/candidate` | `Bearer $WORKER_API_TOKEN` | 候选交付视图(只读投影,不新增状态对象):`{ status, verified, safe_to_apply, base, patch, writer_attempt_id, verifier_attempt_id, decision, binding_digest, warnings }`。`status ∈ unverified \| verified \| verification_failed \| approved \| rejected \| held_for_human`;`base` 是**这份候选自己的**基线(manifest 血统),与任务当前基线不一致时进 `warnings`。尚未有钉住候选 → 404 `no_candidate_yet` |
 | GET | `/tasks/:id/candidate?format=patch` | `Bearer $WORKER_API_TOKEN` | `text/plain` + `Content-Disposition: attachment; filename="task-<id>-<patch digest 前 12 位>.patch"`。**下发前重算补丁字节 sha256 并与 manifest 记录的 digest 比对**,不一致 → 500 `integrity_error`,不把未校验字节交出去。判定进响应头 `x-candidate-status` / `x-verified` / `x-safe-to-apply` / `x-base-sha`,只看头也不会把被否决的候选当成可提交成品 |
+| GET | `/tasks/:id/events` | `Bearer $WORKER_API_TOKEN` | **在途事件流**(§9.5):直接读 R2 的 `obs/` 段文件 journal,**不经 D1 终态归档**,所以任务 `RUNNING` 期间就有内容。返回 `{ task_id, state, events: AgentEventV1[], count, total, next_cursor, unreadable_attempts }`;按 attempt 创建序、attempt 内按 `generation`/`seq` 升序。`?after=`(扁平流上已读的条数,缺省 0)、`?limit=`(缺省 500,上限 2000;非法 → 400 `invalid_after`/`invalid_limit`)。任务不存在 → 404;从未摄取过 → 空列表 |
 | GET | `/tasks/:id/attempts/:aid/transcript` | `Bearer $WORKER_API_TOKEN` | 流式透传 R2 里的 transcript 原文 |
 
 ### 典型调用序列

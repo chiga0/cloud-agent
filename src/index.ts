@@ -7,6 +7,8 @@ import type { EvidenceManifest } from "./audit/evidence";
 import { sha256Hex } from "./audit/evidence";
 import { assembleCandidate, candidateFileName } from "./audit/candidate";
 import { isValidSha } from "./exec/base";
+import type { AgentEventV1 } from "./obs/events";
+import { readObsAttemptEvents } from "./obs/journal";
 
 export { AttemptWorkflow } from "./exec/workflow";
 export { ContainerProxy } from "@cloudflare/sandbox";
@@ -65,6 +67,7 @@ function landingHtml(env: Env): string {
       <dt>GET /tasks/:id/evidence</dt><dd>钉住的候选 manifest + approve 所需 attempt_id / binding_digest(需鉴权)</dd>
       <dt>GET /tasks/:id/candidate</dt><dd>候选交付视图:基线 commit、patch 引用、判定标签与诚实性告警(需鉴权)</dd>
       <dt>GET /tasks/:id/candidate?format=patch</dt><dd>下载补丁正文(<code>curl -o candidate.patch</code> 后本地 <code>git apply</code>);下发前重算 sha256,状态在 <code>x-candidate-status</code> / <code>x-safe-to-apply</code> 头里</dd>
+      <dt>GET /tasks/:id/events</dt><dd>在途事件流(需鉴权):读 Observation 层的 R2 段文件 journal,<strong>不经 D1 终态归档</strong>,因此任务 <code>RUNNING</code> 期间就有内容 —— 这是它相对 <code>/admin/events</code>(只读已归档的 hash chain)的核心增量。数据来自 poll 相每 30s 的 transcript 增量摄取:<strong>模型悬挂表现为「新事件停止而进程 alive」,凭最后一条事件的 <code>ts</code> 与轮询周期对比即可在 5 分钟内发现</strong>。按 attempt 创建序、attempt 内按 <code>generation</code> 与 <code>seq</code> 升序返回 <code>{"task_id",state,"events":[AgentEventV1],"count",total,"next_cursor","unreadable_attempts"}</code>;信封为 <code>{v:1,task_id,attempt_id,generation,seq,ts,kind,payload}</code>,<code>kind</code> ∈ system/assistant/user/tool_use/tool_result/result/error/raw(认不出的行不丢)。payload 已在 ingress 过白名单:只留类型/工具名/token 用量/时长/退出码等枚举字段,自由文本 ≤2048 字符并对平台注入的凭据值精确打码。分页:<code>?after=</code>(扁平有序流上已读的条数,默认 0)、<code>?limit=</code>(默认 500,上限 2000,非数字或越界 → 400);<code>next_cursor</code> 无后续时为 <code>null</code>。任务不存在 → 404;从未摄取过事件 → 空列表而不是 404</dd>
       <dt>GET /tasks/:id/attempts/:aid/transcript</dt><dd>attempt 的 transcript 原文(verifier 为 JSON 验证报告,需鉴权)</dd>
       <dt>GET /admin/chain-check</dt><dd>校验 D1 归档的事件 hash chain(需鉴权)</dd>
       <dt>GET /admin/tasks</dt><dd>归档任务列表(需鉴权):<strong>只读</strong>投影,数据源仅为 D1 归档的 <code>tasks</code> 表 —— 任务到终态才归档,因此<strong>不含仍在 DO 中运行、尚未归档的任务</strong>(实时状态看 <code>GET /tasks/:id</code>)。按 <code>updated_at</code> 降序返回 <code>{"tasks":[{id,state,created_at,updated_at,version}],"count":N}</code>;可选 <code>?state=</code> 精确过滤(合法取值见状态机,非法 → 400)、可选 <code>?limit=</code>(默认 50,上限 200,非数字或越界 → 400)</dd>
@@ -290,6 +293,121 @@ async function handleGetAttemptTranscript(
   }
   return new Response(artifact.body, {
     headers: { "content-type": "text/plain; charset=utf-8" },
+  });
+}
+
+/** Observation 事件的读端点分页口径(与 /admin/* 的归档 limit 刻意不同:这里读 R2 段文件)。 */
+const DEFAULT_OBS_LIMIT = 500;
+const MAX_OBS_LIMIT = 2000;
+
+/**
+ * query 里出现了参数名,空值就不是「缺省」:`?after=` 被当成 0 会让客户端从头再读
+ * 一遍已经看过的流(分页最典型的静默重放)。/admin/events 的空 cursor 同样判非法。
+ */
+function parseObsInt(raw: string): number {
+  return raw.trim().length === 0 ? Number.NaN : Number(raw);
+}
+
+/**
+ * `after` 是「扁平有序流里已读过的条数」,不是事件自带的 seq。
+ *
+ * 为什么不是 seq:seq 只在 (attempt, generation) 内单调,一个任务的多条 attempt
+ * 各有各的 seq —— 拿它当跨 attempt 的游标就会出现在 attempt2 上 `after=50` 把
+ * attempt1 的 50 条之后全部漏掉的荒谬结果。用位置序号做游标,跨 attempt 天然有序,
+ * 代价是「新事件插进更早的 attempt」会让游标漂移;实际不会发生(轮次串行),
+ * 每条事件都自带 seq/attempt_id/generation,客户端要精确锚点可以看它们。
+ */
+function parseObsAfter(raw: string | null): { after: number; error: string | null } {
+  if (raw === null) return { after: 0, error: null };
+  const parsed = parseObsInt(raw);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    return { after: 0, error: "after must be a non-negative integer" };
+  }
+  return { after: parsed, error: null };
+}
+
+function parseObsLimit(raw: string | null): { limit: number; error: string | null } {
+  if (raw === null) return { limit: DEFAULT_OBS_LIMIT, error: null };
+  const parsed = parseObsInt(raw);
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > MAX_OBS_LIMIT) {
+    return { limit: 0, error: `limit must be an integer within [1, ${MAX_OBS_LIMIT}]` };
+  }
+  return { limit: parsed, error: null };
+}
+
+/**
+ * GET /tasks/:id/events —— 在途事件的只读投影(数据源:**R2 journal,不经 D1**)。
+ *
+ * 这就是它与 GET /admin/events 的全部差别:后者读的是终态才归档的 hash chain,
+ * 任务 RUNNING 时返回空 —— 于是 C2-r6 那种 24 分钟模型悬挂,外圈在 /tasks/:id 里
+ * 只看到 `state: RUNNING`,与正常无异。本端点直接读 poll 相每 30s 增量摄取的段文件,
+ * 因此「新事件停止但进程 alive」这件事在事件流里 5 分钟内就是可见的(判据:最后一条
+ * 事件的 ts 与当前时刻的差,对比 poll 周期 30s)。
+ *
+ * 有序返回该任务**全部 attempt** 的事件:attempt 顺序取 TaskSession DO 里的 attempts
+ * 数组序(= 创建序,与 GET /tasks/:id 同源),attempt 内按 generation、seq 升序。
+ * 不解析、不加工 payload:journal 里是什么就返回什么(白名单已在 ingress 完成)。
+ *
+ * 某 attempt 的 index 读坏了不能让整个任务看不到事件:记 stderr 并把该 attempt 列进
+ * `unreadable_attempts`,让读者知道这一段视图不完整 —— 静默少一批事件比报错更糟。
+ */
+async function handleGetTaskEvents(url: URL, env: Env, taskId: string): Promise<Response> {
+  const afterParsed = parseObsAfter(url.searchParams.get("after"));
+  if (afterParsed.error !== null) {
+    return Response.json(
+      { error: { type: "invalid_after", detail: afterParsed.error } },
+      { status: 400 },
+    );
+  }
+  const limitParsed = parseObsLimit(url.searchParams.get("limit"));
+  if (limitParsed.error !== null) {
+    return Response.json(
+      { error: { type: "invalid_limit", detail: limitParsed.error } },
+      { status: 400 },
+    );
+  }
+  const after = afterParsed.after;
+  const limit = limitParsed.limit;
+
+  const snap = await TaskSession.from(env, taskId).getSnapshot();
+  if (!snap) return Response.json({ error: { type: "not_found" } }, { status: 404 });
+
+  const events: AgentEventV1[] = [];
+  const unreadable: string[] = [];
+  let total = 0;
+  let more = false;
+  for (const attempt of snap.attempts) {
+    // 页面已满时仍要问一遍该 attempt 的条数:skip=MAX_INT 只读 index,不下载任何段
+    const skip = more ? Number.MAX_SAFE_INTEGER : Math.max(0, after - total);
+    let page: { events: AgentEventV1[]; total: number };
+    try {
+      page = await readObsAttemptEvents(env.ARTIFACTS, taskId, attempt.id, skip);
+    } catch (err) {
+      console.warn(
+        `obs_read_attempt_failed task=${taskId} attempt=${attempt.id} err=${String(err).slice(0, 300)}`,
+      );
+      unreadable.push(attempt.id);
+      continue;
+    }
+    total += page.total;
+    if (more) continue;
+    const room = limit - events.length;
+    if (page.events.length > room) {
+      events.push(...page.events.slice(0, room));
+      more = true;
+    } else {
+      events.push(...page.events);
+    }
+  }
+
+  return Response.json({
+    task_id: taskId,
+    state: snap.task.state,
+    events,
+    count: events.length,
+    total,
+    next_cursor: more ? after + events.length : null,
+    unreadable_attempts: unreadable,
   });
 }
 
@@ -704,7 +822,7 @@ export default {
     }
 
     const taskMatch =
-      /^\/tasks\/([0-9a-f-]{36})(\/approve|\/result|\/evidence|\/candidate)?$/.exec(url.pathname);
+      /^\/tasks\/([0-9a-f-]{36})(\/approve|\/result|\/evidence|\/candidate|\/events)?$/.exec(url.pathname);
     if (taskMatch) {
       if (req.method === "GET" && !taskMatch[2]) return handleGetTask(env, taskMatch[1]);
       if (req.method === "GET" && taskMatch[2] === "/result") {
@@ -712,6 +830,9 @@ export default {
       }
       if (req.method === "GET" && taskMatch[2] === "/evidence") {
         return handleGetEvidence(env, taskMatch[1]);
+      }
+      if (req.method === "GET" && taskMatch[2] === "/events") {
+        return handleGetTaskEvents(url, env, taskMatch[1]);
       }
       if (req.method === "GET" && taskMatch[2] === "/candidate") {
         return handleGetCandidate(env, taskMatch[1], url.searchParams.get("format"));

@@ -23,6 +23,7 @@ import {
   pollLongRun,
   type ProcessSnapshot,
 } from "./longrun";
+import { ingestObsBestEffort } from "../obs/ingest";
 
 interface ExecOutcome {
   exitCode: number;
@@ -212,9 +213,21 @@ export class AttemptWorkflow extends WorkflowEntrypoint<Env, AttemptParams> {
               break;
             }
             await step.sleep(`wait-${i}`, POLL_INTERVAL);
-            final = await step.do(`poll-${i}`, POLL_RETRIES, async (): Promise<ProcessSnapshot> =>
-              pollLongRun(getSandbox(this.env.Sandbox, p.attempt_id)),
-            );
+            final = await step.do(`poll-${i}`, POLL_RETRIES, async (): Promise<ProcessSnapshot> => {
+              const sandbox = getSandbox(this.env.Sandbox, p.attempt_id);
+              const snap = await pollLongRun(sandbox);
+              // Observation 层旁路(M10):与轮询同拍做 transcript 增量摄取,落 R2 段
+              // journal,让 GET /tasks/:id/events 在 RUNNING 期间就读得到事件。
+              // 判据「新事件停止而进程 alive」要求摄取节奏 == 轮询节奏,所以就在
+              // 这个 step 里,不另开 step(轮询本来就按 30s 占着 step 配额)。
+              // 永不抛:观测失败最多丢一轮观测,不该把 attempt 拖成 BLOCKED。
+              await ingestObsBestEffort(this.env, {
+                taskId: p.task_id,
+                attemptId: p.attempt_id,
+                reader: sandbox,
+              });
+              return snap;
+            });
             i++;
           }
           if (final.status === "missing" && !execError) {
