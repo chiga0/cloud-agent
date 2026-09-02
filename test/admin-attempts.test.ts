@@ -22,6 +22,10 @@ interface ArchivedAttempt {
   role: string;
   state: string;
   tokens_used: number;
+  input_tokens: number | null;
+  cache_read_tokens: number | null;
+  output_tokens: number | null;
+  cost_weighted_tokens: number | null;
   max_model_tokens: number;
   max_wall_seconds: number;
   workflow_instance_id: string | null;
@@ -38,13 +42,17 @@ interface ErrorBody {
   error: { type: string; detail?: string };
 }
 
-/** 端点承诺的投影字段:多一个就是泄露,少一个就是复盘缺料。 */
+/** 端点承诺的投影字段:多一个就是泄露,少一个就是复盘缺料。必须严格升序(与被测的 sort 同序)。 */
 const PROJECTED_FIELDS = [
+  "cache_read_tokens",
+  "cost_weighted_tokens",
   "created_at",
   "finished_at",
   "id",
+  "input_tokens",
   "max_model_tokens",
   "max_wall_seconds",
+  "output_tokens",
   "role",
   "state",
   "task_id",
@@ -103,6 +111,13 @@ async function seedAttempt(over: {
   created_at?: string;
   finished_at?: string | null;
   tokens_used?: number;
+  /** 用量四元组与成本加权值;省略即按「当时未记录」落 NULL */
+  ledger?: {
+    input_tokens?: number | null;
+    cache_read_tokens?: number | null;
+    output_tokens?: number | null;
+    cost_weighted_tokens?: number | null;
+  };
   proxy_token?: string | null;
   idempotency_key?: string;
   workflow_instance_id?: string | null;
@@ -110,8 +125,9 @@ async function seedAttempt(over: {
   const id = crypto.randomUUID();
   await env.DB.prepare(
     "INSERT INTO attempts (id, task_id, role, state, idempotency_key, proxy_token, tokens_used," +
+      " input_tokens, cache_read_tokens, output_tokens, cost_weighted_tokens," +
       " max_model_tokens, max_wall_seconds, workflow_instance_id, created_at, finished_at)" +
-      " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
   )
     .bind(
       id,
@@ -121,6 +137,10 @@ async function seedAttempt(over: {
       over.idempotency_key ?? `${id}:attempt:${clock}`,
       over.proxy_token === undefined ? null : over.proxy_token,
       over.tokens_used ?? 1234,
+      over.ledger?.input_tokens ?? null,
+      over.ledger?.cache_read_tokens ?? null,
+      over.ledger?.output_tokens ?? null,
+      over.ledger?.cost_weighted_tokens ?? null,
       100_000,
       600,
       over.workflow_instance_id === undefined ? null : over.workflow_instance_id,
@@ -158,7 +178,7 @@ describe("GET /admin/attempts", () => {
     await env.DB.prepare("DELETE FROM tasks").run();
   });
 
-  it("无参数返回全部归档 attempt,按 created_at 降序,字段恰为承诺的那 10 个", async () => {
+  it("无参数返回全部归档 attempt,按 created_at 降序,字段恰为承诺的那 14 个", async () => {
     const oldest = await seedAttempt({ role: "writer", created_at: stamp(10) });
     const newest = await seedAttempt({ role: "verifier", created_at: stamp(30), tokens_used: 77 });
     const middle = await seedAttempt({ role: "reviewer", created_at: stamp(20) });
@@ -196,6 +216,50 @@ describe("GET /admin/attempts", () => {
     expect(body.attempts[0].state).toBe("RUNNING");
     expect(body.attempts[0].finished_at).toBeNull();
     expect(body.attempts[0].workflow_instance_id).toBeNull();
+  });
+
+  /**
+   * 成本口径的落地处:r11 实测 total 6,949,711 里 96.9% 是最便宜的隐式缓存命中,
+   * 只透出 total 会把这条记成「史上最贵的 attempt」。四元组与加权值必须与 total
+   * 并列可见,而「当时未记录」的行只能是 NULL —— 补 0 就是在编造事实。
+   */
+  it("台账四元组与成本加权值进投影;未记录的历史行是 NULL 而不是 0", async () => {
+    const taskId = await seedTask();
+    const recorded = await seedAttempt({
+      task_id: taskId,
+      tokens_used: 6_949_711,
+      ledger: {
+        input_tokens: 6_886_340,
+        cache_read_tokens: 6_733_762,
+        output_tokens: 63_371,
+        cost_weighted_tokens: 1_562_701,
+      },
+    });
+    const legacy = await seedAttempt({ task_id: taskId, tokens_used: 500 });
+
+    const { status, body } = await getJson<AttemptsBody>(`?task_id=${taskId}`);
+    expect(status).toBe(200);
+
+    const hit = body.attempts.find((a) => a.id === recorded)!;
+    expect(hit).toMatchObject({
+      tokens_used: 6_949_711,
+      input_tokens: 6_886_340,
+      cache_read_tokens: 6_733_762,
+      output_tokens: 63_371,
+      cost_weighted_tokens: 1_562_701,
+    });
+    expect(hit.cost_weighted_tokens!).toBeLessThan(hit.tokens_used / 4);
+    // 拆分自洽:fresh 部分 + output 就是加权值里折扣外的项
+    expect(hit.input_tokens! + hit.output_tokens! - hit.cache_read_tokens!).toBe(215_949);
+
+    const old = body.attempts.find((a) => a.id === legacy)!;
+    expect(old.tokens_used).toBe(500);
+    expect([
+      old.input_tokens,
+      old.cache_read_tokens,
+      old.output_tokens,
+      old.cost_weighted_tokens,
+    ]).toEqual([null, null, null, null]);
   });
 
   it("?task_id 精确过滤命中的行,不命中返回空列表而不是 404", async () => {

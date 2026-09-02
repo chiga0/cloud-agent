@@ -796,6 +796,35 @@ checkout --quiet --detach '<sha>'
 
 ---
 
+### 13.20 attempt token 台账的成本口径(M9.5)— 已实现:四元组拆分 + 成本加权值,raw total 原样保留
+
+**问题(r11 writer 实测)**:`attempts.tokens_used` 只记 qwen stream-json 的累计 `usage.total_tokens` = **6,949,711**。拆开是 input 6,886,340 / **cache_read_input 6,733,762** / output 63,371 —— **96.9% 是隐式 prompt 缓存命中**,即最便宜的那类 token;真正贵的 fresh input(152,578)+ output(63,371)只有约 **216K**。把 total 当成本口径,会把「一次几乎全程命中缓存的跑」与「一次全新长上下文的跑」记成同一个数;以同一口径比对的 `max_model_tokens` 同样失真。
+
+**改法(只加不改)**:
+
+- **提取层** `src/exec/extract.ts`:新增 `TranscriptUsage`(字段名与 qwen stream-json 原样对齐,缺的是 `undefined` 不是 0 —— 「上游没说」与「上游说没消耗」是两回事)、`extractUsageFromTranscript()`(在所有携带 usage 的事件里取**有效 total 最大**的一条:type=result 的 usage 是整轮累计值,单次调用不可能超过上下文窗口,故最大值必是累计值)与 `costWeightedFromUsage()`。`extractTokensFromTranscript()` 改为从前者派生,**既有语义逐分支等价**(无 usage → 0;缺 total → input+output;取最大不取最后),既有测试不改一条断言即过。
+- **台账层** `AttemptRecord` 与 D1 `attempts` 增加 `input_tokens` / `cache_read_tokens` / `output_tokens` / `cost_weighted_tokens` 四列(`migrations/0004`);`tokens_used` **仍是 raw total**,历史行与既有复盘口径不动。
+- **传递链**:workflow extract step → `REPORT_QUEUE` → DO 全程带 `usage`。reviewer 走 chat completions,把 `prompt_tokens`/`completion_tokens` 规范化成同一形状;上游不下发 `cache_read` → 留空,成本按全 fresh 保守计。verifier 的 transcript 是结构化 JSON 报告(无用量),如实记 null。
+- **读端**:`GET /admin/attempts` 透出四列(`proxy_token` / `idempotency_key` 仍绝不进投影);`GET /tasks/:id` 的 attempts 投影刻意不动 —— 审计面只改一处。
+
+**`cost_weighted_tokens` 的三档口径**(单位 = fresh input token 数):
+
+| 已知字段 | 计算 | 含义 |
+| --- | --- | --- |
+| input + cache_read | `(input − cache_read) + output + round(cache_read × factor)` | 精确拆分 |
+| 仅 input | `input + output` | 缓存收益未知,**保守按全 fresh**,绝不猜「全是命中」 |
+| 仅 total | `total` | 无从拆分,与 raw total 同值 —— 如实标注 |
+
+r11 向量自检:`factor=1` → 6,949,711,**恰等于 raw total**(「缓存与 fresh 同价」的退化情形,拿它当回归锚点最省事);`factor=0.2` → 1,562,701;`factor=0` → 215,949(只剩真贵的部分)。
+
+**0.2 是估计值,不是价目表**:`CACHE_READ_COST_FACTOR`(wrangler.jsonc 显式 `"0.2"`,`Env` 里可选)是「缓存命中相对 fresh input 折扣」的唯一读取口径 —— `Number(env.CACHE_READ_COST_FACTOR) || 0.2`,未设/非法一律回落 0.2,不因此打断回报链路。qwen3.8-flash 经百炼 compatible-mode 的**真实隐式缓存折扣以百炼控制台为准**;这个加权值用于跨 attempt 横向比较(哪次真贵),不是账单,output 按 1 个 input token 计同样是简化(真实 output 单价更高)。
+
+**刻意不做**:`max_model_tokens` 仍是纯记录字段,**不新增执法、路由或预算拦截逻辑** —— 它与 `tokens_used` 同源于失真的 raw total,拿它执法等于拿失真值执法。四列**不给 `DEFAULT 0`**:旧行 NULL 表示「当时未记录」;`result.captured` 事件同步带 `cost_weighted_tokens`(无 usage → null)。台账在终态转换前就落定,所以 SUCCEEDED/FAILED/BLOCKED 三种终态都有数 —— 到期击杀的 attempt 钱已经花了,台账不能空白。
+
+验证:`npm run typecheck && npm test` 全绿(15 文件 230 测试,新增 22 条:提取/加权向量 17 + DO 落库 4 + 读端投影 1)。
+
+---
+
 ## 14. 延伸阅读
 
 - [`../research/agent-research/docs/research/cloudflare-ai-infra-overview-2026-08-28.md`](../../../research/agent-research/docs/research/cloudflare-ai-infra-overview-2026-08-28.md) — Cloudflare AI 基础设施调研

@@ -45,6 +45,12 @@ export interface Env {
    * 平台击杀而非 qwen 的干净退出。
    */
   MAX_WRITER_WALL_MINUTES?: string;
+  /**
+   * 隐式 prompt 缓存命中相对 fresh input 的成本折扣(0 = 免费,1 = 同价),用于
+   * attempts 台账的 cost_weighted_tokens。可选,缺配/非法回落 0.2 —— 这是横向
+   * 比较用的估计值,qwen3.8-flash 的真实折扣以百炼控制台为准,不是账单口径。
+   */
+  CACHE_READ_COST_FACTOR?: string;
 
   /** Worker 侧高权 key:给 reviewer 用;也是沙箱 key 缺配时的回落值 */
   DASHSCOPE_API_KEY: string;

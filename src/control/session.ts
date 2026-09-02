@@ -10,6 +10,7 @@ import {
   type EvidencePart,
 } from "../audit/evidence";
 import { BASE_ERRORS, isValidSha, isBaseError } from "../exec/base";
+import { costWeightedFromUsage, type TranscriptUsage } from "../exec/extract";
 import type { CandidateDecision, CandidateEvidence } from "../audit/candidate";
 import { assertTransition, attemptDeadline, decideRework, isLegalTransition, nextWatchdogAlarm } from "./statemachine";
 import {
@@ -85,6 +86,16 @@ interface AttemptRecord {
   state: AttemptState;
   idempotency_key: string;
   tokens_used: number;
+  /**
+   * 用量四元组拆分 + 成本加权值。`tokens_used` 仍是 raw total(历史口径不变),
+   * 这四列回答的是「这些 token 值多少钱」:96.9% 缓存命中的 total 与全 fresh 的
+   * 同号 total 不是一个量级的成本。
+   * null = 当时未记录(M8 前的历史行,或执行面没拿到 usage),与 0 严格区分。
+   */
+  input_tokens: number | null;
+  cache_read_tokens: number | null;
+  output_tokens: number | null;
+  cost_weighted_tokens: number | null;
   max_model_tokens: number;
   max_wall_seconds: number;
   workflow_instance_id: string | null;
@@ -138,6 +149,15 @@ export class TaskSession extends DurableObject<Env> {
 
   private now(): string {
     return new Date().toISOString();
+  }
+
+  /**
+   * 隐式 prompt 缓存命中的相对成本折扣(1 = 与 fresh input 同价,0 = 免费)。
+   * 可选配置:缺配/非法一律回落 0.2 —— 这只是个用于横向比较的估计值(真实折扣
+   * 以百炼控制台为准),不该因为一个环境变量写错就让回报链路失败。
+   */
+  private cacheReadCostFactor(): number {
+    return Number(this.env.CACHE_READ_COST_FACTOR) || 0.2;
   }
 
   private async loadAll(): Promise<SessionData> {
@@ -289,6 +309,10 @@ export class TaskSession extends DurableObject<Env> {
       state: "RUNNING",
       idempotency_key: args.idempotency_key,
       tokens_used: 0,
+      input_tokens: null,
+      cache_read_tokens: null,
+      output_tokens: null,
+      cost_weighted_tokens: null,
       max_model_tokens: args.max_model_tokens,
       max_wall_seconds: args.max_wall_seconds,
       workflow_instance_id: null,
@@ -386,6 +410,8 @@ export class TaskSession extends DurableObject<Env> {
     manifest_key?: string | null;
     manifest_digest?: string | null;
     tokens?: number;
+    /** 用量四元组拆分;缺省 = 执行面没拿到 usage,四列如实记 null */
+    usage?: TranscriptUsage | null;
     result_text?: string | null;
     patch_digest?: string | null;
     base?: BaseReport | null;
@@ -403,6 +429,15 @@ export class TaskSession extends DurableObject<Env> {
 
       attempt.finished_at = this.now();
       attempt.tokens_used = args.tokens ?? 0;
+      // 台账同时记「量」与「钱」:tokens_used 保持 raw total 的历史口径,四元组拆分
+      // 与成本加权值回答「这些 token 里有多少是缓存命中的」。无 usage 时四列全 null,
+      // 与「记录到 0」严格区分 —— 后者是事实,前者是没记过,不能糊成同一个数。
+      const usage = args.usage ?? null;
+      const costWeighted = usage === null ? null : costWeightedFromUsage(usage, this.cacheReadCostFactor());
+      attempt.input_tokens = usage?.input_tokens ?? null;
+      attempt.cache_read_tokens = usage?.cache_read_input_tokens ?? null;
+      attempt.output_tokens = usage?.output_tokens ?? null;
+      attempt.cost_weighted_tokens = costWeighted;
       if (args.manifest_key) attempt.manifest_key = args.manifest_key;
       if (args.manifest_digest) attempt.manifest_digest = args.manifest_digest;
       if (args.exit_code !== 0) {
@@ -448,6 +483,7 @@ export class TaskSession extends DurableObject<Env> {
         has_text: args.result_text != null,
         length: args.result_text?.length ?? 0,
         total_tokens: args.tokens ?? 0,
+        cost_weighted_tokens: costWeighted,
       });
       await this.appendEvent(s, "evidence.manifest", {
         attempt_id: args.attempt_id,
@@ -1282,7 +1318,10 @@ export class TaskSession extends DurableObject<Env> {
     for (const a of s.attempts) {
       stmts.push(
         this.env.DB.prepare(
-          "INSERT INTO attempts (id, task_id, role, state, idempotency_key, proxy_token, tokens_used, max_model_tokens, max_wall_seconds, workflow_instance_id, created_at, finished_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          "INSERT INTO attempts (id, task_id, role, state, idempotency_key, proxy_token, tokens_used," +
+            " input_tokens, cache_read_tokens, output_tokens, cost_weighted_tokens," +
+            " max_model_tokens, max_wall_seconds, workflow_instance_id, created_at, finished_at)" +
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         ).bind(
           a.id,
           t.id,
@@ -1291,6 +1330,12 @@ export class TaskSession extends DurableObject<Env> {
           a.idempotency_key,
           null,
           a.tokens_used,
+          // `?? null`:M8 前的 DO 快照里没有这四个字段,storage 反序列化出来是
+          // undefined,直接 bind 会被 D1 判为 UNDEFINED_VALUE 而整批归档失败。
+          a.input_tokens ?? null,
+          a.cache_read_tokens ?? null,
+          a.output_tokens ?? null,
+          a.cost_weighted_tokens ?? null,
           a.max_model_tokens,
           a.max_wall_seconds,
           a.workflow_instance_id,

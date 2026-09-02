@@ -1,5 +1,6 @@
 import type { BaseReport, Env, TaskSpec } from "../types";
 import type { ReviewVerdict } from "../control/gates";
+import type { TranscriptUsage } from "./extract";
 import { TaskSession } from "../control/session";
 
 interface ReviewMessage {
@@ -34,6 +35,12 @@ export interface ReportMessage {
   manifest_key?: string | null;
   manifest_digest?: string | null;
   tokens?: number;
+  /**
+   * 用量四元组拆分(input/cache_read/output/total)。`tokens` 是 raw total 口径,
+   * 两者都要:total 保持历史可比,拆分才能算成本 —— 96.9% 缓存命中的 total 与
+   * 全 fresh 的同号 total 钱差一个数量级(见 docs/architecture.md)。
+   */
+  usage?: TranscriptUsage | null;
   result_text?: string | null;
   /** writer 导出的候选 patch 摘要(非 repo 任务为空),无进展熔断的比较基准 */
   patch_digest?: string | null;
@@ -55,6 +62,7 @@ export function reportArgsFrom(body: ReportMessage): Parameters<TaskSession["rep
     manifest_key: body.manifest_key ?? null,
     manifest_digest: body.manifest_digest ?? null,
     tokens: body.tokens ?? 0,
+    usage: body.usage ?? null,
     result_text: body.result_text ?? null,
     patch_digest: body.patch_digest ?? null,
     base: body.base ?? null,

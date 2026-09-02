@@ -80,11 +80,18 @@ git -C <你的仓库> checkout <candidate.base.sha> && git apply task-<task_id>-
 # 因此**不含尚未归档的在途 attempt** —— 在跑的任务仍看 `GET /tasks/<task_id>`。
 # 安全投影:一次性模型代理凭据 `proxy_token` **绝不下发**,内部去重用的
 # `idempotency_key` 同样不进投影;返回字段固定为 id/task_id/role/state/tokens_used/
-# max_model_tokens/max_wall_seconds/workflow_instance_id/created_at/finished_at。
+# input_tokens/cache_read_tokens/output_tokens/cost_weighted_tokens/max_model_tokens/
+# max_wall_seconds/workflow_instance_id/created_at/finished_at。
+# 成本口径看 `cost_weighted_tokens`,不是 `tokens_used`:后者是 raw total(为历史可比
+# 保留),r11 writer 实测其 96.9% 是最便宜的隐式缓存命中(6,949,711 里 6,733,762 是
+# cache_read)。加权值 = (input − cache_read) + output + round(cache_read × 折扣系数),
+# 折扣系数取 `CACHE_READ_COST_FACTOR`(未设/非法回落 0.2;这只是横向比较用的估计值,
+# qwen3.8-flash 的真实隐式缓存折扣以百炼控制台为准)。四列为 null = 该记录产生时未记过
+# 拆分口径(M8 前的历史行)或没拿到 usage,**不等于消耗为 0**。
 # 过滤按 AND 组合:?task_id=(36 字符 UUID) ?role= ?state= ?limit=(默认 50,上限 200);
 # 畸形值 → 400,过滤不命中 → 空列表(count 是本次返回条数,受 limit 截断,不是总匹配数)
 curl -s "localhost:8787/admin/attempts?task_id=<task_id>&role=writer" \
-  -H "authorization: Bearer $TOKEN" | jq '{count, attempts: [.attempts[] | {id, state, tokens_used, finished_at}]}'
+  -H "authorization: Bearer $TOKEN" | jq '{count, attempts: [.attempts[] | {id, state, tokens_used, cost_weighted_tokens, cache_read_tokens, finished_at}]}'
 
 # 按任务回放审计事件 hash chain —— `GET /admin/events`。
 # 同样是 D1 归档的**只读视图**(读投影,不是新的状态权威):事件随任务终态才归档,

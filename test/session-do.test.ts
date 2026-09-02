@@ -2,6 +2,7 @@ import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { env } from "cloudflare:test";
 import type { TaskSession } from "../src/control/session";
 import type { ReviewVerdict } from "../src/control/gates";
+import type { TranscriptUsage } from "../src/exec/extract";
 import { compositeEvidenceDigest } from "../src/audit/evidence";
 import { reportArgsFrom, type ReportMessage } from "../src/exec/queue";
 import { applyMigrations } from "./d1";
@@ -602,6 +603,7 @@ describe("exec-report 消息映射", () => {
       manifest_key: "mk",
       manifest_digest: "md",
       tokens: 7,
+      usage: { input_tokens: 5, cache_read_input_tokens: 4, output_tokens: 2, total_tokens: 7 },
       result_text: "done",
       patch_digest: "pd",
       base: { sha: BASE_A, source: "resolved_default" },
@@ -699,5 +701,148 @@ describe("attempt 终态销毁沙箱", () => {
     await flush();
 
     expect(logs.all().some((l) => l.includes("sandbox_destroy"))).toBe(false);
+  });
+});
+
+/**
+ * attempt 的 token 台账:raw total 之外还要记下用量四元组与成本加权值。
+ *
+ * 钉三件事:① tokens_used 的既有语义不变(仍 = raw total,r11 那个 6,949,711);
+ * ② 四列来自 usage,加权值按 CACHE_READ_COST_FACTOR(测试环境未配 → 回落 0.2);
+ * ③ 没有 usage 时四列是 NULL 而不是 0 —— 「未记录」与「零消耗」在审计面上是两回事。
+ */
+describe("attempt token 台账落库", () => {
+  const R11_USAGE: TranscriptUsage = {
+    input_tokens: 6_886_340,
+    cache_read_input_tokens: 6_733_762,
+    output_tokens: 63_371,
+    total_tokens: 6_949_711,
+  };
+  /** factor=0.2:(input-cache_read) + output + round(cache_read*0.2) */
+  const R11_COST = 1_562_701;
+
+  interface LedgerRow {
+    state: string;
+    tokens_used: number;
+    input_tokens: number | null;
+    cache_read_tokens: number | null;
+    output_tokens: number | null;
+    cost_weighted_tokens: number | null;
+  }
+
+  async function ledgerRow(attemptId: string): Promise<LedgerRow> {
+    const row = await env.DB.prepare(
+      "SELECT state, tokens_used, input_tokens, cache_read_tokens, output_tokens, cost_weighted_tokens" +
+        " FROM attempts WHERE id = ?",
+    )
+      .bind(attemptId)
+      .first<LedgerRow>();
+    // 查不到行 = 归档没发生,那和「四列为 null」是两种故障,不能混为一谈
+    expect(row).not.toBeNull();
+    return row!;
+  }
+
+  /** writer 回报 → 人工 approve 到 DONE(终态才归档)。usage 原样透传。 */
+  async function reportAndArchive(over: {
+    usage?: TranscriptUsage | null;
+    exit_code?: number;
+    error?: string;
+  }): Promise<{ stub: Stub; attempt_id: string }> {
+    const stub = newStub();
+    await stub.createTask({ prompt: "ledger" } as never, crypto.randomUUID());
+    const { attempt_id } = await stub.startAttempt({
+      role: "writer",
+      idempotency_key: crypto.randomUUID(),
+      ...BUDGET,
+    });
+    const res = await stub.reportExecution({
+      attempt_id,
+      exit_code: over.exit_code ?? 0,
+      error: over.error,
+      tokens: R11_USAGE.total_tokens,
+      usage: over.usage,
+      result_text: "已按要求完成",
+      manifest_key: `manifests/task/w/${attempt_id}.json`,
+      manifest_digest: `digest-${attempt_id}`,
+    });
+    expect(res.ok).toBe(true);
+
+    if ((over.exit_code ?? 0) === 0) {
+      const ev = await stub.getEvidenceSummary();
+      const done = await stub.submitDecision({
+        attempt_id: ev.writer_attempt_id!,
+        evidence_digest: ev.binding_digest!,
+        decision: "approve",
+        actor: "human:test",
+      });
+      expect(done.ok).toBe(true);
+    }
+    return { stub, attempt_id };
+  }
+
+  it("带 usage → 四元组与成本加权值入归档行,tokens_used 仍是 raw total", async () => {
+    const { stub, attempt_id } = await reportAndArchive({ usage: R11_USAGE });
+
+    const row = await ledgerRow(attempt_id);
+    expect(row.state).toBe("SUCCEEDED");
+    expect(row.tokens_used).toBe(6_949_711);
+    expect({
+      input_tokens: row.input_tokens,
+      cache_read_tokens: row.cache_read_tokens,
+      output_tokens: row.output_tokens,
+    }).toEqual({
+      input_tokens: 6_886_340,
+      cache_read_tokens: 6_733_762,
+      output_tokens: 63_371,
+    });
+    // 96.9% 是缓存命中:加权值只有 raw total 的两成出头
+    expect(row.cost_weighted_tokens).toBe(R11_COST);
+
+    const snap = await stub.getSnapshot();
+    const [captured] = payloads(snap!, "result.captured");
+    expect(captured.total_tokens).toBe(6_949_711);
+    expect(captured.cost_weighted_tokens).toBe(R11_COST);
+    chainIntact(snap!.events);
+  });
+
+  it("不带 usage → 四列 NULL(不是 0),raw total 照常记", async () => {
+    const { stub, attempt_id } = await reportAndArchive({});
+
+    const row = await ledgerRow(attempt_id);
+    expect(row.tokens_used).toBe(6_949_711);
+    expect([row.input_tokens, row.cache_read_tokens, row.output_tokens, row.cost_weighted_tokens]).toEqual([
+      null,
+      null,
+      null,
+      null,
+    ]);
+
+    const [captured] = payloads((await stub.getSnapshot())!, "result.captured");
+    expect(captured.cost_weighted_tokens).toBeNull();
+  });
+
+  it("回报缺 cache_read 一项时:已知的照记,成本保守按全 fresh 计", async () => {
+    const { attempt_id } = await reportAndArchive({
+      usage: { input_tokens: 1_000, output_tokens: 200, total_tokens: 1_200 },
+    });
+
+    const row = await ledgerRow(attempt_id);
+    expect(row.input_tokens).toBe(1_000);
+    expect(row.output_tokens).toBe(200);
+    expect(row.cache_read_tokens).toBeNull();
+    expect(row.cost_weighted_tokens).toBe(1_200);
+  });
+
+  it("BLOCKED 终态同样留台账:到期击杀的 attempt 钱已经花了", async () => {
+    const { attempt_id } = await reportAndArchive({
+      usage: R11_USAGE,
+      exit_code: -1,
+      error: "longrun_wall_exceeded",
+    });
+
+    const row = await ledgerRow(attempt_id);
+    expect(row.state).toBe("BLOCKED");
+    expect(row.tokens_used).toBe(6_949_711);
+    expect(row.cost_weighted_tokens).toBe(R11_COST);
   });
 });

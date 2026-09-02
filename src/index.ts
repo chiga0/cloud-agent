@@ -69,7 +69,7 @@ function landingHtml(env: Env): string {
       <dt>GET /admin/chain-check</dt><dd>校验 D1 归档的事件 hash chain(需鉴权)</dd>
       <dt>GET /admin/tasks</dt><dd>归档任务列表(需鉴权):<strong>只读</strong>投影,数据源仅为 D1 归档的 <code>tasks</code> 表 —— 任务到终态才归档,因此<strong>不含仍在 DO 中运行、尚未归档的任务</strong>(实时状态看 <code>GET /tasks/:id</code>)。按 <code>updated_at</code> 降序返回 <code>{"tasks":[{id,state,created_at,updated_at,version}],"count":N}</code>;可选 <code>?state=</code> 精确过滤(合法取值见状态机,非法 → 400)、可选 <code>?limit=</code>(默认 50,上限 200,非数字或越界 → 400)</dd>
       <dt>GET /admin/events</dt><dd>归档事件流(需鉴权):按任务回放审计事件的 hash chain。<strong>只读</strong>投影,数据源仅为 D1 归档的 <code>events</code> 表 —— 事件随任务终态才归档,因此<strong>只含已归档(终态)任务的事件</strong>,<strong>看不到仍在 DO 中运行、尚未归档的在途事件</strong>(实时状态看 <code>GET /tasks/:id</code>)。<code>?task_id=</code>(36 字符 UUID)<strong>必填</strong>:每 task 的 <code>seq</code> 才是分页脊线,跨 task 分页无意义;缺失或畸形 → 400。按 <code>seq</code> 升序(审计回放顺序)返回 <code>{"events":[{seq,kind,digest,prev_digest,created_at,canonical}],"next_cursor":&lt;string|null&gt;}</code>。<code>canonical</code> 是 D1 <code>payload</code> 列<strong>逐字原文</strong>(即 <code>JSON.stringify({task_id,kind,payload})</code>,正是被 hash 的那个串),不解析、不重新序列化 —— 客户端因此能独立重算 <code>digest == sha256Hex((prev_digest ?? "GENESIS") + canonical)</code> 并逐条核对 <code>prev_digest</code>,即在本地重放一遍 <code>/admin/chain-check</code>。安全:审计 journal 按构造<strong>绝不携带</strong>一次性模型代理凭据 <code>proxy_token</code>(它只存在于 <code>attempts</code> 表,从不进事件链)。游标分页:<code>?limit=</code>(默认 50,上限 200,非数字或越界 → 400)、<code>?cursor=</code>(不透明游标,首页省略;畸形 → 400),<code>next_cursor</code> 为下一页起点、无后续时为 <code>null</code>;过滤不命中返回空列表而不是 404</dd>
-      <dt>GET /admin/attempts</dt><dd>归档 attempt 列表(需鉴权):按任务复盘各 attempt(writer / verifier / reviewer)的终态与 token 消耗。<strong>只读</strong>投影,数据源仅为 D1 归档的 <code>attempts</code> 表 —— attempt 随任务终态才归档,因此<strong>不含尚未归档的在途 attempt</strong>(实时状态看 <code>GET /tasks/:id</code>)。按 <code>created_at</code> 降序返回 <code>{"attempts":[{id,task_id,role,state,tokens_used,max_model_tokens,max_wall_seconds,workflow_instance_id,created_at,finished_at}],"count":N}</code>(<code>count</code> 是本次返回条数,受 limit 截断)。安全投影:<code>proxy_token</code>(一次性模型代理凭据)<strong>绝不下发</strong>,内部去重用的 <code>idempotency_key</code> 同样不进投影。可选过滤器按 AND 组合:<code>?task_id=</code>(36 字符 UUID,畸形 → 400)、<code>?role=</code>(writer/reviewer/verifier)、<code>?state=</code>(RUNNING/SUCCEEDED/FAILED/BLOCKED;合法取值来自权威声明,非法 → 400,不命中返回空列表)、<code>?limit=</code>(默认 50,上限 200,非数字或越界 → 400)</dd>
+      <dt>GET /admin/attempts</dt><dd>归档 attempt 列表(需鉴权):按任务复盘各 attempt(writer / verifier / reviewer)的终态与 token 消耗。<strong>只读</strong>投影,数据源仅为 D1 归档的 <code>attempts</code> 表 —— attempt 随任务终态才归档,因此<strong>不含尚未归档的在途 attempt</strong>(实时状态看 <code>GET /tasks/:id</code>)。按 <code>created_at</code> 降序返回 <code>{"attempts":[{id,task_id,role,state,tokens_used,input_tokens,cache_read_tokens,output_tokens,cost_weighted_tokens,max_model_tokens,max_wall_seconds,workflow_instance_id,created_at,finished_at}],"count":N}</code>(<code>count</code> 是本次返回条数,受 limit 截断)。口径:<code>tokens_used</code> 是 raw total(历史可比,<strong>不是成本</strong> —— r11 实测其 96.9% 是最便宜的隐式缓存命中);四元组拆分与 <code>cost_weighted_tokens</code>(缓存命中按 <code>CACHE_READ_COST_FACTOR</code> 折扣加权)才是成本口径,今后看成本看后者。四列与 <code>cost_weighted_tokens</code> 为 <code>null</code> 表示该记录产生时未记过拆分口径(M8 前的历史行),<strong>不等于消耗为 0</strong>。安全投影:<code>proxy_token</code>(一次性模型代理凭据)<strong>绝不下发</strong>,内部去重用的 <code>idempotency_key</code> 同样不进投影。可选过滤器按 AND 组合:<code>?task_id=</code>(36 字符 UUID,畸形 → 400)、<code>?role=</code>(writer/reviewer/verifier)、<code>?state=</code>(RUNNING/SUCCEEDED/FAILED/BLOCKED;合法取值来自权威声明,非法 → 400,不命中返回空列表)、<code>?limit=</code>(默认 50,上限 200,非数字或越界 → 400)</dd>
     </dl>
   </div>
 
@@ -422,6 +422,10 @@ async function handleAdminTasks(url: URL, env: Env): Promise<Response> {
  * 归档 attempt 的投影字段。`proxy_token`(一次性模型代理凭据)与
  * `idempotency_key`(内部去重管道)**刻意不在列表里**:读投影不该成为
  * 凭据的第二条出口,复盘要的是结果、终态与 token 消耗,不是拿回能重放的钥匙。
+ *
+ * 用量四元组(input/cache_read/output)与成本加权值同 raw total 并列:tokens_used
+ * 保持历史口径可比,成本口径看 cost_weighted_tokens。`null` 是该记录产生时还没有
+ * 拆分口径(M8 前的历史行)或执行面没拿到 usage —— 不等于「消耗为 0」。
  */
 interface ArchivedAttemptRow {
   id: string;
@@ -429,6 +433,10 @@ interface ArchivedAttemptRow {
   role: string;
   state: string;
   tokens_used: number;
+  input_tokens: number | null;
+  cache_read_tokens: number | null;
+  output_tokens: number | null;
+  cost_weighted_tokens: number | null;
   max_model_tokens: number;
   max_wall_seconds: number;
   workflow_instance_id: string | null;
@@ -513,7 +521,8 @@ async function handleAdminAttempts(url: URL, env: Env): Promise<Response> {
   }
   params.push(limit);
   const sql =
-    "SELECT id, task_id, role, state, tokens_used, max_model_tokens, max_wall_seconds," +
+    "SELECT id, task_id, role, state, tokens_used, input_tokens, cache_read_tokens," +
+    " output_tokens, cost_weighted_tokens, max_model_tokens, max_wall_seconds," +
     " workflow_instance_id, created_at, finished_at FROM attempts" +
     (where.length === 0 ? "" : ` WHERE ${where.join(" AND ")}`) +
     " ORDER BY created_at DESC LIMIT ?";

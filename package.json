@@ -6,7 +6,10 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
+    "ensure-deps": "node scripts/ensure-deps.mjs",
+    "pretypecheck": "node scripts/ensure-deps.mjs",
     "typecheck": "tsc --noEmit",
+    "pretest": "node scripts/ensure-deps.mjs",
     "test": "vitest run",
     "db:migrate:local": "wrangler d1 migrations apply cloud-agent --local",
     "db:migrate:remote": "wrangler d1 migrations apply cloud-agent --remote"

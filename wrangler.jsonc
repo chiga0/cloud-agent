@@ -10,6 +10,9 @@
     "MODEL_UPSTREAM_BASE": "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
     "DEFAULT_MODEL": "qwen3.8-flash",
     "DEFAULT_MAX_MODEL_TOKENS": "5000000",
+    // attempts 台账 cost_weighted_tokens 的隐式缓存折扣系数(横向比较用的估计值,
+    // 真实折扣以百炼控制台为准)。未设/非法值回落代码里的 0.2,不影响主流程。
+    "CACHE_READ_COST_FACTOR": "0.2",
     "DEFAULT_MAX_WALL_SECONDS": "3600",
     "DEFAULT_MAX_ATTEMPTS": "3",
     "REJECT_EVIDENCE_MODE": "shadow",

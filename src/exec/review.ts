@@ -1,4 +1,5 @@
 import type { Env } from "../types";
+import type { TranscriptUsage } from "./extract";
 import { putArtifact, type ArtifactRef } from "../audit/evidence";
 
 export interface ReviewLLMResult {
@@ -7,6 +8,28 @@ export interface ReviewLLMResult {
   transcriptRaw: string;
   stderr: ArtifactRef;
   tokens: number;
+  /**
+   * chat completions 的用量拆分。上游用的是 OpenAI 风格字段名,这里规范化成与
+   * qwen stream-json 同一套口径(input/output/total)好让台账只有一个形状;
+   * 隐式缓存命中不下发,故 cache_read 缺省 —— 成本按全 fresh 计(保守)。
+   */
+  usage: TranscriptUsage | null;
+}
+
+/** 把 chat completions 的 usage 规范化为台账口径;没有任何数值字段即 null。 */
+function normalizeChatUsage(
+  usage: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number } | undefined,
+): TranscriptUsage | null {
+  if (!usage) return null;
+  const out: TranscriptUsage = {
+    input_tokens: typeof usage.prompt_tokens === "number" ? usage.prompt_tokens : undefined,
+    output_tokens: typeof usage.completion_tokens === "number" ? usage.completion_tokens : undefined,
+    total_tokens: typeof usage.total_tokens === "number" ? usage.total_tokens : undefined,
+  };
+  if (out.input_tokens === undefined && out.output_tokens === undefined && out.total_tokens === undefined) {
+    return null;
+  }
+  return out;
 }
 
 /**
@@ -47,7 +70,7 @@ export async function runReviewLLM(
     const errText = `review LLM call failed: ${String(err).slice(0, 500)}`;
     const transcript = await putArtifact(env.ARTIFACTS, errText, `attempts/${args.attemptId}`);
     const stderr = await putArtifact(env.ARTIFACTS, errText, `attempts/${args.attemptId}`);
-    return { exitCode: 12, transcript, transcriptRaw: errText, stderr, tokens: 0 };
+    return { exitCode: 12, transcript, transcriptRaw: errText, stderr, tokens: 0, usage: null };
   }
 
   const transcriptRaw = JSON.stringify({
@@ -66,15 +89,18 @@ export async function runReviewLLM(
       `HTTP ${resp.status}\n${raw.slice(0, 4000)}`,
       `attempts/${args.attemptId}`,
     );
-    return { exitCode: 12, transcript, transcriptRaw, stderr, tokens: 0 };
+    return { exitCode: 12, transcript, transcriptRaw, stderr, tokens: 0, usage: null };
   }
 
-  let parsed: { choices?: Array<{ message?: { content?: string } }>; usage?: { total_tokens?: number } };
+  let parsed: {
+    choices?: Array<{ message?: { content?: string } }>;
+    usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
+  };
   try {
     parsed = JSON.parse(raw) as typeof parsed;
   } catch {
     const stderr = await putArtifact(env.ARTIFACTS, "invalid JSON response", `attempts/${args.attemptId}`);
-    return { exitCode: 12, transcript, transcriptRaw, stderr, tokens: 0 };
+    return { exitCode: 12, transcript, transcriptRaw, stderr, tokens: 0, usage: null };
   }
   const text = parsed.choices?.[0]?.message?.content ?? "";
   const stderr = await putArtifact(env.ARTIFACTS, "", `attempts/${args.attemptId}`);
@@ -84,5 +110,6 @@ export async function runReviewLLM(
     transcriptRaw: text,
     stderr,
     tokens: parsed.usage?.total_tokens ?? 0,
+    usage: normalizeChatUsage(parsed.usage),
   };
 }

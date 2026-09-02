@@ -8,7 +8,13 @@ import { collectQwenAttempt, prepareQwenAttempt, qwenDeadlineSeconds } from "./s
 import { collectVerifyAttempt, prepareVerifyAttempt } from "./verify";
 import { runReviewLLM } from "./review";
 import { composeAttemptPrompt } from "./prompt";
-import { parseReviewVerdict, extractResultFromTranscript, extractTokensFromTranscript } from "./extract";
+import {
+  parseReviewVerdict,
+  extractResultFromTranscript,
+  extractTokensFromTranscript,
+  extractUsageFromTranscript,
+  type TranscriptUsage,
+} from "./extract";
 import type { ReviewVerdict } from "../control/gates";
 import {
   isLongRunTerminal,
@@ -28,6 +34,8 @@ interface ExecOutcome {
   /** reviewer 专用:模型正文(受 max_tokens 约束,体积小,可直接进步骤返回值) */
   reviewText?: string;
   tokens?: number;
+  /** 用量四元组拆分;undefined = 该角色不产出用量 */
+  usage?: TranscriptUsage | null;
 }
 
 function slim(r: {
@@ -95,7 +103,7 @@ export class AttemptWorkflow extends WorkflowEntrypoint<Env, AttemptParams> {
                 prompt: p.spec.prompt,
                 model: p.model,
               });
-              return { ...slim(r), reviewText: r.transcriptRaw, tokens: r.tokens };
+              return { ...slim(r), reviewText: r.transcriptRaw, tokens: r.tokens, usage: r.usage };
             } catch (err) {
               console.warn(
                 `exec_step_failed task=${p.task_id} attempt=${p.attempt_id} role=${p.role} ` +
@@ -252,25 +260,28 @@ export class AttemptWorkflow extends WorkflowEntrypoint<Env, AttemptParams> {
         }
       }
 
-      const extracted: { text: string | null; tokens: number; review?: ReviewVerdict } = await step.do(
-        "extract",
-        async () => {
-          if (p.role === "reviewer") {
-            const text = run.reviewText ?? "";
-            return { text, tokens: run.tokens ?? 0, review: parseReviewVerdict(text) };
-          }
-          const obj = await this.env.ARTIFACTS.get(run.transcript.key);
-          const raw = obj ? await obj.text() : "";
-          if (p.role === "verifier") {
-            // transcript 已是结构化 JSON 报告,不做 NDJSON 提取
-            return { text: raw, tokens: 0 };
-          }
-          return {
-            text: extractResultFromTranscript(raw),
-            tokens: extractTokensFromTranscript(raw),
-          };
-        },
-      );
+      const extracted: {
+        text: string | null;
+        tokens: number;
+        usage: TranscriptUsage | null;
+        review?: ReviewVerdict;
+      } = await step.do("extract", async () => {
+        if (p.role === "reviewer") {
+          const text = run.reviewText ?? "";
+          return { text, tokens: run.tokens ?? 0, usage: run.usage ?? null, review: parseReviewVerdict(text) };
+        }
+        const obj = await this.env.ARTIFACTS.get(run.transcript.key);
+        const raw = obj ? await obj.text() : "";
+        if (p.role === "verifier") {
+          // transcript 已是结构化 JSON 报告,不做 NDJSON 提取
+          return { text: raw, tokens: 0, usage: null };
+        }
+        return {
+          text: extractResultFromTranscript(raw),
+          tokens: extractTokensFromTranscript(raw),
+          usage: extractUsageFromTranscript(raw),
+        };
+      });
 
       const manifestRef = await step.do("evidence", async () => {
         const manifest: EvidenceManifest = {
@@ -301,6 +312,7 @@ export class AttemptWorkflow extends WorkflowEntrypoint<Env, AttemptParams> {
         manifest_key: manifestRef.key,
         manifest_digest: manifestRef.digest,
         tokens: extracted.tokens,
+        usage: extracted.usage,
         patch_digest: run.patch?.digest ?? null,
         base: run.base ?? null,
         result_text:

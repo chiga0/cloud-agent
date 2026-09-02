@@ -41,31 +41,120 @@ export function extractResultFromTranscript(transcript: string): string | null {
 }
 
 /**
- * 从 qwen-code stream-json transcript 提取 token 用量。
- * type=result 事件的 usage 字段优先;不存在时累加所有 usage 字段。
- * 返回 total_tokens 整数,无法解析则返回 0。
+ * qwen stream-json 事件里的 token 用量四元组。字段名与上游原样对齐
+ * (input/output/cache_read),不做重命名 —— 台账要能回答「这个数字是从哪来的」,
+ * 改一次名字就多一层需要人记的映射。
+ * 缺字段留 `undefined`(不是 0):0 是「上游说没消耗」,undefined 是「上游没说」。
  */
-export function extractTokensFromTranscript(transcript: string): number {
+export interface TranscriptUsage {
+  input_tokens?: number;
+  cache_read_input_tokens?: number;
+  output_tokens?: number;
+  total_tokens?: number;
+}
+
+const USAGE_FIELDS = [
+  "input_tokens",
+  "cache_read_input_tokens",
+  "output_tokens",
+  "total_tokens",
+] as const;
+
+/** 事件里的 usage:顶层 `evt.usage` 或挂在 message 上的 `evt.message.usage`。 */
+function usageOfEvent(evt: Record<string, unknown>): TranscriptUsage | null {
+  const message = evt.message;
+  const nested =
+    message && typeof message === "object"
+      ? (message as Record<string, unknown>).usage
+      : undefined;
+  const raw = (evt.usage ?? nested) as Record<string, unknown> | undefined;
+  if (!raw || typeof raw !== "object") return null;
+
+  const usage: TranscriptUsage = {};
+  let known = false;
+  for (const field of USAGE_FIELDS) {
+    if (typeof raw[field] === "number") {
+      usage[field] = raw[field] as number;
+      known = true;
+    }
+  }
+  // 只有 usage 壳子(或全是非数值字段)等于没有用量信息,不能当 0 记进台账
+  return known ? usage : null;
+}
+
+/**
+ * 一条 usage 的有效总量:上游没给 total 时由 input+output 推出。
+ * 注意这是「量」的口径,不是「钱」的口径 —— 成本看 costWeightedFromUsage。
+ */
+function effectiveTotal(u: TranscriptUsage): number {
+  return u.total_tokens ?? (u.input_tokens ?? 0) + (u.output_tokens ?? 0);
+}
+
+/**
+ * 从 qwen-code stream-json transcript 提取 token 用量四元组。
+ *
+ * 在所有携带 usage 的事件里取有效 total 最大的一条:type=result 的 usage 是整轮
+ * 会话的累计值,而单次调用不可能超过上下文窗口,因此最大值必是累计值。
+ * 无任何 usage 事件返回 null。
+ */
+export function extractUsageFromTranscript(transcript: string): TranscriptUsage | null {
   const lines = transcript.split("\n").filter((l) => l.trim().length > 0);
-  let best = 0;
+  let best: TranscriptUsage | null = null;
+  let bestTotal = 0;
 
   for (const line of lines) {
+    let evt: unknown;
     try {
-      const evt = JSON.parse(line) as Record<string, unknown>;
-      const usage = evt.usage as Record<string, number> | undefined;
-      if (!usage) continue;
-      const total =
-        typeof usage.total_tokens === "number"
-          ? usage.total_tokens
-          : (usage.input_tokens ?? 0) + (usage.output_tokens ?? 0);
-      // type=result usage is cumulative; take the last/largest value seen
-      if (total > best) best = total;
+      evt = JSON.parse(line);
     } catch {
       // non-JSON line, ignore
+      continue;
+    }
+    if (!evt || typeof evt !== "object") continue;
+    const usage = usageOfEvent(evt as Record<string, unknown>);
+    if (!usage) continue;
+    const total = effectiveTotal(usage);
+    if (total > bestTotal) {
+      best = usage;
+      bestTotal = total;
     }
   }
 
   return best;
+}
+
+/**
+ * 从 qwen-code stream-json transcript 提取 token 用量。
+ * 取所有携带 usage 的事件里有效总量最大的一条(type=result 是整轮累计值),
+ * 无 total_tokens 时由 input+output 推出;无法解析则返回 0。
+ *
+ * 保留 raw total 口径(台账的 tokens_used 即此值),既有复盘的语义不变;成本口径
+ * 另见 costWeightedFromUsage —— total 把 cache 命中与 fresh input 同价计,失真严重。
+ */
+export function extractTokensFromTranscript(transcript: string): number {
+  const usage = extractUsageFromTranscript(transcript);
+  return usage === null ? 0 : effectiveTotal(usage);
+}
+
+/**
+ * 成本加权用量:把「量」换算成可横向比较的相对成本,单位是 fresh input token 数。
+ *
+ * 隐式 prompt 缓存命中(r11 实测占 total 的 96.9%)按 cacheReadFactor 折扣计价,
+ * fresh input 与 output 全额。三档口径:
+ * - input 与 cache_read 都已知:精确拆分;
+ * - 只有 input(cache_read 未知):保守按全 fresh 计,绝不猜「全是缓存命中」;
+ * - 只有 total:退回 total,即与 raw total 同值 —— 诚实标注为「无从拆分」。
+ */
+export function costWeightedFromUsage(u: TranscriptUsage, cacheReadFactor: number): number {
+  const output = u.output_tokens ?? 0;
+  const input = u.input_tokens;
+  const cacheRead = u.cache_read_input_tokens;
+  if (input !== undefined && cacheRead !== undefined) {
+    // cache_read 是 input 的子集:fresh = input - cache_read
+    return input - cacheRead + output + Math.round(cacheRead * cacheReadFactor);
+  }
+  if (input !== undefined) return input + output;
+  return u.total_tokens ?? (u.input_tokens ?? 0) + (u.output_tokens ?? 0);
 }
 
 const REVIEW_SOURCES: ReviewSource[] = ["task_prompt", "writer_result", "verify_output", "patch"];
