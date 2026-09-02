@@ -15,7 +15,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { EXIT, planRun, resolveToken, runGate, summaryLine } from "./land-gate.mjs";
+import { EXIT, parseTestCount, planRun, resolveToken, runGate, summaryLine } from "./land-gate.mjs";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -175,11 +175,10 @@ const deps = {
 
   async runTests(handle) {
     const r = npmAt(handle.dir, ["test"]);
-    // 提交信息里的 tests N passed 必须是真实输出里的数字。vitest 的汇总行是
-    // `Tests  214 passed (214)`;解析不出来时如实写 0(宁可得出的摘要难看,也不编一个数)。
-    const out = `${r.stdout}\n${r.stderr}`;
-    const m = /Tests\s+(\d+) passed/.exec(out) ?? /(\d+) passed/.exec(out);
-    return { ok: r.code === 0, passed: m ? Number(m[1]) : 0, detail: m ? `passed=${m[1]}` : r.detail };
+    // 提交信息里的 tests N passed 必须是真实输出里的数字。解析(含剥 ANSI 色码)
+    // 收在 parseTestCount;解析不出来时如实写 0(宁可得出的摘要难看,也不编一个数)。
+    const passed = parseTestCount(`${r.stdout}\n${r.stderr}`);
+    return { ok: r.code === 0, passed, detail: passed > 0 ? `passed=${passed}` : r.detail };
   },
 
   async commit(handle, message) {

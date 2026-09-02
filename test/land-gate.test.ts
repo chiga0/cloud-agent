@@ -6,6 +6,7 @@ import {
   EXIT,
   GATE_KEYS,
   parseArgs,
+  parseTestCount,
   planRun,
   resolveToken,
   runGate,
@@ -385,5 +386,40 @@ describe("摘要形状与提交信息", () => {
     expect(messages[0]).toContain(`base: ${BASE_SHA}`);
     expect(messages[0]).toContain(`binding-digest: ${BINDING_DIGEST}`);
     expect(messages[0]).toContain(`land: task ${TASK} candidate`);
+  });
+});
+
+/**
+ * parseTestCount 的契约钉在**真实 vitest 输出字节**上(2026-09-02 C6a 冒烟取证:
+ * TERM=xterm-256color 下 vitest 输出带 ANSI 色码,Tests 标签与数字之间隔着 ESC 序列)。
+ * 这又是反模式 17 的活体:注入层给的都是已解析好的 {ok, passed},真实输出形状零覆盖
+ * —— 旧正则在带码输出上永远失配,回落咬住 Test Files 的文件数(15 ≠ 230)。
+ */
+describe("parseTestCount(真实 vitest 输出字节)", () => {
+  // 汇总两行是 2026-09-02 冒烟捕获的逐字节原文(npm test 输出重定向进文件仍带码)。
+  const REAL_VITEST_SUMMARY = [
+    "> cloud-agent@0.1.0 test\n> vitest run\n",
+    "\x1b[2m Test Files \x1b[22m \x1b[1m\x1b[32m16 passed\x1b[39m\x1b[22m\x1b[90m (16)\x1b[39m",
+    "\x1b[2m      Tests \x1b[22m \x1b[1m\x1b[32m258 passed\x1b[39m\x1b[22m\x1b[90m (258)\x1b[39m",
+    "   Duration  41.02s",
+  ].join("\n");
+
+  it("带 ANSI 色码的真实汇总:取 Tests 行的用例数 258,不是 Test Files 的文件数 16", () => {
+    expect(parseTestCount(REAL_VITEST_SUMMARY)).toBe(258);
+  });
+
+  it("无色码的汇总行同样取用例数", () => {
+    expect(parseTestCount(" Test Files  15 passed (15)\n      Tests  230 passed (230)\n")).toBe(230);
+  });
+
+  it("只有 Test Files 行时回落取文件数 —— 有数字好于 0,但语义是文件数", () => {
+    expect(parseTestCount(" Test Files  15 passed (15)\n")).toBe(15);
+  });
+
+  it("解析不出如实返回 0,绝不编数;null/undefined 同样 0", () => {
+    expect(parseTestCount("no summary here")).toBe(0);
+    expect(parseTestCount("")).toBe(0);
+    expect(parseTestCount(null)).toBe(0);
+    expect(parseTestCount(undefined)).toBe(0);
   });
 });

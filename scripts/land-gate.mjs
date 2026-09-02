@@ -168,6 +168,20 @@ export function buildCommitMessage(info) {
 }
 
 /**
+ * vitest 汇总行的测试数解析。真实输出带 ANSI 色码 —— 终端 TERM=xterm-256color 时
+ * 色库不看 isTTY,重定向进管道的输出也带码,形如:
+ *   "\x1b[2m      Tests \x1b[22m \x1b[1m\x1b[32m258 passed\x1b[39m\x1b[22m\x1b[90m (258)\x1b[39m"
+ * 「Tests」标签与数字之间隔着 ESC 序列,直接匹配 /Tests\s+(\d+) passed/ 永远失配,
+ * 回落正则会先咬住上一行「Test Files  N passed」的 N —— 文件数 ≠ 用例数(C6a 冒烟
+ * 实测 15 vs 230)。先剥码再匹配;解析不出如实返回 0,绝不编数。
+ */
+export function parseTestCount(text) {
+  const plain = String(text ?? "").replace(/\x1b\[[0-9;]*m/g, "");
+  const m = /Tests\s+(\d+) passed/.exec(plain) ?? /(\d+) passed/.exec(plain);
+  return m ? Number(m[1]) : 0;
+}
+
+/**
  * @param {LandOptions} opts
  * @returns {{exitCode:number, task:string, gates:Record<string, boolean|null>, committed:boolean, pushed:boolean, commitSha:string|null, reason:string|null}}
  */
