@@ -7,10 +7,14 @@
  * 因此本脚本是**唯一**能改远端的地方 —— 它宁可什么都不做,也不会在没被证明的候选上动手。
  *
  * 退出码口径见 land-gate.mjs 头注释:0 成功 / 1 执行期故障 / 2 守门拒绝 / 3 环境或参数错误。
+ *
+ * 守门链 a–g 之后可选接两段迭代循环尾巴(判定全在 land-gate.mjs,本文件只给真实现):
+ * --next <file> 在本轮 push 成功后把 spec 文件原样 POST /tasks 提交下一任务;
+ * --wait 再每 60s 轮询那个新任务直到 DONE/REJECTED/BLOCKED(上限 90 分钟)。
  */
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -78,28 +82,36 @@ function npmAt(dir, args) {
 }
 
 /**
- * 带鉴权的 GET。token **每次从 env 现读**(不做凭据缓存):平台侧 token 可轮换,
- * 而落地窗口可能横跨轮换。
+ * 带鉴权的 HTTP。token **每次从 env 现读**(不做凭据缓存):平台侧 token 可轮换,
+ * 而落地窗口可能横跨轮换 —— 加了 --wait 之后这个窗口最长是 90 分钟。
+ *
+ * 失败语义对 GET/POST 一视同仁:网络错误与任何非 2xx 都抛 LandError(RUNTIME)。
+ * POST /tasks 的 4xx 是「平台拒绝了这个 spec」,大声失败比就地猜测要补什么字段有用。
  */
-async function get(opts, path, accept) {
+async function request(opts, method, path, { accept = "application/json", body = null } = {}) {
   const tok = resolveToken(process.env, opts.tokenEnv);
   if (!tok.ok) throw new LandError(EXIT.ENV, tok.error);
+  const headers = { authorization: `Bearer ${tok.token}`, accept };
+  if (body !== null) headers["content-type"] = "application/json";
   let res;
   try {
-    res = await fetch(`${opts.api}${path}`, {
-      headers: { authorization: `Bearer ${tok.token}`, accept },
-    });
+    res = await fetch(`${opts.api}${path}`, { method, headers, body });
   } catch (err) {
     // undici 把真实原因(ECONNREFUSED / ENOTFOUND / TLS)藏在 err.cause 里:
     // 只喊 "fetch failed" 等于把最有用的一行扔了。
     const cause = err && typeof err === "object" && err.cause instanceof Error ? ` (${err.cause.message})` : "";
-    throw new LandError(EXIT.RUNTIME, `GET ${path} failed: ${err instanceof Error ? err.message : String(err)}${cause}`);
+    throw new LandError(EXIT.RUNTIME, `${method} ${path} failed: ${err instanceof Error ? err.message : String(err)}${cause}`);
   }
   if (!res.ok) {
-    const body = oneLine((await res.text().catch(() => ""))).slice(0, 300);
-    throw new LandError(EXIT.RUNTIME, `GET ${path} → HTTP ${res.status}${body ? ` ${body}` : ""}`);
+    const text = oneLine((await res.text().catch(() => ""))).slice(0, 300);
+    throw new LandError(EXIT.RUNTIME, `${method} ${path} → HTTP ${res.status}${text ? ` ${text}` : ""}`);
   }
   return res;
+}
+
+/** GET 的薄别名:守门链 a–c 三步全是读,调用点保持原样好读。 */
+function get(opts, path, accept) {
+  return request(opts, "GET", path, { accept });
 }
 
 /** 真 deps:与 land-gate.mjs 的注入面一一对应。 */
@@ -202,6 +214,52 @@ const deps = {
     const r = gitAt(handle.dir, ["push", "origin", "HEAD:main"]);
     if (r.code !== 0) throw new LandError(EXIT.RUNTIME, `git push origin HEAD:main failed(非快进则先人工 rebase,不用 --force): ${r.detail}`);
   },
+
+  async readSpecFile(opts) {
+    // h 步材料。这里只判「读得到、解析得开」两件事,然后把**文件原文**交回去:
+    // spec 文件是任务意图的权威副本,脚本既不改写(不 JSON.parse 后再 stringify —— 那会
+    // 悄悄重排键序、归一化数字),也不校验业务内容(平台是唯一裁判,4xx 由它大声报)。
+    const path = resolve(process.cwd(), opts.next);
+    let text;
+    try {
+      text = readFileSync(path, "utf8");
+    } catch (err) {
+      return { ok: false, detail: `read ${path} failed: ${err instanceof Error ? err.message : String(err)}` };
+    }
+    try {
+      JSON.parse(text);
+    } catch (err) {
+      return { ok: false, detail: `${path} is not valid JSON: ${err instanceof Error ? err.message : String(err)}` };
+    }
+    return { ok: true, text };
+  },
+
+  async postNext(opts, text) {
+    const res = await request(opts, "POST", "/tasks", { body: text });
+    const body = /** @type {{task?: {id?: unknown}, task_id?: unknown}} */ (await res.json());
+    // prod 实测(2026-09-02)返回 {"task":{"id":…,"state":"QUEUED"}};仓内 src/index.ts 的
+    // 同一端点返回 {task_id:…}。两种都认,认不出即大声失败 —— 把 null 记进摘要会让
+    // 一个 --wait 去等一个不存在的任务,那是最难查的一类挂法。
+    const id = body?.task?.id ?? body?.task_id;
+    if (typeof id !== "string" || id === "") {
+      throw new LandError(EXIT.RUNTIME, `POST /tasks → 响应里没有新任务 id(拿到的是 ${oneLine(JSON.stringify(body)).slice(0, 200)})`);
+    }
+    return id;
+  },
+
+  async fetchTaskState(opts, id) {
+    const res = await get(opts, `/tasks/${id}`, "application/json");
+    const body = /** @type {{task?: {state?: unknown}}} */ (await res.json());
+    const state = body?.task?.state;
+    if (typeof state !== "string" || state === "") {
+      throw new LandError(EXIT.RUNTIME, `GET /tasks/${id} → 响应里没有 task.state`);
+    }
+    return state;
+  },
+
+  async sleep(ms) {
+    await new Promise((r) => setTimeout(r, ms));
+  },
 };
 
 async function main(argv, env) {
@@ -220,7 +278,7 @@ async function main(argv, env) {
     return EXIT.ENV;
   }
 
-  log("args", "ok", `task=${opts.task} api=${opts.api} execute=${opts.execute} push=${opts.push} worktree=${opts.worktree ?? "temp"}`);
+  log("args", "ok", `task=${opts.task} api=${opts.api} execute=${opts.execute} push=${opts.push} worktree=${opts.worktree ?? "temp"} next=${opts.next ?? "-"} wait=${opts.wait}`);
   try {
     const outcome = await runGate(opts, deps);
     process.stdout.write(`${summaryLine(outcome)}\n`);

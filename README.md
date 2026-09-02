@@ -127,6 +127,10 @@ node scripts/land.mjs --task <task_id> --execute # 通过后在临时 worktree �
 node scripts/land.mjs --task <task_id> --execute --push   # 再 git push origin HEAD:main
 # 可选:--api <url>(默认 https://cloud-agent.aflow.workers.dev)、--token-env <NAME>
 #       (默认 WORKER_API_TOKEN)、--worktree <dir>(固定目录;失败现场保留,缺省放系统临时目录且结束回收)
+# 迭代循环续命两段(独立开关,都在 g 步之后执行,守门链本身不变):
+#   --next <file>  本轮 push 成功后,把该 JSON 文件原样 POST /tasks 提交下一任务(记进摘要 next_task)
+#   --wait         上一段提交成功后,每 60s GET /tasks/<id> 直到 DONE/REJECTED/BLOCKED(上限 90 分钟)
+node scripts/land.mjs --task <task_id> --execute --push --next backlog/next.json --wait
 ```
 
 五道门按序执行,任一步失败立即停,后续步骤一次都不执行:
@@ -139,20 +143,28 @@ node scripts/land.mjs --task <task_id> --execute --push   # 再 git push origin 
 
 全绿且带 `--execute` 才 commit,提交信息逐字含四要素(task / base sha 全长 / patch sha256 / binding digest)加一行真实验证摘要;`--push` 必须与 `--execute` 同传,且 push 只在**已 commit** 后发生。push 失败(含非快进)直接报错退出,**绝不 `--force`**。
 
+守门链之后可追加两段迭代循环尾巴(判定同样在 `land-gate.mjs`,h 步 `--next` / i 步 `--wait`):
+
+- **h `--next <file>` —— 提交下一任务。硬不变量:本轮 `pushed` 为真才 POST。** 判的是实际推送事实而不是「传了 `--push`」:本轮改动没进远端就派下一任务,下一轮会在缺本轮成果的基线上重跑,而无人值守的循环里这种失败会一直「成功」。前置不满足时 stderr 打一行 `[land] next skip push 未成功 …`、`next_task=null`,不静默跳过。参数层还拦一条链式依赖:`--next` ⇒ `--push` ⇒ `--execute`、`--wait` ⇒ `--next`,缺环即 usage 错误(3)。
+- **文件即权威副本**:`--next` 指向的 JSON 文件形状与 `POST /tasks` 请求体同构(`{"spec":{…},"budget":{…}}`)。脚本**不改写**它(POST 发的是文件原文字节,不是重新序列化)、**不做 schema 校验** —— 平台是唯一裁判,形状错误由 4xx 大声失败(→ 退出码 1)。文件读不到/不是合法 JSON → 退出码 3,但五道门已判完,摘要照打(`next_task=null`)。
+- **i `--wait` —— 轮询下一任务到终态**:每 60s `GET /tasks/<next_id>`,直到 `state ∈ {DONE, REJECTED, BLOCKED}`(记进 `next_state`)。瞬态容忍:单次网络错误/HTTP 5xx 继续下一轮,连续 ≥5 次问不到才放弃;预算 90 分钟用完仍非终态即超时 —— 两者都是退出码 1(报的是环境)。下一任务自己的 `REJECTED`/`BLOCKED` **不改本次运行的退出码**:那是它那一轮 land 运行的裁决,不由本次运行代答。
+
 | 退出码 | 含义 |
 | --- | --- |
-| 0 | 成功。dry-run 表示「可以落地」;`--execute` 表示已 commit(`--push` 则已 push) |
-| 1 | 执行期故障:网络、子进程、`npm ci`、commit/push 本身失败 —— 报的是环境,不是对候选的裁决 |
+| 0 | 成功。dry-run 表示「可以落地」;`--execute` 表示已 commit(`--push` 则已 push,`--wait` 则下一任务已到终态) |
+| 1 | 执行期故障:网络、子进程、`npm ci`、commit/push 本身失败、`POST /tasks` 被拒、`--wait` 超时或连续 5 次问不到 —— 报的是环境,不是对候选的裁决 |
 | 2 | 守门拒绝:五道门(`done_state`/`manifest_cross`/`digest_ok`/`apply_ok`/`tests_ok`)任一不过 |
-| 3 | 环境或参数错误:usage 错误(只传 `--push`、未知参数、缺 `--task`…)、token 环境变量缺失、目标不是 git 仓库 |
+| 3 | 环境或参数错误:usage 错误(只传 `--push`、`--next` 缺 `--push`、`--wait` 缺 `--next`、未知参数、缺 `--task`…)、token 环境变量缺失、目标不是 git 仓库、`--next` 的 spec 文件读不到或不是合法 JSON(此时五道门已判完,摘要**照打** —— 这是 3 里唯一打摘要的一类) |
 
-过程日志走 stderr(`[land] <step> ok|fail <detail>`),终局摘要走 stdout 一行 JSON —— 退出码 3 时不输出摘要(一道门也没评估过):
+过程日志走 stderr(`[land] <step> ok|fail|skip|retry <detail>`),终局摘要走 stdout 一行 JSON —— 守门开始**之前**的失败不输出摘要(一道门也没评估过);唯一例外是 `--next` 的 spec 文件不可用:那时五道门已判完,摘要照打。
 
 ```json
-{"task":"…","gate":{"done_state":true,"manifest_cross":true,"digest_ok":true,"apply_ok":true,"tests_ok":true},"committed":false,"pushed":false,"commit_sha":null}
+{"task":"…","gate":{"done_state":true,"manifest_cross":true,"digest_ok":true,"apply_ok":true,"tests_ok":true},"committed":false,"pushed":false,"commit_sha":null,"next_task":null,"next_state":null}
 ```
 
-边界:不做并发落地锁(假设单机单循环,一次只 land 一个 task),不做 `--next`/轮询(下一期),不缓存凭据(每个请求从 env 现读)。`git`/`npm` 真实进程行为不在单测里 mock —— 第一次在新任务上跑请先 dry-run,看五道门是否如预期。
+`next_task` 是 h 步提交成功后平台返回的新任务 id,`next_state` 是 i 步轮询到的终态;dry-run 或前置不满足时恒为 `null`(键恒在,读的人靠键的存在判断「这段跑过了」)。
+
+边界:不做并发落地锁(假设单机单循环,一次只 land 一个 task),不做凭据缓存(每个请求从 env 现读 —— `--wait` 之后这个窗口最长 90 分钟,更要现读),不做 `--force`、不做交互式确认。`git`/`npm` 真实进程行为与真 HTTP 不在单测里 mock —— 第一次在新任务上跑请先 dry-run,看五道门是否如预期。
 
 ## 部署前一次性配置(需要账号操作)
 

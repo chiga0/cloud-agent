@@ -7,14 +7,19 @@
  * 守门器的价值在于它**不会做什么**,而那些恰恰是最难靠真进程验证的断言。
  * 真 git/npm/HTTP 的实现留在 land.mjs(薄壳),那部分靠真实运行验证。
  *
+ * 守门链 a–g 之后还有两段可选的迭代循环尾巴(h 提交下一任务 / i 轮询下一任务到终态)。
+ * 它们同样是纯逻辑:无人值守的循环里「本轮没进远端就派下一任务」会让下一轮在没有成果的
+ * 基线上原地重跑,这条不变量跟 digest 硬门一样必须能被假 deps 钉住,而不是靠真网络跑一次。
+ *
  * 退出码 —— 对外的唯一口径,land.mjs、README 退出码表、测试三处必须一致:
  * - 0 成功。守门链全绿:dry-run 表示「可以落地」,--execute 表示已 commit(--push 则已 push)。
- * - 1 执行期故障。网络、git/npm 子进程本身、install、commit/push 失败 —— 这是对**环境**的
- *   报告,不是对候选的裁决,因此不占用 2。
+ * - 1 执行期故障。网络、git/npm 子进程本身、install、commit/push 失败、--wait 超时或连续
+ *   问不到下一任务 —— 这是对**环境**的报告,不是对候选的裁决,因此不占用 2。
  * - 2 守门拒绝。五道门(done_state / manifest_cross / digest_ok / apply_ok / tests_ok)任一不过。
- * - 3 环境或参数错误。usage 错误(只传 --push、未知参数、缺 --task、选项取值缺失)、
- *   鉴权环境变量缺失、目标目录不是 git 仓库。这类失败发生在守门开始**之前**,
- *   所以 stdout 不输出摘要 JSON —— 一道门也没被评估过,打出来只会误导读数。
+ * - 3 环境或参数错误。usage 错误(只传 --push、--next 缺 --push、未知参数、缺 --task、选项取值
+ *   缺失)、鉴权环境变量缺失、目标目录不是 git 仓库、--next 的 spec 文件读不到/不是合法 JSON。
+ *   前几类失败发生在守门开始**之前**,所以 stdout 不输出摘要 JSON —— 一道门也没被评估过,
+ *   打出来只会误导读数。唯一例外是 spec 文件不可用:五道门已判完,摘要照打(next_task=null)。
  *
  * 并发:不做落地锁。前提是单机单循环(一次只 land 一个 task),这是刻意接受的边界。
  */
@@ -25,7 +30,22 @@ export const DEFAULT_API = "https://cloud-agent.aflow.workers.dev";
 export const DEFAULT_TOKEN_ENV = "WORKER_API_TOKEN";
 
 export const USAGE =
-  "usage: node scripts/land.mjs --task <uuid> [--api <url>] [--token-env <NAME>] [--execute] [--push] [--worktree <dir>]";
+  "usage: node scripts/land.mjs --task <uuid> [--api <url>] [--token-env <NAME>] [--execute] [--push] [--worktree <dir>] [--next <file>] [--wait]";
+
+/**
+ * --wait 的轮询口径。收在这里(而不是散在壳的 while 里)是因为「多久问一次、什么时候放弃」
+ * 是无人值守循环的语义,必须能在测试里被假 sleep/fetchTaskState 钉死。
+ * 上限用**轮数**表达而不是墙钟计时:纯逻辑里没有可靠的「现在」,注入假 clock 只会让这条
+ * 边界更难读;轮数 = 上限时长 ÷ 间隔,两者同源,改间隔即改时长,不会各说各话。
+ */
+export const POLL_INTERVAL_MS = 60_000;
+export const POLL_TIMEOUT_MS = 90 * 60_000;
+export const POLL_MAX_ROUNDS = Math.floor(POLL_TIMEOUT_MS / POLL_INTERVAL_MS);
+/** 连续失败到第 5 次才放弃:前 4 次当作瞬态(网络抖动、一次 5xx),第 5 次才像「问不到」。 */
+export const POLL_MAX_CONSECUTIVE_FAILURES = 5;
+
+/** 下一任务的终态集合。轮询到其中之一即停 —— 状态名与 a 步的 DONE 同一套,含义是「这一轮已有裁决,可交接」。 */
+export const NEXT_TERMINAL_STATES = Object.freeze(["DONE", "REJECTED", "BLOCKED"]);
 
 /**
  * @typedef {Object} LandOptions
@@ -35,6 +55,8 @@ export const USAGE =
  * @property {boolean} execute
  * @property {boolean} push
  * @property {string|null} worktree
+ * @property {string|null} next
+ * @property {boolean} wait
  */
 
 /** 守门链的五道门,顺序即执行顺序(null = 尚未执行到,不是「不过」)。 */
@@ -46,8 +68,8 @@ export const GATE_KEYS = Object.freeze([
   "tests_ok",
 ]);
 
-const VALUE_OPTS = new Set(["--task", "--api", "--token-env", "--worktree"]);
-const FLAG_OPTS = new Set(["--execute", "--push"]);
+const VALUE_OPTS = new Set(["--task", "--api", "--token-env", "--worktree", "--next"]);
+const FLAG_OPTS = new Set(["--execute", "--push", "--wait"]);
 
 /**
  * task id 要拼进 URL path,worktree/api 要进 argv 与 cwd —— 用户输入是唯一的校验点,
@@ -71,6 +93,8 @@ export function parseArgs(argv) {
     execute: false,
     push: false,
     worktree: null,
+    next: null,
+    wait: false,
   };
 
   for (let i = 0; i < argv.length; i += 1) {
@@ -85,7 +109,7 @@ export function parseArgs(argv) {
 
     if (FLAG_OPTS.has(flag)) {
       if (inline !== null) return usage(`${flag} is a boolean flag, it takes no value`);
-      opts[flag === "--execute" ? "execute" : "push"] = true;
+      opts[flag === "--execute" ? "execute" : flag === "--push" ? "push" : "wait"] = true;
       continue;
     }
     if (!VALUE_OPTS.has(flag)) return usage(`unknown option: ${flag}`);
@@ -100,6 +124,7 @@ export function parseArgs(argv) {
     if (flag === "--task") opts.task = value;
     else if (flag === "--api") opts.api = value.replace(/\/+$/, "");
     else if (flag === "--token-env") opts.tokenEnv = value;
+    else if (flag === "--next") opts.next = value;
     else opts.worktree = value;
   }
 
@@ -107,6 +132,11 @@ export function parseArgs(argv) {
   if (!TASK_ID_RE.test(opts.task)) return usage(`--task is not a valid id: ${JSON.stringify(opts.task)}`);
   // --push 单独出现一定是误用:落地端唯一的写远端动作,必须先过 --execute 这道显式意图门。
   if (opts.push && !opts.execute) return usage("--push requires --execute (dry-run never pushes)");
+  // 链式依赖 --next ⇒ --push ⇒ --execute:未 push 成功就 POST 下一任务,等于让下一轮在没有本轮
+  // 成果的基线上重跑。参数层先拦一道,runGate 的 h 步再按**实际 pushed 事实**兜底。
+  if (opts.next && !opts.push) return usage("--next requires --push (下一任务只能在本轮已进远端之后提交)");
+  // --wait 等的是 --next 提交出来的任务;没有对象可等就没必要占着进程 90 分钟。
+  if (opts.wait && !opts.next) return usage("--wait requires --next (没有下一任务可等)");
   return { ok: true, opts };
 }
 
@@ -183,13 +213,23 @@ export function parseTestCount(text) {
 
 /**
  * @param {LandOptions} opts
- * @returns {{exitCode:number, task:string, gates:Record<string, boolean|null>, committed:boolean, pushed:boolean, commitSha:string|null, reason:string|null}}
+ * @returns {{exitCode:number, task:string, gates:Record<string, boolean|null>, committed:boolean, pushed:boolean, commitSha:string|null, nextTask:string|null, nextState:string|null, reason:string|null}}
  */
 export function newOutcome(opts) {
   /** @type {Record<string, boolean|null>} */
   const gates = {};
   for (const key of GATE_KEYS) gates[key] = null;
-  return { exitCode: EXIT.OK, task: opts.task, gates, committed: false, pushed: false, commitSha: null, reason: null };
+  return {
+    exitCode: EXIT.OK,
+    task: opts.task,
+    gates,
+    committed: false,
+    pushed: false,
+    commitSha: null,
+    nextTask: null,
+    nextState: null,
+    reason: null,
+  };
 }
 
 /** stdout 的终局摘要:一行 JSON,机读优先,不加装饰。 */
@@ -206,7 +246,62 @@ export function summaryLine(outcome) {
     committed: outcome.committed,
     pushed: outcome.pushed,
     commit_sha: outcome.commitSha,
+    next_task: outcome.nextTask,
+    next_state: outcome.nextState,
   });
+}
+
+/**
+ * --wait 的轮询状态机(纯逻辑):每 POLL_INTERVAL_MS 问一次 `GET /tasks/<id>`,
+ * 直到 state 进 NEXT_TERMINAL_STATES,或撞上两条放弃线之一 —— 超时(90 分钟预算用完)、
+ * 连续 POLL_MAX_CONSECUTIVE_FAILURES 次问不到。
+ *
+ * 为什么值得单独成一个函数而不是壳里的 while:瞬态容忍是**语义**而非细节。
+ * 把一次 5xx 当成失败退出,无人值守循环会因为平台一次抖动就断掉;把「问不到」无限容忍,
+ * 又等于把真故障伪装成长等待。两头都要能用假 deps 钉住。
+ * 失败轮同样要 sleep —— 否则连续抖动会变成对平台的猛击。
+ *
+ * @param {LandOptions} opts
+ * @param {string} id 下一任务 id
+ * @param {any} deps fetchTaskState(opts, id) -> state(抛错即记一次瞬态失败) / sleep(ms) / log(step, status, detail)
+ * @returns {Promise<{ok:boolean, state:string|null, polls:number, failures:number, reason:string|null}>}
+ */
+export async function pollNextTask(opts, id, deps) {
+  let polls = 0;
+  let failures = 0;
+  for (let round = 1; round <= POLL_MAX_ROUNDS; round += 1) {
+    polls += 1;
+    /** @type {string|null} */
+    let state = null;
+    try {
+      const asked = await deps.fetchTaskState(opts, id);
+      state = typeof asked === "string" ? asked : null;
+      failures = 0;
+    } catch (err) {
+      failures += 1;
+      deps.log("wait", "retry", `round=${round} 问不到 ${id}(${err instanceof Error ? err.message : String(err)}),连续失败 ${failures}/${POLL_MAX_CONSECUTIVE_FAILURES}`);
+      if (failures >= POLL_MAX_CONSECUTIVE_FAILURES) {
+        return {
+          ok: false,
+          state: null,
+          polls,
+          failures,
+          reason: `连续 ${failures} 次问不到 /tasks/${id} —— 判为故障而非「还没好」,放弃`,
+        };
+      }
+    }
+    if (state !== null && NEXT_TERMINAL_STATES.includes(state)) {
+      return { ok: true, state, polls, failures, reason: null };
+    }
+    if (round < POLL_MAX_ROUNDS) await deps.sleep(POLL_INTERVAL_MS);
+  }
+  return {
+    ok: false,
+    state: null,
+    polls,
+    failures,
+    reason: `轮询 ${polls} 次(预算 ${Math.round(POLL_TIMEOUT_MS / 60000)} 分钟)后 /tasks/${id} 仍未进终态 —— 超时`,
+  };
 }
 
 /**
@@ -219,10 +314,12 @@ export function summaryLine(outcome) {
  *   applyCheck(handle, bytes) / applyPatch(handle, bytes) -> {ok, detail}
  *   install(handle) -> {ok, detail} / typecheck(handle) -> {ok, out, detail}
  *   runTests(handle) -> {ok, passed, detail} / commit(handle, message) -> sha / push(handle)
+ *   readSpecFile(opts) -> {ok:true, text} | {ok:false, detail}(h 步)
+ *   postNext(opts, text) -> 新任务 id / fetchTaskState(opts, id) -> state / sleep(ms)(h/i 步)
  *
  * @param {LandOptions} opts
  * @param {any} deps
- * @returns {Promise<{exitCode:number, task:string, gates:Record<string, boolean|null>, committed:boolean, pushed:boolean, commitSha:string|null, reason:string|null}>}
+ * @returns {Promise<{exitCode:number, task:string, gates:Record<string, boolean|null>, committed:boolean, pushed:boolean, commitSha:string|null, nextTask:string|null, nextState:string|null, reason:string|null}>}
  */
 export async function runGate(opts, deps) {
   const outcome = newOutcome(opts);
@@ -357,6 +454,45 @@ export async function runGate(opts, deps) {
       await deps.push(handle);
       outcome.pushed = true;
       deps.log("push", "ok", "HEAD:main");
+    }
+
+    // ── h. 提交下一任务(仅 --next,且本轮 push **实际**成功)───────────────
+    // 判的是 pushed 事实而不是 opts.push:参数层已经拦过(--next ⇒ --push),但守门链的
+    // 不变量不能建立在「调用方没自相矛盾」上。本轮改动没进远端就派下一任务,下一轮会在
+    // 缺本轮成果的基线上重跑 —— 无人值守循环里这是最坏的一种静默失败。
+    if (opts.next) {
+      if (!outcome.pushed) {
+        deps.log("next", "skip", `push 未成功(committed=${outcome.committed} pushed=${outcome.pushed})— 绝不 POST 下一任务`);
+      } else {
+        deps.log("next", "start", `读 ${opts.next} → POST ${opts.api}/tasks`);
+        // spec 文件是任务意图的**权威副本**:脚本既不改写它(POST 发的是文件原文字节),
+        // 也不校验其业务内容 —— 平台是唯一裁判,形状错误由 4xx 大声失败(→ 退出码 1)。
+        const spec = await deps.readSpecFile(opts);
+        if (!spec.ok) {
+          // 五道门已判完,这条摘要该打(诚实记录下一任务确实没提交),但性质仍是环境/参数错误。
+          return refuse(EXIT.ENV, "next", `spec 文件不可用: ${spec.detail}`);
+        }
+        const nextId = await deps.postNext(opts, spec.text);
+        outcome.nextTask = nextId;
+        deps.log("next", "ok", `next_task=${nextId}`);
+      }
+    }
+
+    // ── i. 轮询下一任务到终态(仅 --wait,且 --next 确实提交成功)────────────
+    if (opts.wait) {
+      if (!outcome.nextTask) {
+        deps.log("wait", "skip", "next_task 为空 — 没提交成功就没有可等的对象");
+      } else {
+        deps.log("wait", "start", `每 ${Math.round(POLL_INTERVAL_MS / 1000)}s GET /tasks/${outcome.nextTask},上限 ${Math.round(POLL_TIMEOUT_MS / 60000)}min`);
+        const watch = await pollNextTask(opts, outcome.nextTask, deps);
+        if (!watch.ok) {
+          // 超时/连续问不到报的是**环境**(1)。下一任务自己的 REJECTED/BLOCKED 不占用任何
+          // 退出码含义:那是它那一轮 land 运行的裁决,不由本次运行代答。
+          return refuse(EXIT.RUNTIME, "wait", `${watch.reason}(共轮询 ${watch.polls} 次)`);
+        }
+        outcome.nextState = watch.state;
+        deps.log("wait", "ok", `next_state=${watch.state} polls=${watch.polls}`);
+      }
     }
     return outcome;
   } catch (err) {

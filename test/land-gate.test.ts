@@ -5,6 +5,10 @@ import {
   DEFAULT_TOKEN_ENV,
   EXIT,
   GATE_KEYS,
+  NEXT_TERMINAL_STATES,
+  POLL_INTERVAL_MS,
+  POLL_MAX_CONSECUTIVE_FAILURES,
+  POLL_MAX_ROUNDS,
   parseArgs,
   parseTestCount,
   planRun,
@@ -83,12 +87,22 @@ function evidenceResponse(over: Record<string, unknown> = {}): Record<string, un
 /** runGate 会经过的全部副作用名。GIT_WRITE_STEPS 是「真的动手」的那几个:任何一门不过都不该出现。 */
 const GIT_WRITE_STEPS = ["openWorktree", "applyCheck", "applyPatch", "install", "typecheck", "runTests", "commit", "push"];
 
+/** h/i 两段的材料:下一任务的 spec 原文 + 平台返回的新 id。 */
+const NEXT_SPEC_TEXT = '{"spec":{"prompt":"接着上一轮","repo_url":"https://github.com/octocat/Hello-World"},"budget":{"max_wall_seconds":1800}}';
+const NEXT_ID = "11111111-2222-3333-4444-555555555555";
+
 function fakeDeps(over: Record<string, unknown> = {}) {
   const calls: string[] = [];
   const messages: string[] = [];
+  const logs: string[] = [];
+  /** POST /tasks 实际发出的 body —— 用来钉「脚本不改写 spec 文件」。 */
+  const nextBodies: unknown[] = [];
+  /** 每次 GET /tasks/<id> 时看到的 state 序列由 over.fetchTaskState 决定,这里只记账。 */
+  const stateAsks: string[] = [];
+  const sleeps: number[] = [];
   const pass = { ok: true, detail: "" };
   const impl: Record<string, (...args: any[]) => unknown> = {
-    log: () => undefined,
+    log: (step: string, status: string, detail: string) => logs.push(`${step} ${status} ${detail}`),
     fetchTask: () => taskResponse(),
     fetchEvidence: () => evidenceResponse(),
     fetchPatch: () => PATCH_BYTES,
@@ -102,6 +116,11 @@ function fakeDeps(over: Record<string, unknown> = {}) {
     runTests: () => ({ ok: true, passed: 214, detail: "" }),
     commit: (_handle: unknown, message: string) => (messages.push(message), COMMIT_SHA),
     push: () => undefined,
+    readSpecFile: () => ({ ok: true, text: NEXT_SPEC_TEXT }),
+    postNext: (_opts: unknown, text: string) => (nextBodies.push(text), NEXT_ID),
+    // 默认第一问即终态:没显式关心轮询次数的用例不会在循环里空转 90 轮。
+    fetchTaskState: (_opts: unknown, id: string) => (stateAsks.push(id), "DONE"),
+    sleep: (ms: number) => sleeps.push(ms),
     ...over,
   };
   // 调用记录统一由注入层包一层:覆写某个 dep 时不会把「这次到底有没有被叫到」的账一起丢掉。
@@ -109,12 +128,22 @@ function fakeDeps(over: Record<string, unknown> = {}) {
   for (const [name, fn] of Object.entries(impl)) {
     deps[name] = name === "log" ? fn : async (...args: unknown[]) => (calls.push(name), await fn(...args));
   }
-  return { deps, calls, messages };
+  return { deps, calls, messages, logs, nextBodies, stateAsks, sleeps };
 }
 
 /** 绕过 parseArgs 直接造 opts,以便单列测「即使 opts 自相矛盾也不许 push」。 */
 function landOpts(over: Record<string, unknown> = {}) {
-  return { task: TASK, api: DEFAULT_API, tokenEnv: DEFAULT_TOKEN_ENV, execute: false, push: false, worktree: null, ...over };
+  return {
+    task: TASK,
+    api: DEFAULT_API,
+    tokenEnv: DEFAULT_TOKEN_ENV,
+    execute: false,
+    push: false,
+    worktree: null,
+    next: null,
+    wait: false,
+    ...over,
+  };
 }
 
 describe("退出码口径", () => {
@@ -165,6 +194,44 @@ describe("planRun:参数与环境门(守门开始之前)", () => {
     expect(plan.ok).toBe(true);
     if (plan.ok) expect(plan.opts.tokenEnv).toBe("LAND_TOKEN");
   });
+
+  it("--next 缺 --push → 参数错误 3(--next ⇒ --push ⇒ --execute 链式依赖)", () => {
+    for (const argv of [
+      ["--task", TASK, "--next", "backlog/next.json"],
+      ["--task", TASK, "--execute", "--next", "backlog/next.json"],
+    ]) {
+      const plan = planRun(argv, env);
+      expect(plan.ok, JSON.stringify(argv)).toBe(false);
+      if (!plan.ok) {
+        expect(plan.exitCode).toBe(3);
+        expect(plan.error).toContain("--next requires --push");
+        expect(plan.usage).toContain("[--next <file>] [--wait]");
+      }
+    }
+  });
+
+  it("--wait 缺 --next → 参数错误 3(即使 --push 已给)", () => {
+    const plan = planRun(["--task", TASK, "--execute", "--push", "--wait"], env);
+    expect(plan.ok).toBe(false);
+    if (!plan.ok) {
+      expect(plan.exitCode).toBe(3);
+      expect(plan.error).toContain("--wait requires --next");
+    }
+  });
+
+  it("整条链 --execute --push --next --wait 齐备才通过;等号形式同样吃", () => {
+    const plan = planRun(["--task", TASK, "--execute", "--push", "--next=backlog/next.json", "--wait"], env);
+    expect(plan.ok).toBe(true);
+    if (plan.ok) expect(plan.opts).toMatchObject({ next: "backlog/next.json", wait: true, push: true, execute: true });
+  });
+
+  it("--next 只给旗子不给取值 → 3(与其它取值选项同口径)", () => {
+    for (const argv of [["--task", TASK, "--execute", "--push", "--next"], ["--task", TASK, "--execute", "--push", "--next", "--wait"]]) {
+      const plan = planRun(argv, env);
+      expect(plan.ok, JSON.stringify(argv)).toBe(false);
+      if (!plan.ok) expect(plan.exitCode).toBe(3);
+    }
+  });
 });
 
 describe("parseArgs / resolveToken", () => {
@@ -179,6 +246,8 @@ describe("parseArgs / resolveToken", () => {
         execute: false,
         push: false,
         worktree: null,
+        next: null,
+        wait: false,
       });
     }
   });
@@ -336,8 +405,179 @@ describe("顺序不变量:commit 先于 push", () => {
   });
 });
 
+/**
+ * 迭代循环续命段(h 提交下一任务 / i 轮询到终态)。
+ *
+ * 这一节钉的是本期核心不变量:**未 push 成功绝不 POST 下一任务**。本轮改动没进远端就派下一
+ * 任务,下一轮会在缺本轮成果的基线上重跑 —— 对无人值守循环来说这比报错更糟,因为它会一直
+ * 「成功」。轮询侧钉的是两条放弃线:瞬态要容忍(一次 5xx 不该断循环),而连续问不到与超时
+ * 必须是退出码 1(报的是环境,不是对下一任务质量的裁决)。
+ */
+describe("迭代循环续命段:--next / --wait", () => {
+  /** 按脚本喂 state 序列并记轮数;数组耗尽后重复最后一个值(超时用例要它一直不动)。 */
+  function stateScript(states: (string | Error)[]) {
+    const asked: string[] = [];
+    const fn = async (_opts: unknown, id: string): Promise<string> => {
+      const value = asked.length < states.length ? states[asked.length] : states[states.length - 1];
+      asked.push(id);
+      if (value instanceof Error) throw value;
+      return value;
+    };
+    return { fn, asked };
+  }
+
+  it("① dry-run(未 commit 未 push)带 --next --wait → 绝不 POST、绝不轮询,两字段为 null", async () => {
+    const { deps, calls, logs, stateAsks } = fakeDeps();
+    const outcome = await runGate(landOpts({ next: "backlog/next.json", wait: true }), deps);
+
+    expect(outcome.exitCode).toBe(EXIT.OK);
+    expect(calls).not.toContain("postNext");
+    expect(calls).not.toContain("readSpecFile");
+    expect(calls).not.toContain("fetchTaskState");
+    expect(stateAsks).toEqual([]);
+    expect(outcome).toMatchObject({ nextTask: null, nextState: null });
+    // 跳过必须喊出来:静默跳过等于让读日志的人以为下一任务已经派出去了
+    expect(logs.some((line) => line.startsWith("next skip") && line.includes("绝不 POST 下一任务"))).toBe(true);
+    expect(logs.some((line) => line.startsWith("wait skip"))).toBe(true);
+  });
+
+  it("② 已 commit 但未 push(--execute 单传)→ 同样绝不 POST", async () => {
+    const { deps, calls } = fakeDeps();
+    const outcome = await runGate(landOpts({ execute: true, next: "backlog/next.json", wait: true }), deps);
+    expect(outcome.pushed).toBe(false);
+    expect(calls).toContain("commit");
+    expect(calls).not.toContain("push");
+    expect(calls).not.toContain("postNext");
+  });
+
+  it("③ push 抛错(远端拒绝)→ 下一任务不提交,故障原样上抛", async () => {
+    const { deps, calls } = fakeDeps({
+      push: async () => {
+        throw new Error("non-fast-forward");
+      },
+    });
+    await expect(
+      runGate(landOpts({ execute: true, push: true, next: "backlog/next.json", wait: true }), deps),
+    ).rejects.toThrow(/non-fast-forward/);
+    expect(calls).not.toContain("postNext");
+    expect(calls).toContain("closeWorktree");
+  });
+
+  it("④ --next 提交成功 + --wait 轮询至终态:三次问、两次 sleep、next_state 落地", async () => {
+    const script = stateScript(["RUNNING", "RUNNING", "DONE"]);
+    const { deps, calls, nextBodies, sleeps } = fakeDeps({ fetchTaskState: script.fn });
+    const outcome = await runGate(landOpts({ execute: true, push: true, next: "backlog/next.json", wait: true }), deps);
+
+    expect(outcome.exitCode).toBe(EXIT.OK);
+    expect(outcome.nextTask).toBe(NEXT_ID);
+    expect(outcome.nextState).toBe("DONE");
+    expect(script.asked).toEqual([NEXT_ID, NEXT_ID, NEXT_ID]);
+    expect(sleeps).toEqual([POLL_INTERVAL_MS, POLL_INTERVAL_MS]); // 间隔 60s,末轮不再 sleep
+    // POST 发的是文件**原文**:脚本不改写 spec 文件(它只是任务意图的权威副本)
+    expect(nextBodies).toEqual([NEXT_SPEC_TEXT]);
+    // 顺序:本轮 push 之后才 POST,POST 之后才开始问
+    expect(calls.indexOf("push")).toBeLessThan(calls.indexOf("postNext"));
+    expect(calls.indexOf("postNext")).toBeLessThan(calls.indexOf("fetchTaskState"));
+    expect(JSON.parse(summaryLine(outcome))).toMatchObject({ pushed: true, next_task: NEXT_ID, next_state: "DONE" });
+  });
+
+  it("REJECTED / BLOCKED 也是终态,且不改本次运行的退出码(那是下一任务自己那一轮的裁决)", async () => {
+    for (const [terminal, runs] of [["REJECTED", 2], ["BLOCKED", 4]] as const) {
+      const { deps } = fakeDeps({ fetchTaskState: stateScript([...Array(runs).fill("RUNNING"), terminal]).fn });
+      const outcome = await runGate(landOpts({ execute: true, push: true, next: "f.json", wait: true }), deps);
+      expect(outcome.nextState).toBe(terminal);
+      expect(outcome.exitCode).toBe(EXIT.OK);
+    }
+    expect(NEXT_TERMINAL_STATES).toEqual(["DONE", "REJECTED", "BLOCKED"]);
+  });
+
+  it("⑤ 瞬态容忍:连续 4 次问不到后恢复 → 不放弃,继续轮询到终态", async () => {
+    const script = stateScript([
+      new Error("HTTP 503"),
+      new Error("fetch failed"),
+      new Error("HTTP 502"),
+      new Error("socket hang up"),
+      "RUNNING",
+      "RUNNING",
+      "DONE",
+    ]);
+    const { deps, sleeps } = fakeDeps({ fetchTaskState: script.fn });
+    const outcome = await runGate(landOpts({ execute: true, push: true, next: "f.json", wait: true }), deps);
+
+    expect(outcome.exitCode).toBe(EXIT.OK);
+    expect(outcome.nextState).toBe("DONE");
+    expect(script.asked).toHaveLength(7);
+    // 抖动轮同样要 sleep:否则「连续失败」会变成对平台的猛击
+    expect(sleeps).toHaveLength(6);
+  });
+
+  it("⑥ 连续 5 次问不到 → 判为故障而非「还没好」,退出码 1 且 next_state 不落地", async () => {
+    const script = stateScript(Array(POLL_MAX_CONSECUTIVE_FAILURES).fill(new Error("HTTP 500")));
+    const { deps } = fakeDeps({ fetchTaskState: script.fn });
+    const outcome = await runGate(landOpts({ execute: true, push: true, next: "f.json", wait: true }), deps);
+
+    expect(outcome.exitCode).toBe(EXIT.RUNTIME);
+    expect(outcome.nextTask).toBe(NEXT_ID); // 下一任务确实提交了 —— 摘要不能撒谎说没提交
+    expect(outcome.nextState).toBe(null);
+    expect(script.asked).toHaveLength(POLL_MAX_CONSECUTIVE_FAILURES);
+    expect(outcome.reason).toContain("连续 5 次问不到");
+  });
+
+  it("⑦ 轮询超时(90 分钟预算用完仍非终态)→ 退出码 1,轮数正好用满预算", async () => {
+    const script = stateScript(["RUNNING"]);
+    const { deps, sleeps } = fakeDeps({ fetchTaskState: script.fn });
+    const outcome = await runGate(landOpts({ execute: true, push: true, next: "f.json", wait: true }), deps);
+
+    expect(outcome.exitCode).toBe(EXIT.RUNTIME);
+    expect(outcome.nextState).toBe(null);
+    expect(script.asked).toHaveLength(POLL_MAX_ROUNDS);
+    expect(sleeps).toHaveLength(POLL_MAX_ROUNDS - 1);
+    expect(POLL_MAX_ROUNDS * POLL_INTERVAL_MS).toBe(90 * 60_000); // 轮数 × 间隔 = 承诺的 90 分钟
+    expect(outcome.reason).toContain("超时");
+  });
+
+  it("⑧ spec 文件读不到/不是合法 JSON → 退出码 3、摘要照打(next_task=null)、不再 POST", async () => {
+    for (const read of [
+      { ok: false, detail: "read /repo/backlog/next.json failed: ENOENT" },
+      { ok: false, detail: "next.json is not valid JSON: Unexpected token" },
+    ]) {
+      const { deps, calls } = fakeDeps({ readSpecFile: async () => read });
+      const outcome = await runGate(landOpts({ execute: true, push: true, next: "f.json", wait: true }), deps);
+      const parsed = JSON.parse(summaryLine(outcome));
+
+      expect(outcome.exitCode, JSON.stringify(read)).toBe(EXIT.ENV);
+      expect(parsed.next_task).toBe(null);
+      expect(parsed.next_state).toBe(null);
+      expect(parsed.pushed).toBe(true); // 本轮确实落地了:这条摘要照打才有意义
+      expect(calls).not.toContain("postNext");
+      expect(calls).not.toContain("fetchTaskState");
+      expect(outcome.reason, JSON.stringify(read)).toContain("spec 文件不可用");
+    }
+  });
+
+  it("POST /tasks 失败(平台 4xx)与 get() 同口径上抛,不把 null 记成已提交、也不去等", async () => {
+    const { deps, calls } = fakeDeps({
+      postNext: async () => {
+        throw new Error("POST /tasks → HTTP 400 invalid_spec");
+      },
+    });
+    await expect(
+      runGate(landOpts({ execute: true, push: true, next: "f.json", wait: true }), deps),
+    ).rejects.toThrow(/invalid_spec/);
+    expect(calls).not.toContain("fetchTaskState"); // 没有 id 就没有可等的对象
+  });
+
+  it("不带 --next 时 h/i 两段完全不存在 —— 既有 a–g 行为零变化", async () => {
+    const { deps, calls } = fakeDeps();
+    const outcome = await runGate(landOpts({ execute: true, push: true }), deps);
+    expect(outcome.exitCode).toBe(EXIT.OK);
+    for (const step of ["readSpecFile", "postNext", "fetchTaskState", "sleep"]) expect(calls, step).not.toContain(step);
+    expect(calls.slice(calls.indexOf("runTests"))).toEqual(["runTests", "commit", "push", "closeWorktree"]);
+  });
+});
+
 describe("摘要形状与提交信息", () => {
-  it("stdout 摘要:键固定为 task/gate/committed/pushed/commit_sha,未执行到的门是 null", async () => {
+  it("stdout 摘要:键固定为 task/gate/committed/pushed/commit_sha/next_task/next_state,未执行到的门是 null", async () => {
     const { deps } = fakeDeps({ applyPatch: async () => ({ ok: false, detail: "nope" }) });
     const line = summaryLine(await runGate(landOpts(), deps));
     expect(line.trim().split("\n")).toHaveLength(1);
@@ -347,14 +587,18 @@ describe("摘要形状与提交信息", () => {
       committed: false,
       pushed: false,
       commit_sha: null,
+      next_task: null,
+      next_state: null,
     });
   });
 
-  it("dry-run 全绿的摘要:committed/pushed=false、commit_sha=null,gate 五键有序", async () => {
+  it("dry-run 全绿的摘要:committed/pushed=false、commit_sha=null、next_task/next_state=null,gate 五键有序", async () => {
     const { deps } = fakeDeps();
     const parsed = JSON.parse(summaryLine(await runGate(landOpts(), deps)));
-    expect(parsed).toMatchObject({ task: TASK, committed: false, pushed: false, commit_sha: null });
+    expect(parsed).toMatchObject({ task: TASK, committed: false, pushed: false, commit_sha: null, next_task: null, next_state: null });
     expect(Object.keys(parsed.gate)).toEqual([...GATE_KEYS]);
+    // 新增两字段必须在摘要里存在(即使为 null)—— 无人值守的读者靠键的存在判断「这一段跑过了」
+    expect(Object.keys(parsed)).toEqual(["task", "gate", "committed", "pushed", "commit_sha", "next_task", "next_state"]);
   });
 
   it("落地后的摘要带 commit_sha 且 committed/pushed 为真", async () => {
