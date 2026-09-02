@@ -9,6 +9,13 @@ import { assembleCandidate, candidateFileName } from "./audit/candidate";
 import { isValidSha } from "./exec/base";
 import type { AgentEventV1 } from "./obs/events";
 import { readObsAttemptEvents } from "./obs/journal";
+import {
+  OBS_SSE_TAIL_INTERVAL_MS,
+  createObsStreamSession,
+  obsStreamResponse,
+  parseObsLastEventId,
+  type ObsStreamDeps,
+} from "./obs/stream";
 
 export { AttemptWorkflow } from "./exec/workflow";
 export { ContainerProxy } from "@cloudflare/sandbox";
@@ -409,6 +416,55 @@ async function handleGetTaskEvents(url: URL, env: Env, taskId: string): Promise<
     next_cursor: more ? after + events.length : null,
     unreadable_attempts: unreadable,
   });
+}
+
+/**
+ * GET /tasks/:id/events/stream —— 在途事件的 **SSE 投影**(第④层可观测架构的上半)。
+ *
+ * 与 handleGetTaskEvents 是同一个位置游标的两种读法(拉/推),两者互为恢复源:
+ * 流断了就 `GET /events?after=<最后看到的 id>`,分页翻不动了就带 `Last-Event-ID` 重连。
+ * 这个互换成立**仅因为**帧 id 与 `after` 同口径(都 = 已读条数,扁平序 1-based 位置)——
+ * 口径的推导与三条不变量写在 src/obs/stream.ts 顶部;位置在两个端点里的分配规则刻意
+ * 同构(见 obsStreamStep 与 handleGetTaskEvents),不同构的两个实现迟早漂移。
+ *
+ * 为什么是独立端点而不是把 /events 改成「可选流式」:后者的 Content-Type 与响应形状会
+ * 随 query 变化,同一个 URL 两种契约最容易让客户端猜错;而 SSE 的连接生命周期(取消、
+ * 保活、终止帧)是一整套自己的约定,值得单独一个路径。
+ *
+ * 本函数只做装配,泵的逻辑(含 teardown 不变量)全在 obs/stream.ts 且可单测:
+ * - 校验 `Last-Event-ID`(缺省 0 = 从头回放),非法 → 400,风格与 `invalid_after` 一致;
+ * - 任务不存在 → 404(必须在建流**之前**判掉:流一旦 200 就没法再补状态码);
+ * - deps 的真实装配:`getSnapshot()` 短读 + `readObsAttemptEvents` + `setTimeout`。
+ *   连接**不挂进 TaskSession DO**(DO 是 blockConcurrencyWhile 重度单写者,长连接会
+ *   挤占权威写并发 —— 架构定稿的明确禁令);每轮那次 getSnapshot 是短读,不是禁令对象。
+ */
+async function handleGetTaskEventStream(req: Request, env: Env, taskId: string): Promise<Response> {
+  const last = parseObsLastEventId(req.headers.get("last-event-id"));
+  if (last.error !== null) {
+    return Response.json(
+      { error: { type: "invalid_last_event_id", detail: last.error } },
+      { status: 400 },
+    );
+  }
+  const snap = await TaskSession.from(env, taskId).getSnapshot();
+  if (!snap) return Response.json({ error: { type: "not_found" } }, { status: 404 });
+
+  const deps: ObsStreamDeps = {
+    readSnapshot: async (id) => {
+      const next = await TaskSession.from(env, id).getSnapshot();
+      return next ? { state: next.task.state, attemptIds: next.attempts.map((a) => a.id) } : null;
+    },
+    readAttemptEvents: (id, attemptId, skip) =>
+      readObsAttemptEvents(env.ARTIFACTS, id, attemptId, skip),
+    // cancel 必须真的清掉定时器:泵的另一半(settle 等待中的那一拍)在 stream.ts 里。
+    schedule: (ms, fire) => {
+      const timer = setTimeout(fire, ms);
+      return { cancel: () => clearTimeout(timer) };
+    },
+    tailIntervalMs: OBS_SSE_TAIL_INTERVAL_MS,
+    warn: (message) => console.warn(message),
+  };
+  return obsStreamResponse(taskId, deps, createObsStreamSession(last.value)).response;
 }
 
 async function handleApprove(req: Request, env: Env, taskId: string): Promise<Response> {
@@ -822,7 +878,7 @@ export default {
     }
 
     const taskMatch =
-      /^\/tasks\/([0-9a-f-]{36})(\/approve|\/result|\/evidence|\/candidate|\/events)?$/.exec(url.pathname);
+      /^\/tasks\/([0-9a-f-]{36})(\/approve|\/result|\/evidence|\/candidate|\/events\/stream|\/events)?$/.exec(url.pathname);
     if (taskMatch) {
       if (req.method === "GET" && !taskMatch[2]) return handleGetTask(env, taskMatch[1]);
       if (req.method === "GET" && taskMatch[2] === "/result") {
@@ -833,6 +889,9 @@ export default {
       }
       if (req.method === "GET" && taskMatch[2] === "/events") {
         return handleGetTaskEvents(url, env, taskMatch[1]);
+      }
+      if (req.method === "GET" && taskMatch[2] === "/events/stream") {
+        return handleGetTaskEventStream(req, env, taskMatch[1]);
       }
       if (req.method === "GET" && taskMatch[2] === "/candidate") {
         return handleGetCandidate(env, taskMatch[1], url.searchParams.get("format"));
