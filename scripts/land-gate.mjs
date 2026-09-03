@@ -252,7 +252,7 @@ export function summaryLine(outcome) {
 }
 
 /**
- * --wait 的轮询状态机(纯逻辑):每 POLL_INTERVAL_MS 问一次 `GET /tasks/<id>`,
+ * --wait 的轮询状态机(纯逻辑):每 POLL_INTERVAL_MS 问一次 `GET /api/tasks/<id>`,
  * 直到 state 进 NEXT_TERMINAL_STATES,或撞上两条放弃线之一 —— 超时(90 分钟预算用完)、
  * 连续 POLL_MAX_CONSECUTIVE_FAILURES 次问不到。
  *
@@ -286,7 +286,7 @@ export async function pollNextTask(opts, id, deps) {
           state: null,
           polls,
           failures,
-          reason: `连续 ${failures} 次问不到 /tasks/${id} —— 判为故障而非「还没好」,放弃`,
+          reason: `连续 ${failures} 次问不到 /api/tasks/${id} —— 判为故障而非「还没好」,放弃`,
         };
       }
     }
@@ -300,7 +300,7 @@ export async function pollNextTask(opts, id, deps) {
     state: null,
     polls,
     failures,
-    reason: `轮询 ${polls} 次(预算 ${Math.round(POLL_TIMEOUT_MS / 60000)} 分钟)后 /tasks/${id} 仍未进终态 —— 超时`,
+    reason: `轮询 ${polls} 次(预算 ${Math.round(POLL_TIMEOUT_MS / 60000)} 分钟)后 /api/tasks/${id} 仍未进终态 —— 超时`,
   };
 }
 
@@ -339,7 +339,7 @@ export async function runGate(opts, deps) {
     // ── a. 平台状态必须是 DONE ────────────────────────────────────────────
     // DONE 意味着状态机里已有一条 approve/accept_with_notes 决策记录(平台不变量),
     // 所以这里读 state 就足够,不需要也无法再独立读 reviewer verdict。
-    deps.log("state", "start", `GET ${opts.api}/tasks/${opts.task}`);
+    deps.log("state", "start", `GET ${opts.api}/api/tasks/${opts.task}`);
     const task = await deps.fetchTask(opts);
     const state = task && typeof task.state === "string" ? task.state : "";
     if (state !== "DONE") {
@@ -356,7 +356,7 @@ export async function runGate(opts, deps) {
     deps.log("state", "ok", `DONE base=${baseSha}`);
 
     // ── b. evidence.digest 与 task.current_evidence 交叉校验 ───────────────
-    deps.log("evidence", "start", `GET ${opts.api}/tasks/${opts.task}/evidence`);
+    deps.log("evidence", "start", `GET ${opts.api}/api/tasks/${opts.task}/evidence`);
     const evidence = await deps.fetchEvidence(opts);
     const pinned = typeof task.current_evidence?.writer_manifest_digest === "string"
       ? task.current_evidence.writer_manifest_digest
@@ -376,7 +376,7 @@ export async function runGate(opts, deps) {
     // ── c. 逐字节重算候选 patch 的 sha256 —— 防篡改硬门 ─────────────────────
     // 到这一步为止所有校验读的都是「平台说」。这里第一次拿到本体并自己算一遍:
     // 不一致就是下发链路被动过,后面所有门都不必再看一眼。
-    deps.log("candidate", "start", `GET ${opts.api}/tasks/${opts.task}/candidate?format=patch`);
+    deps.log("candidate", "start", `GET ${opts.api}/api/tasks/${opts.task}/candidate?format=patch`);
     const patchDigest = typeof evidence?.manifest?.patch?.digest === "string"
       ? evidence.manifest.patch.digest
       : null;
@@ -464,7 +464,7 @@ export async function runGate(opts, deps) {
       if (!outcome.pushed) {
         deps.log("next", "skip", `push 未成功(committed=${outcome.committed} pushed=${outcome.pushed})— 绝不 POST 下一任务`);
       } else {
-        deps.log("next", "start", `读 ${opts.next} → POST ${opts.api}/tasks`);
+        deps.log("next", "start", `读 ${opts.next} → POST ${opts.api}/api/tasks`);
         // spec 文件是任务意图的**权威副本**:脚本既不改写它(POST 发的是文件原文字节),
         // 也不校验其业务内容 —— 平台是唯一裁判,形状错误由 4xx 大声失败(→ 退出码 1)。
         const spec = await deps.readSpecFile(opts);
@@ -483,7 +483,7 @@ export async function runGate(opts, deps) {
       if (!outcome.nextTask) {
         deps.log("wait", "skip", "next_task 为空 — 没提交成功就没有可等的对象");
       } else {
-        deps.log("wait", "start", `每 ${Math.round(POLL_INTERVAL_MS / 1000)}s GET /tasks/${outcome.nextTask},上限 ${Math.round(POLL_TIMEOUT_MS / 60000)}min`);
+        deps.log("wait", "start", `每 ${Math.round(POLL_INTERVAL_MS / 1000)}s GET /api/tasks/${outcome.nextTask},上限 ${Math.round(POLL_TIMEOUT_MS / 60000)}min`);
         const watch = await pollNextTask(opts, outcome.nextTask, deps);
         if (!watch.ok) {
           // 超时/连续问不到报的是**环境**(1)。下一任务自己的 REJECTED/BLOCKED 不占用任何

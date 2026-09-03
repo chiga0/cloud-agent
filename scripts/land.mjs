@@ -119,22 +119,22 @@ const deps = {
   log,
 
   async fetchTask(opts) {
-    const res = await get(opts, `/tasks/${opts.task}`, "application/json");
+    const res = await get(opts, `/api/tasks/${opts.task}`, "application/json");
     const body = /** @type {{task?: Record<string, unknown>}} */ (await res.json());
     if (!body || typeof body.task !== "object" || body.task === null) {
-      throw new LandError(EXIT.RUNTIME, `GET /tasks/${opts.task} → 响应里没有 task 对象`);
+      throw new LandError(EXIT.RUNTIME, `GET /api/tasks/${opts.task} → 响应里没有 task 对象`);
     }
     return /** @type {any} */ (body.task);
   },
 
   async fetchEvidence(opts) {
-    const res = await get(opts, `/tasks/${opts.task}/evidence`, "application/json");
+    const res = await get(opts, `/api/tasks/${opts.task}/evidence`, "application/json");
     return await res.json();
   },
 
   async fetchPatch(opts) {
     // 裸 patch 文本,不是 JSON:按**响应体字节**算 sha256,不能经过任何解析/换行改写。
-    const res = await get(opts, `/tasks/${opts.task}/candidate?format=patch`, "text/plain");
+    const res = await get(opts, `/api/tasks/${opts.task}/candidate?format=patch`, "text/plain");
     return new Uint8Array(await res.arrayBuffer());
   },
 
@@ -235,24 +235,24 @@ const deps = {
   },
 
   async postNext(opts, text) {
-    const res = await request(opts, "POST", "/tasks", { body: text });
+    const res = await request(opts, "POST", "/api/tasks", { body: text });
     const body = /** @type {{task?: {id?: unknown}, task_id?: unknown}} */ (await res.json());
     // prod 实测(2026-09-02)返回 {"task":{"id":…,"state":"QUEUED"}};仓内 src/index.ts 的
     // 同一端点返回 {task_id:…}。两种都认,认不出即大声失败 —— 把 null 记进摘要会让
     // 一个 --wait 去等一个不存在的任务,那是最难查的一类挂法。
     const id = body?.task?.id ?? body?.task_id;
     if (typeof id !== "string" || id === "") {
-      throw new LandError(EXIT.RUNTIME, `POST /tasks → 响应里没有新任务 id(拿到的是 ${oneLine(JSON.stringify(body)).slice(0, 200)})`);
+      throw new LandError(EXIT.RUNTIME, `POST /api/tasks → 响应里没有新任务 id(拿到的是 ${oneLine(JSON.stringify(body)).slice(0, 200)})`);
     }
     return id;
   },
 
   async fetchTaskState(opts, id) {
-    const res = await get(opts, `/tasks/${id}`, "application/json");
+    const res = await get(opts, `/api/tasks/${id}`, "application/json");
     const body = /** @type {{task?: {state?: unknown}}} */ (await res.json());
     const state = body?.task?.state;
     if (typeof state !== "string" || state === "") {
-      throw new LandError(EXIT.RUNTIME, `GET /tasks/${id} → 响应里没有 task.state`);
+      throw new LandError(EXIT.RUNTIME, `GET /api/tasks/${id} → 响应里没有 task.state`);
     }
     return state;
   },
