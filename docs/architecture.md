@@ -660,20 +660,34 @@ that your Worker's code had hung
 
 附带两条同源约束:`taskId` 的路径正则与 `/tasks/:id/*` **同一条** `[0-9a-f-]{36}`(畸形 id 在路由层就 404,不进渲染),而 `renderLivePage` 仍然自己转义 —— 导出函数的契约不能建立在「调用方的正则恰好够用」上(下一棒放宽路由、或别处复用本函数,就得到一个静默的注入点)。转义按上下文分两套:HTML 文本节点走 `escapeHtmlText`,`<script>` 内的 JS 字面量走 `scriptJsonString`(`</script>` 会提前闭合标签,而 script 元素内容不是 HTML 文本节点,`&lt;` 在那里不还原 —— 用同一个函数糊过去就是 XSS);流里来的数据一律 `textContent` 落地,绝不 `innerHTML`,因为脱敏管的是「不该出现的值」,管不了「看起来像标记的字符」。
 
-### 已知的部署侧前提:EventSource 带不了 Authorization 头
+### 已知的部署侧前提:EventSource 带不了 Authorization 头(401 与断连**可区分**)
 
-必须写清,不能靠实现蒙过去:**`EventSource` 按规范不能携带自定义请求头**,而 §9.6 那条流只认 `Authorization: Bearer`。所以浏览器直连会得到 **401**,页面显示「连接中断,浏览器正在自动重连」。
+必须写清,不能靠实现蒙过去:**`EventSource` 按规范不能携带自定义请求头**,而 §9.6 那条流只认 `Authorization: Bearer`。所以 prod 无凭据直开 `/live` 会得到 **401**,页面停在「连接已关闭」那一支提示上。
 
-本期硬约束是不改 SSE 端点的任何行为(**含它的鉴权**),所以 UI 按规格直连并把这件事在页面提示、`src/index.ts` 与 §11 里写清。要真跑通,两条路都在别的棒里:
+**这个 401 是预期,不是回归**:全局那一条 `checkApiToken` 有意覆盖这个出口(理由见上一小节:要守的是任务存在性本身),而页面里不含任何凭据出口。**浏览器可达性由后续产品化会话方案统一解决,本期刻意不引入任何临时方案** —— 本地代理、登录壳、query token、cookie 会话、平台 ticket 铸发一律不做(方向已定,先搭临时桥等于给下一棒留要拆的桥);把 `WORKER_API_TOKEN` 塞进 URL 尤其不做(凭据会进浏览器历史、访问日志与 Referer,是拿观测面换一个泄露面)。本期硬约束同样包含**不改 SSE 端点的一个字节(含它的鉴权)**。
 
-1. 部署侧用注入凭据的反代理解 `/tasks/*`(不改代码,推荐先试这条);
-2. 给流端点加一次性短期 token(**不**把 `WORKER_API_TOKEN` 塞进 URL —— 那会让凭据进浏览器历史、访问日志与 Referer,是拿观测面换一个泄露面)。
+**本节此前写着「401 与网络断连在 EventSource 前端不可区分」—— 那句是错的,2026-09-03 浏览器实测后更正如下。** 同一 42s 窗口并排探两条流(readyState 探针):
 
-页面因此自带一条对照用的 curl 命令(同一条流、同一个凭据,能出事件就说明问题在浏览器侧的凭据出口),并在 `onerror` 时给出**可见**提示 —— 因为 401 与网络断连在 EventSource 前端不可区分。
+| 故障形状 | `onerror` 触发次数 | 最终 `readyState` | 浏览器是否重连 |
+|---|---|---|---|
+| **HTTP 401**(prod 直开的实际落点) | 仅 **1 次**(dt≈1ms) | **2 = CLOSED** | **永不重连** |
+| **网络失败(拒连)** | **每 ~3000ms 一次** | **0 = CONNECTING** | 每 3s 自动重连 |
+
+判据因此是 `es.readyState`,**不是**「error 事件出现了几次」—— 两种故障的**第一次**都恰好是 1 次,拿次数当判据必然把 401 误判成「正在重连」。
+
+页面据此分三条分支,规则与文案的唯一来源是 `src/obs/live.ts` 的 `LIVE_CONN_RULES`(同一张表既注入给浏览器侧的 `connView()`,又喂给纯函数 `liveConnectionView()`,后者由 `test/obs-live.test.ts` 逐分支钉住):
+
+- `readyState === 2`(**CLOSED**)→ 明说「**不会自动重连**」,点名**鉴权失败(401)**为最常见原因,并给出**当下就能用**的出路:带凭据的 API 客户端(`curl -N` 加 `authorization` 头)访问流端点;
+- `readyState === 0`(**CONNECTING**)→ 保留「自动重连(第 N 次)」,且**只在这条分支**上把 `reconnects` 计数 +1(否则计数行是第二处谎);
+- 其它取值(如 `1 = OPEN`)→ 兜底分支:「状态未知,既不承诺重连也不承诺已关闭」。为什么需要第三条:本期只实测过 401 与拒连两种形状,在任何其它取值上承诺「会重连」或「已关闭」都是在替没测过的东西说话。
+
+这就是本期修掉的**次生缺陷**:旧代码不分枝,401 下页面显示「连接中断,浏览器正在自动重连(第 1 次)」并**永久停在同一句**上 —— 它承诺了一件已证明不会发生的事,操作员会白等。断流与悬挂在页面上本来就长得一模一样(都不出事件),提示再说谎等于把唯一的线索也毁掉。
+
+页面因此自带一条对照用的 curl 命令(同一条流、同一个凭据,能出事件就说明问题在浏览器侧的凭据出口),`onerror` 的提示**可见且分枝**;空态说明块也同步更正:如实写明 EventSource 无法携带 Authorization 头、浏览器自己连不上 prod,不再暗示「再等等浏览器自己就连上了」。
 
 ### 单测钉不住什么(不要拿断言当「UI 已验证」)
 
-页面是字符串产物。`test/obs-live.test.ts` 钉得住:路由与 401/404、`text/html`、阈值数字与 `EventSource` 与流路径确实渲染出去、`OBS_EVENT_KINDS` 全部徽章、两套转义生效、**内联 JS 能通过编译**(`new Function(script)` 只编译不执行 —— 字符串产物里的语法错误是静默的,不钉这一条就会交付一个白屏页面)、**页面里那个 STREAM_URL 真能开出 200 的 `text/event-stream` 且首帧是 `{seq,kind,ts,payload}` 信封**(把「UI 连的是哪条流」从注释变成断言)、零外链(`not.toMatch(/https?:\/\//)`、无 `<link>`、无 `src=`)。
+页面是字符串产物。`test/obs-live.test.ts` 钉得住:路由与 401/404、`text/html`、阈值数字与 `EventSource` 与流路径确实渲染出去、`OBS_EVENT_KINDS` 全部徽章、两套转义生效、**内联 JS 能通过编译**(`new Function(script)` 只编译不执行 —— 字符串产物里的语法错误是静默的,不钉这一条就会交付一个白屏页面)、**页面里那个 STREAM_URL 真能开出 200 的 `text/event-stream` 且首帧是 `{seq,kind,ts,payload}` 信封**(把「UI 连的是哪条流」从注释变成断言)、零外链(`not.toMatch(/https?:\/\//)`、无 `<link>`、无 `src=`)、**`onerror` 的三条分支判定与文案**(`liveConnectionView(2/0/其它)` 各钉一条:CLOSED 必须出现「不会自动重连」且**不得**出现「正在自动重连」、CONNECTING 保留「(第 N 次)」且 `reconnecting === true`、兜底分支不承诺任何一边;外加「兜底规则必须排在表末」这条顺序不变量与 `0/1/2` 常数本身)。
 
 钉不住、**需浏览器实测**的:
 
@@ -682,7 +696,8 @@ that your Worker's code had hung
 | 计时器每秒自增;跨 90s/300s 时黄→红真的变 | 需要真实时钟与真实 CSS 计算 |
 | `end` 帧后「流已结束」并停止计时 | 需要真实 EventSource |
 | 一条坏帧只跳过那一条、坏帧计数累加、其余继续渲染 | 需要浏览器的事件派发 |
-| 401 时提示文案是否够让人明白是凭据问题 | 同上 |
+| 真实 401 下 `onerror` 是否真的把 `readyState` 停在 2、真实拒连是否停在 0(即上面的实测结论在新版本上仍成立) | 分支**规则**由单测钉住,但规则与浏览器实现的对应关系只能实测;探针在页面之外 |
+| CLOSED 那条长文案在顶部 pill 里的排版是否读得下去 | 渲染结果不是字符串断言能判的(本期只改文案,未做视觉重设计) |
 | 200 字符截断后排版、`result`/`error` 的视觉强调是否真的「跳出来」 | 渲染结果不是字符串断言能判的 |
 
 ### 这一层刻意不做什么
@@ -734,7 +749,7 @@ that your Worker's code had hung
 | GET | `/tasks/:id/events` | `Bearer $WORKER_API_TOKEN` | **在途事件流**(§9.5):直接读 R2 的 `obs/` 段文件 journal,**不经 D1 终态归档**,所以任务 `RUNNING` 期间就有内容。返回 `{ task_id, state, events: AgentEventV1[], count, total, next_cursor, unreadable_attempts }`;按 attempt 创建序、attempt 内按 `generation`/`seq` 升序。`?after=`(扁平流上已读的条数,缺省 0)、`?limit=`(缺省 500,上限 2000;非法 → 400 `invalid_after`/`invalid_limit`)。任务不存在 → 404;从未摄取过 → 空列表 |
 | GET | `/tasks/:id/events/stream` | `Bearer $WORKER_API_TOKEN` | **在途事件的 SSE 投影**(§9.6):`text/event-stream`,与 `/events` 同一份 journal、同一个位置游标的两种读法(推/拉),互为恢复源。帧 `id` = **该帧之后已读的条数**(扁平序 1-based 位置),与 `?after=` 完全同口径 → 断线带 `Last-Event-ID: <id>` 续传不重发也不漏读(header 缺省 = 0 = 从头回放;值为空或畸形 → 400 `invalid_last_event_id`)。每拍 3s 尾读增量,零新增发 `: ping` 注释帧;任务离开 `RUNNING` 且增量推完 → 一帧 `event: end`(id = 总条数,`data` 带 `unreadable_attempts`)后关流。某 attempt 的 journal 读不到只列进 `unreadable_attempts`,**不杀流**。任务不存在 → 404(在建流之前判定)。**只读投影:不写任何权威状态** |
 | GET | `/tasks/:id/attempts/:aid/transcript` | `Bearer $WORKER_API_TOKEN` | 流式透传 R2 里的 transcript 原文 |
-| GET | `/live/:taskId` | `Bearer $WORKER_API_TOKEN` | **Live UI**(§9.7):第④层投影的人眼端。返回 `text/html`(`cache-control: no-store`),CSS/JS **全内联**、零外部依赖、无构建步骤;页面自己用 `EventSource` 连上一条端点(浏览器按标准重连并回传 `Last-Event-ID`,与帧 `id` 同口径 → 续传不需要 UI 侧代码)。顶部 = 任务 id + state 徽章;主体 = 事件时间线按到达序渲染 `seq`/`kind` 徽章(清单派生自 `OBS_EVENT_KINDS`)/`ts`/`payload.text` 摘要(>200 字符截断并标注全文长度),`tool_use` 附 `tool_names`、`raw` 附 `raw_type`、`result`/`error` 视觉强调。**核心价值 = 停滞检测**:显著位置显示「最后事件 Ns 前」且每秒自增,>90s 黄、>300s 红(验收标本 C2-r6:单次模型调用悬挂 24 分钟,当时只有人工 tail 才发现)。收到 `event: end` → 显示「流已结束」并停止计时。前端防御性解析:坏帧跳过并计数,`onerror` 有可见提示。鉴权与 `/tasks/:id/events*` 同源(无凭据 401、任务不存在 404,均在生成 HTML 之前判定 —— 要守的是**任务存在性**本身,不只是 payload);`taskId` 按上下文分两套转义(HTML 文本节点 / JS 字面量)。**只被动显示:不做任何判定、不做任何处置**(Supervisor 是独立消费者层,下一期)。⚠️ `EventSource` 不能携带 `Authorization` 头 → 直连会得到 401 并显示重连提示;打通需部署侧注入凭据(见 §9.7「已知的部署侧前提」) |
+| GET | `/live/:taskId` | `Bearer $WORKER_API_TOKEN` | **Live UI**(§9.7):第④层投影的人眼端。返回 `text/html`(`cache-control: no-store`),CSS/JS **全内联**、零外部依赖、无构建步骤;页面自己用 `EventSource` 连上一条端点(浏览器按标准重连并回传 `Last-Event-ID`,与帧 `id` 同口径 → 续传不需要 UI 侧代码)。顶部 = 任务 id + state 徽章;主体 = 事件时间线按到达序渲染 `seq`/`kind` 徽章(清单派生自 `OBS_EVENT_KINDS`)/`ts`/`payload.text` 摘要(>200 字符截断并标注全文长度),`tool_use` 附 `tool_names`、`raw` 附 `raw_type`、`result`/`error` 视觉强调。**核心价值 = 停滞检测**:显著位置显示「最后事件 Ns 前」且每秒自增,>90s 黄、>300s 红(验收标本 C2-r6:单次模型调用悬挂 24 分钟,当时只有人工 tail 才发现)。收到 `event: end` → 显示「流已结束」并停止计时。前端防御性解析:坏帧跳过并计数,`onerror` 有**分枝**的可见提示(401 不承诺重连)。鉴权与 `/tasks/:id/events*` 同源(无凭据 401、任务不存在 404,均在生成 HTML 之前判定 —— 要守的是**任务存在性**本身,不只是 payload);`taskId` 按上下文分两套转义(HTML 文本节点 / JS 字面量)。**只被动显示:不做任何判定、不做任何处置**(Supervisor 是独立消费者层,下一期)。⚠️ `EventSource` 不能携带 `Authorization` 头 → prod 无凭据直开得到 **401(预期:全局鉴权门有意覆盖这个出口)**;而 401 与网络断连按 `es.readyState` **可区分**(401 → 2/CLOSED 且永不重连,拒连 → 0/CONNECTING 且每 3s 重连),页面据此分分支提示,401 下如实写「不会自动重连」并指向带凭据的 API 客户端。浏览器可达性等后续产品化会话方案统一解决,**本期不引入任何临时凭据出口**(详见 §9.7「已知的部署侧前提」) |
 
 ### 典型调用序列
 

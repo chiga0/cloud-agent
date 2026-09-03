@@ -28,10 +28,12 @@
  *    的任意自由文本(已在 ingress 过白名单脱敏,但脱敏不是转义:它管的是「不该出现的
  *    值」,管不了「看起来像标记的字符」)。
  *
- * ⚠️ **已知的部署侧前提(本期刻意不解决,见 index.ts 的 handleLivePage 注释)**:
+ * ⚠️ **已知的部署侧前提(可达性本期刻意不解决,见 index.ts 的 handleLivePage 注释)**:
  * `EventSource` 按规范**不能**携带 `Authorization` 头,而 §9.6 那条流的鉴权只认这个头。
- * 直连会得到 401。本模块不改 SSE 端点的任何行为(本期硬约束),因此页面按规格直连,
- * 并把这件事在页面提示与 docs 里写清,而不是假装它不存在。
+ * prod 无凭据直开本页面因此得到 **401**,而 401 下的 `onerror` 与网络断连**是可区分的**:
+ * 判据是 `es.readyState`(实测 401 → 2/CLOSED 且永不重连,拒连 → 0/CONNECTING 且每 3s 重连,
+ * 详见下方 `LIVE_CONN_RULES` 的注释)。本模块据此给两个分支两个文案 —— 页面对「会不会重连」
+ * 这句话必须说实话。本模块不改 SSE 端点的任何行为(本期硬约束),也不引入任何临时凭据出口。
  */
 
 import { OBS_EVENT_KINDS } from "./events";
@@ -89,8 +91,10 @@ export function escapeHtmlText(value: string): string {
  * `<`/`>`/`&`,所以还要显式换成 `\u003c` 形式;U+2028/U+2029 对 HTML 合法、对 JSON
  * 合法,历史上对 JS 源码的字面量非法(ES2019 起合法,但页面可能被老引擎打开),一并换掉
  * —— 与 obs/stream.ts 的 sseData() 同一个理由。
+ *
+ * 入参是 `unknown` 而非 `string`:页面向来注入两类值 —— 流路径是字符串,连接文案表是数组。
  */
-export function scriptJsonString(value: string): string {
+function scriptJsonValue(value: unknown): string {
   return JSON.stringify(value)
     .replace(/</g, "\\u003c")
     .replace(/>/g, "\\u003e")
@@ -99,8 +103,118 @@ export function scriptJsonString(value: string): string {
     .replace(/\u2029/g, "\\u2029");
 }
 
+export function scriptJsonString(value: string): string {
+  return scriptJsonValue(value);
+}
+
 /** kind 徽章清单:唯一权威仍是 OBS_EVENT_KINDS,这里只派生,不留第二份列表。 */
 const KINDS: readonly string[] = OBS_EVENT_KINDS;
+
+/**
+ * `EventSource.readyState` 的三个取值(WHATWG 冻结的常数)。
+ *
+ * 为什么在这里写数值而不是引用 `EventSource.CLOSED`:分支判定必须能在 vitest 里当纯函数跑,
+ * 那个环境没有 `EventSource` 全局;而 0/1/2 是规范常数、不是实现细节。浏览器侧比较的也是
+ * 数值,两侧共用下面那张表 —— 所以常数只有一份。
+ */
+export const ES_READY_STATE_CONNECTING = 0;
+export const ES_READY_STATE_OPEN = 1;
+export const ES_READY_STATE_CLOSED = 2;
+
+/** 连接状态提示的一条分支规则(是数据不是代码:页面里的 JS 与下面的纯函数读同一份)。 */
+export interface LiveConnRule {
+  /** 匹配的 `es.readyState`;`null` = 兜底分支(取值不在预期内) */
+  readonly readyState: number | null;
+  readonly prefix: string;
+  readonly suffix: string;
+  /** 中间插哪个计数器。`null` = 这条分支不承诺任何次数,因此不显示数字。 */
+  readonly counter: "reconnects" | "readyState" | null;
+  /**
+   * 这条分支是否意味着浏览器**真的**还会自己重连。只有 true 时 `reconnects` 才 +1、
+   * 计数行才显示「重连 N 次」—— 否则那个数字本身就成了第二处谎。
+   */
+  readonly reconnecting: boolean;
+}
+
+/**
+ * 分支表。**顺序即语义**:线性扫描 + 末尾兜底,所以 `readyState: null` 只能出现在最后
+ * (下面用模块级检查钉住 —— 写错顺序会在导入时就炸,而不是静默地把 401 文案派给断连)。
+ *
+ * 为什么 CLOSED 与 CONNECTING 必须是两个文案(2026-09-03 浏览器实测,同一 42s 窗口并排探
+ * 两条流,用 readyState 探针):
+ * - **HTTP 401** → `onerror` 只触发 **1 次**(dt≈1ms)、最终 `readyState === 2`(CLOSED)、
+ *   浏览器**永不重连**;
+ * - **网络失败(拒连)** → `onerror` **每 ~3000ms 一次**、最终 `readyState === 0`(CONNECTING)、
+ *   每 3s 真重连。
+ * 两个形状在旧页面上长得一模一样(都停在「正在自动重连(第 1 次)」),而 401 那条永远不会
+ * 再动 —— 沿用同一句文案等于向操作员承诺一件已证明不会发生的事,他会白等。
+ */
+export const LIVE_CONN_RULES: readonly LiveConnRule[] = [
+  {
+    readyState: ES_READY_STATE_CLOSED,
+    prefix:
+      "连接已关闭,浏览器不会自动重连 —— 最常见原因是鉴权失败(401):EventSource 无法携带 Authorization 头," +
+      "而这条流只认那个头。浏览器直开需要产品化会话方案(规划中,本期刻意不引入临时凭据出口);" +
+      "当前可用带凭据的 API 客户端访问流端点(curl -N 加 authorization 头,见下方说明)。",
+    suffix: "",
+    counter: null,
+    reconnecting: false,
+  },
+  {
+    readyState: ES_READY_STATE_CONNECTING,
+    prefix: "连接中断,浏览器正在自动重连(第 ",
+    suffix: " 次)",
+    counter: "reconnects",
+    reconnecting: true,
+  },
+  {
+    readyState: null,
+    prefix: "连接异常且状态未知(readyState=",
+    suffix: "):不承诺自动重连,也不承诺已关闭 —— 请用带凭据的 API 客户端对照。",
+    counter: "readyState",
+    reconnecting: false,
+  },
+];
+
+if (LIVE_CONN_RULES.some((r, i) => r.readyState === null && i !== LIVE_CONN_RULES.length - 1)) {
+  // 大声失败:兜底分支不在末尾时它会先命中并吃掉所有具体分支 —— 那是静默的文案错配。
+  throw new Error("live_conn_rules_fallback_not_last");
+}
+
+/** 一次 `onerror` 该显示什么、该不该算作一次重连。 */
+export interface LiveConnView {
+  readonly text: string;
+  readonly reconnecting: boolean;
+}
+
+function matchConnRule(readyState: number): LiveConnRule {
+  for (const rule of LIVE_CONN_RULES) {
+    if (rule.readyState === readyState) return rule;
+  }
+  return LIVE_CONN_RULES[LIVE_CONN_RULES.length - 1]!;
+}
+
+/**
+ * 纯函数:`onerror` 的分支判定。
+ *
+ * 判据为什么是 `readyState` 而不是「error 事件出现了几次」:实测的区分度全部在 readyState 上
+ * (401 → 2,拒连 → 0);事件次数只是它的副产物,而且 401 与断连的**第一次**都恰好是 1 次 ——
+ * 拿次数当判据必然把 401 误判成「正在重连」。
+ *
+ * 页面里的 JS 做同一件事(读同一张 LIVE_CONN_RULES)。之所以不把本函数 `toString()` 内联进
+ * 页面:部署经 esbuild 压缩,函数体不是可读的内联脚本,而这张表才是唯一权威 ——
+ * 文案与分支归属改一处即可生效于两侧。
+ */
+export function liveConnectionView(readyState: number, reconnects: number): LiveConnView {
+  const rule = matchConnRule(readyState);
+  const middle =
+    rule.counter === "reconnects"
+      ? String(reconnects)
+      : rule.counter === "readyState"
+        ? String(readyState)
+        : "";
+  return { text: rule.prefix + middle + rule.suffix, reconnecting: rule.reconnecting };
+}
 
 const CSS = `
   :root { color-scheme: dark; }
@@ -157,6 +271,7 @@ const JS = `
   var STALL_DANGER_SECONDS = __STALL_DANGER__;
   var TEXT_MAX = __TEXT_MAX__;
   var KINDS = __KINDS__;
+  var CONN_RULES = __CONN_RULES__;
 
   var stallEl = document.getElementById("stall");
   var connEl = document.getElementById("conn");
@@ -174,6 +289,24 @@ const JS = `
   var seen = 0;
   var bad = 0;
   var reconnects = 0;
+
+  // onerror 的分支判定。与 TS 侧的 liveConnectionView 读同一张 CONN_RULES(由服务端注入),
+  // 所以文案与「这条分支算不算真会重连」只有一处定义。
+  // ⚠️ 此处需浏览器实测:规则本身是 2026-09-03 实测出来的(401 → readyState 2 且不重连;
+  // 拒连 → readyState 0 且每 3s 一次),但「浏览器真的把这段 JS 跑出这个形状」单测钉不住。
+  function connView(readyState, reconnectCount) {
+    for (var i = 0; i < CONN_RULES.length; i++) {
+      // 兜底规则的 readyState 是 null,任何数值都不等于它,所以它天然只在末尾被走到
+      // (顺序由服务端那张表保证,写错会在导入时就抛 live_conn_rules_fallback_not_last)。
+      if (CONN_RULES[i].readyState === readyState || CONN_RULES[i].readyState === null) {
+        var r = CONN_RULES[i];
+        var middle = r.counter === "reconnects" ? String(reconnectCount)
+          : r.counter === "readyState" ? String(readyState) : "";
+        return { text: r.prefix + middle + r.suffix, reconnecting: r.reconnecting };
+      }
+    }
+    return { text: "连接状态未知", reconnecting: false };
+  }
 
   function kindClass(kind) {
     // 未知 kind 落中性徽章:CSS 类名只能来自白名单,不能让 payload 决定类名。
@@ -311,9 +444,11 @@ const JS = `
   tick();
   setInterval(tick, 1000);
 
-  // 选 SSE 的决定性理由之一:断线由浏览器按标准自动重连,并把最后看到的帧 id 原样
+  // 选 SSE 的决定性理由之一:**网络类**断线由浏览器按标准自动重连,并把最后看到的帧 id 原样
   // 回传成 Last-Event-ID。而帧 id 与 GET /events 的 ?after= 是同一个口径(§9.6 不变量 1),
   // 所以重连既不重发也不漏读 —— UI 这一侧一行续传代码都不用写。
+  // 但这条只覆盖 CONNECTING 那一支:HTTP 层的致命错(401)浏览器**根本不重连**(实测见下方
+  // onerror 的注释),所以「它会自己重连」不能当成整页的前提。
   var es = new EventSource(STREAM_URL);
 
   es.addEventListener("agent", function (e) { accept(e.data, "agent"); });
@@ -321,14 +456,24 @@ const JS = `
   // 匿名 data 帧(不带 event:)也收下,别默默丢。
   es.onmessage = function (e) { accept(e.data, "message"); };
 
-  // onerror 必须**可见**:EventSource 会自己重连,但用户不知道连接断过 —— 而断流
-  // 与悬挂在页面上会长得一模一样(都不出事件),不提示就是拿一个误导人的静止。
+  // onerror 必须**可见**,而且必须**按分支可见**。EventSource 的 error 事件有两种完全不同的
+  // 形状(2026-09-03 浏览器实测):HTTP 401 → 只触发一次、readyState 停在 2(CLOSED)、浏览器
+  // 永不重连;网络失败(拒连)→ 每 ~3000ms 一次、readyState 停在 0(CONNECTING)、真的自动重连。
+  // 旧代码不分枝地显示「正在自动重连(第 1 次)」并永久停在同一句上 —— 那是承诺一件不会发生的
+  // 事,操作员会白等。断流与悬挂在页面上本来就长得一样(都不出事件),提示再说谎就等于把
+  // 唯一的线索也毁掉。
+  // ⚠️ 此处需浏览器实测:分支判据与文案由单测钉住(liveConnectionView 的两条分支),
+  // 浏览器真实派发 error 事件时的形态只能实测。
   es.onerror = function () {
     if (ended) return;
-    reconnects += 1;
+    var view = connView(es.readyState, reconnects + 1);
+    // 只有浏览器真会重连时才把这一次记进「重连 N 次」—— 否则计数行是第二处谎。
+    if (view.reconnecting) {
+      reconnects += 1;
+      showCounts();
+    }
     connEl.className = "pill conn bad";
-    connEl.textContent = "连接中断,浏览器正在自动重连(第 " + reconnects + " 次)";
-    showCounts();
+    connEl.textContent = view.text;
   };
   es.onopen = function () {
     if (ended) return;
@@ -368,7 +513,9 @@ export function renderLivePage(taskId: string, opts: RenderLivePageOptions = {})
     .replace("__STALL_WARN__", () => String(LIVE_STALL_WARN_SECONDS))
     .replace("__STALL_DANGER__", () => String(LIVE_STALL_DANGER_SECONDS))
     .replace("__TEXT_MAX__", () => String(LIVE_TEXT_SUMMARY_MAX_CHARS))
-    .replace("__KINDS__", () => kindsLiteral);
+    .replace("__KINDS__", () => kindsLiteral)
+    // 连接文案表整体注入:页面与单测读同一份 LIVE_CONN_RULES,不留第二份文案。
+    .replace("__CONN_RULES__", () => scriptJsonValue(LIVE_CONN_RULES));
 
   return `<!DOCTYPE html>
 <html lang="zh">
@@ -396,7 +543,7 @@ export function renderLivePage(taskId: string, opts: RenderLivePageOptions = {})
     本页只被动显示,不做判定也不做任何处置 —— 它是投影,权威仍是 TaskSession DO(GET /tasks/${displayId})。
   </div>
   <ol id="tl"></ol>
-  <p class="empty" id="empty">还没有事件。若长时间空白:检查鉴权(EventSource 不能携带 Authorization 头,直连需要部署侧提供凭据出口),或用 <code>curl -N "$BASE/tasks/${displayId}/events/stream" -H "authorization: Bearer $TOKEN"</code> 对照。</p>
+  <p class="empty" id="empty">还没有事件。先说清一件事:<code>EventSource</code> 无法携带 Authorization 头,而这条流只认那个头 —— 所以<strong>浏览器自己连不上 prod</strong>:无凭据直开 <code>/live/…</code> 会得到 401,而 401 下浏览器根本不会重连(顶部提示会如实写「不会自动重连」)。浏览器可达性由后续产品化会话方案统一解决,本期刻意不引入临时凭据出口。当下要对照数据,请用带凭据的 API 客户端:<code>curl -N "$BASE/tasks/${displayId}/events/stream" -H "authorization: Bearer $TOKEN"</code>。</p>
 </main>
 <script>${script}</script>
 </body>

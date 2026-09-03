@@ -5,10 +5,15 @@ import { TaskSession } from "../src/control/session";
 import { ingestTranscript, type ObsTranscriptReader } from "../src/obs/ingest";
 import { OBS_EVENT_KINDS, type AgentEventV1 } from "../src/obs/events";
 import {
+  ES_READY_STATE_CLOSED,
+  ES_READY_STATE_CONNECTING,
+  ES_READY_STATE_OPEN,
+  LIVE_CONN_RULES,
   LIVE_STALL_DANGER_SECONDS,
   LIVE_STALL_WARN_SECONDS,
   LIVE_TEXT_SUMMARY_MAX_CHARS,
   escapeHtmlText,
+  liveConnectionView,
   liveStreamPath,
   renderLivePage,
   scriptJsonString,
@@ -208,5 +213,88 @@ describe("renderLivePage(纯函数)", () => {
       expect(page).toContain(`.k-${kind}`);
     }
     expect(OBS_EVENT_KINDS).toContain("tool_result");
+  });
+});
+
+/**
+ * onerror 的分支诚实性(2026-09-03 浏览器实测修的两条缺陷)。
+ *
+ * 实测事实(同一 42s 窗口并排探两条流,readyState 探针):
+ * - HTTP 401 → `onerror` 仅 1 次(dt≈1ms)、最终 `readyState === 2`(CLOSED)、**永不重连**;
+ * - 网络失败(拒连)→ `onerror` 每 ~3000ms 一次、最终 `readyState === 0`(CONNECTING)、每 3s 重连。
+ * 旧代码不分枝地显示「正在自动重连(第 1 次)」并永久停在同一句 —— 承诺了不会发生的重连。
+ *
+ * ⚠️ 这里钉得住的是**判定规则与文案**(纯函数 + 字符串产物),钉不住的是浏览器真的派发
+ * error 事件时页面是否长成这个样子 —— 那一条已在代码里标「需浏览器实测」。
+ */
+describe("onerror 分支判定 liveConnectionView(判据 = readyState)", () => {
+  it("readyState 2(CLOSED,401 的实测落点):明说不会重连 + 点名鉴权 + 给当下可用的出路", () => {
+    const v = liveConnectionView(ES_READY_STATE_CLOSED, 1);
+    expect(v.reconnecting).toBe(false);
+    expect(v.text).toContain("不会自动重连");
+    expect(v.text).toContain("401");
+    expect(v.text).toContain("鉴权");
+    expect(v.text).toContain("Authorization");
+    expect(v.text).toContain("curl");
+    // 旧缺陷本身:这句话在 401 下永远不会再变,所以一个字都不许出现
+    expect(v.text).not.toContain("正在自动重连");
+    expect(v.text).not.toMatch(/第 \d+ 次/);
+  });
+
+  it("readyState 0(CONNECTING,拒连的实测落点):保留「自动重连(第 N 次)」并计入重连数", () => {
+    const v = liveConnectionView(ES_READY_STATE_CONNECTING, 3);
+    expect(v.reconnecting).toBe(true);
+    expect(v.text).toContain("自动重连");
+    expect(v.text).toContain("(第 3 次)");
+    expect(v.text).not.toContain("不会自动重连");
+  });
+
+  it("readyState 其它取值(如 OPEN=1):既不承诺重连,也不谎称已关闭 —— 未知就说未知", () => {
+    const v = liveConnectionView(ES_READY_STATE_OPEN, 1);
+    expect(v.reconnecting).toBe(false);
+    expect(v.text).not.toContain("正在自动重连");
+    expect(v.text).not.toContain("不会自动重连");
+    expect(v.text).toContain("不承诺自动重连");
+    expect(v.text).toContain("readyState=1");
+  });
+
+  it("判据取值与规范同值:页面比较的就是这些数,写错等于分支全错", () => {
+    expect([ES_READY_STATE_CONNECTING, ES_READY_STATE_OPEN, ES_READY_STATE_CLOSED]).toEqual([0, 1, 2]);
+  });
+
+  it("兜底分支必须排在表末(线性扫描 + null 兜底,顺序错就是静默的文案错配)", () => {
+    const fallback = LIVE_CONN_RULES.findIndex((r) => r.readyState === null);
+    expect(fallback).toBe(LIVE_CONN_RULES.length - 1);
+    expect(LIVE_CONN_RULES.filter((r) => r.readyState === null)).toHaveLength(1);
+  });
+});
+
+describe("连接提示的页面侧(字符串产物)", () => {
+  it("文案表整体注入:页面不留第二份文案,判据真的读 es.readyState", () => {
+    const page = renderLivePage("0f6f1f2c-0000-4000-8000-000000000004", { state: "RUNNING" });
+    expect(page).toContain("var CONN_RULES = [");
+    // CLOSED 分支的 counter 是 null,整句 = prefix,所以能整句对上;CONNECTING 分支的数字
+    // 是运行时拼进去的(prefix + 次数 + suffix),页面里只有两半 —— 拼起来对不对只能实测。
+    expect(page).toContain(liveConnectionView(ES_READY_STATE_CLOSED, 1).text);
+    expect(page).toContain("浏览器正在自动重连(第 ");
+    expect(page).toContain("connView(es.readyState");
+    // 兜底规则的 null 必须原样落地:被改写成 0 会把所有分支派给「正在重连」
+    expect(page).toContain('"readyState":null');
+  });
+
+  it("「重连 N 次」只在浏览器真会重连时才自增(否则计数行是第二处谎)", () => {
+    const page = renderLivePage("0f6f1f2c-0000-4000-8000-000000000005");
+    expect(page).toMatch(/if \(view\.reconnecting\) \{\s*reconnects \+= 1;/);
+  });
+
+  it("空态提示同步:明说 EventSource 带不了 Authorization、浏览器自己连不上,旧措辞不得复现", () => {
+    const page = renderLivePage("0f6f1f2c-0000-4000-8000-000000000006");
+    const empty = /<p class="empty"[\s\S]*?<\/p>/.exec(page)?.[0] ?? "";
+    expect(empty).toContain("无法携带 Authorization 头");
+    expect(empty).toContain("浏览器自己连不上");
+    expect(empty).toContain("不会重连");
+    expect(empty).toContain("产品化会话方案");
+    // 旧措辞暗示「浏览器自己能连上,只是要部署侧给个凭据出口」—— 本期不做任何这类出口
+    expect(page).not.toContain("直连需要部署侧提供凭据出口");
   });
 });

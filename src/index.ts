@@ -480,13 +480,23 @@ async function handleGetTaskEventStream(req: Request, env: Env, taskId: string):
  * 404 才能有意义:不鉴权的话,「这个 taskId 存在」会无条件回答出来 —— 未鉴权的 404
  * 与鉴权后的 404 是两台机器。
  *
- * **已知前提(EventSource 带不了 Authorization 头,本期不解决)**:浏览器发起的
- * EventSource 无法携带自定义头,而 §9.6 那条流只认 `Authorization: Bearer`。所以直连
- * 会得到 401,页面会显示连接中断的提示。要让它真跑通,二选一都在别的棒里:部署侧用
- * 注入凭据的反代理解 `/tasks/*`,或者给流端点加一次性短期 token。**刻意不在本期做**
- * —— 本期硬约束是不改 SSE 端点的任何行为(含它的鉴权),而把 token 塞进 URL 会让凭据
- * 进浏览器历史、访问日志和 Referer,那是拿观测面换一个泄露面。
- * 此处需浏览器实测:401 与断连在 EventSource 前端不可区分,页面的提示是否够用只能实测。
+ * **已知前提(EventSource 带不了 Authorization 头;页面可达性本期刻意不解决)**:浏览器发起的
+ * EventSource 无法携带自定义头,而 §9.6 那条流只认 `Authorization: Bearer`。所以 prod 无凭据
+ * 直开 `/live` 得到 **401 是预期行为** —— 全局那一条鉴权门有意覆盖这个出口(要守的是任务存在性
+ * 本身,理由见上),这个页面泄露的从来不是密钥。
+ *
+ * 2026-09-03 的浏览器实测纠正了本注释旧版本的一句错话:**401 与网络断连在 EventSource 前端
+ * 是可区分的**,判据是 `es.readyState`。同一 42s 窗口并排探两条流:HTTP 401 → `onerror` 只触发
+ * **1 次**(dt≈1ms)、最终 `readyState === 2`(CLOSED)、浏览器**永不重连**;网络失败(拒连)→
+ * `onerror` **每 ~3000ms 一次**、最终 `readyState === 0`(CONNECTING)、每 3s 真重连。页面因此
+ * 给两个分支两个文案(规则与「为什么两个文案」见 `src/obs/live.ts` 的 `LIVE_CONN_RULES`),
+ * 不再在 401 下承诺一件不会发生的事 —— 旧版停在「正在自动重连(第 1 次)」永不更新,操作员白等。
+ *
+ * **浏览器可达性由后续产品化会话方案统一解决,本期刻意不引入任何临时方案**:本地代理、登录壳、
+ * query token、cookie 会话、平台 ticket 铸发一律不做(产品化方向已定,先做临时方案等于给下一棒
+ * 留要拆的桥)。本期硬约束还包含不改 SSE 端点的任何行为(含它的鉴权)。其中"把 token 塞进 URL"
+ * 尤其不能做:凭据会进浏览器历史、访问日志与 Referer,那是拿观测面换一个泄露面。
+ * 此处仍需浏览器实测的是文案在真实页面上的可读性;分支判据本身已实测并由单测钉住。
  */
 async function handleLivePage(env: Env, taskId: string): Promise<Response> {
   // 与 /tasks/:id/events* 完全同源的 404 语义,且必须在生成 HTML **之前**判掉:
