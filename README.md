@@ -82,8 +82,14 @@ git -C <你的仓库> checkout <candidate.base.sha> && git apply task-<task_id>-
 # 分类与处置一字未动:55 仍是 budget_abort 仍 BLOCKED 转人工,差量不升格成候选、不自动返工;
 # 零差量(被杀在只读阶段)不伪造空候选,只留一行可 grep 的 budget_abort_no_diff。详见 docs/architecture.md §7.2.1。
 #
-# BLOCKED 任务不再是零信息 —— 被击杀那轮的差量从事件链取(/candidate 只投影钉住的 current_evidence,
-# 而失败回报按 M7 门禁不钉证据):
+# BLOCKED 任务不再是零信息 —— 常规路径 = 抢救读面 GET /api/tasks/:id/rescue(c13,§7.2.2):
+# 失败回报按 M7 门禁从不钉证据,所以 /candidate 对 BLOCKED 恒 404;rescue 读的是该 attempt
+# 自己回报的 manifest。rescued:true / pinned:false、binding_digest 恒 null、safe_to_apply 恒 false ——
+# 它只是人工接续的起点,不进任何审批口径;非 BLOCKED → 404 not_blocked。
+curl -s localhost:8787/api/tasks/<task_id>/rescue -H "authorization: Bearer $TOKEN" \
+  | jq '{rescued, pinned, patch_complete, patch_incomplete_reason, safe_to_apply, base, patch}'
+curl -s -OJ "localhost:8787/api/tasks/<task_id>/rescue?format=patch" -H "authorization: Bearer $TOKEN"   # 下载差量(x-rescued:true / x-patch-complete:false;落地门对不完整差量直接拒绝)
+# 兜底(端点不可用时的取证法,§7.2.1):从事件链取 manifest 指针
 curl -s localhost:8787/api/tasks/<task_id> -H "authorization: Bearer $TOKEN" \
   | jq -r '.events[] | select(.kind=="evidence.manifest") | .payload' | jq -c '{attempt_id, manifest_key}'
 wrangler r2 object get "cloud-agent-evidence/<manifest_key>"   # 内含 patch.key + patch_complete + patch_incomplete_reason
