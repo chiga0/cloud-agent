@@ -381,7 +381,7 @@ describe("route_decision 事件真实入链可读", () => {
     expect(events.map((e) => e.seq)).toEqual([...new Set(events.map((e) => e.seq))].sort((x, y) => x - y));
     chainIntact(events);
 
-    // BLOCKED 即归档:D1 的读端(§13 的 /admin/events 数据源)必须取得到同一条
+    // BLOCKED 即归档:D1 的读端(§13 的 /api/admin/events 数据源)必须取得到同一条
     const rows = await env.DB.prepare(
       "SELECT seq, kind, payload, digest, prev_digest FROM events WHERE task_id = ? AND kind = 'route_decision' ORDER BY seq",
     )

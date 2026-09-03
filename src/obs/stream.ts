@@ -1,5 +1,5 @@
 /**
- * Observation 层的流式读路径:SSE 投影(`GET /tasks/:id/events/stream`)。
+ * Observation 层的流式读路径:SSE 投影(`GET /api/tasks/:id/events/stream`)。
  *
  * 定位(四层可观测架构第④层的**上半**):**投影,非权威**。这里一个字节都不写 ——
  * 权威仍是 TaskSession DO 的 hash chain,本模块只把 journal 里已落盘的事件按位置

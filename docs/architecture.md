@@ -15,7 +15,7 @@
 | **正确性** | 运行中任务状态以 TaskSession DO 为唯一权威(单写者串行 + 显式转换表),终态归档 D1;任何外部视图(Workflow 历史、日志、R2 文件)都不作为仲裁依据 |
 | **可恢复** | Worker 崩溃、Sandbox 容器替换、Workflow step 重试均不丢失进度;每个 step 都是幂等可重放 |
 | **可审计** | 模型 I/O、沙箱 transcript、人工决策一律进 hash chain + 内容寻址 R2,篡改可检测 |
-| **可交付** | 每个 repo 候选绑定一个精确基线 commit(writer 与 verifier 在同一个 SHA 上工作),经 `GET /tasks/:id/candidate` 原样取回并在本地重放(§13.13) |
+| **可交付** | 每个 repo 候选绑定一个精确基线 commit(writer 与 verifier 在同一个 SHA 上工作),经 `GET /api/tasks/:id/candidate` 原样取回并在本地重放(§13.13) |
 | **凭据合规** | token-plan key 直连百炼、不经代理转发、不落盘(telemetry 关闭)。M8 起可分裂为两把:沙箱拿**可撤销的低权 key** `SANDBOX_MODEL_API_KEY`,高权 `DASHSCOPE_API_KEY` 留在 Worker 侧给 reviewer——低权那把是可选配置,缺配即回落共用,降权要等它真的铸出来才成立(§13.14) |
 | **成本可控** | 每个 attempt 有 token / 时长 / turn 三重预算;时长与 turn 由 qwen-code 参数硬停,token 事后记账供归因与后续决策 |
 
@@ -32,12 +32,12 @@
 ## 2. 系统拓扑
 
 ```
- ┌──────────────┐   POST /tasks                  ┌──────────────────────────────┐
+ ┌──────────────┐   POST /api/tasks              ┌──────────────────────────────┐
  │  外部调用方   │ ─────────────────────────────►  │  Worker (src/index.ts)       │
  │  CLI / UI    │                                 │   ├─ 控制面 API              │
  └──────────────┘                                 │   └─ Queue consumer          │
        ▲                                          └──────┬───────────────────────┘
-       │ GET /tasks/:id  /result                         │
+       │ GET /api/tasks/:id  /result                         │
        │              ┌──────────────────────────────────┼──────────────────────┐
        │              │                                  ▼                      │
        │              │         ┌──────────────────────────────────────┐        │
@@ -137,7 +137,7 @@ Task 的一次执行尝试。同一 task 可能有多次 attempt(rework 再试;�
 人工(HITL)或系统对 attempt 的判定。`POST /approve` 只收 `approve|reject`;落库的决策值另有两个内部产物——`accept_with_notes`(reviewer 想返工但举证不成立,降级放行、意见留档)与 `none`(reviewer 抖动或没产出结论,挂 `awaiting_human`)。任何 decision 强制绑定组合证据 digest(§13.9)。
 
 ### Candidate
-repo 任务的产出物:一份基于**冻结基线**的 git patch + 它的证据血统。它**不是新的状态对象**,而是 `TaskRecord.base` + 钉住的 writer manifest + verifier 结论 + 最新 decision 的读模型投影(`src/audit/candidate.ts`),经 `GET /tasks/:id/candidate` 取回。`status` 与 `safe_to_apply` 的存在是为了让消费方一眼分清「独立验证过」和「只是产出过」——被 reject 或基线漂移的候选不能看起来像可直接提交。
+repo 任务的产出物:一份基于**冻结基线**的 git patch + 它的证据血统。它**不是新的状态对象**,而是 `TaskRecord.base` + 钉住的 writer manifest + verifier 结论 + 最新 decision 的读模型投影(`src/audit/candidate.ts`),经 `GET /api/tasks/:id/candidate` 取回。`status` 与 `safe_to_apply` 的存在是为了让消费方一眼分清「独立验证过」和「只是产出过」——被 reject 或基线漂移的候选不能看起来像可直接提交。
 
 ### Evidence
 R2 里的内容寻址对象 + 一次 attempt 的 manifest:
@@ -210,7 +210,7 @@ M1 起权威从「Worker 直接 CAS D1 行」迁到 `TaskSession` DO,早期的 `
 - DO 是**运行中**任务的权威;D1 只是终态归档 + 查询视图。Workflow 历史、日志、R2 文件都不是仲裁依据。
 - 每条写路径(含 `alarm`)整体包在 `ctx.blockConcurrencyWhile()` 里完成 读 → 变更 → 写,并发不产生交错;有并发测试证明(§13.11)。
 - `version` 是 fencing token:`setState` 每次 +1,并作为 `fencing_token` 写进 decisions 与归档。它现在的作用是**让外部读到的视图可判断新旧**,不再承担"调用方先读后写"的乐观锁义务——串行化已在 DO 内部完成。
-- 事件按 task 单调 `seq` 追加、分片(每片 100 条),链内单写者。~~同一 task 并发 `appendEvent` 会读到同一个 prev 从而分叉~~ 已修(0003 加 seq + DO 串行),`GET /admin/chain-check` 可持续复核(§13.1)。
+- 事件按 task 单调 `seq` 追加、分片(每片 100 条),链内单写者。~~同一 task 并发 `appendEvent` 会读到同一个 prev 从而分叉~~ 已修(0003 加 seq + DO 串行),`GET /api/admin/chain-check` 可持续复核(§13.1)。
 
 ### 6.1 一次 RPC 被杀不得损坏权威链(c11)
 
@@ -330,7 +330,7 @@ D1 里查不到,而且它会一直重试到成功或人工介入」。同一个 
 
 #### 6.2.3 chain-check 现在能证明什么 / 仍不能证明什么
 
-`GET /admin/chain-check` 补了三条口径(`src/index.ts:chainBreaks`)。破口标记格式统一为
+`GET /api/admin/chain-check` 补了三条口径(`src/index.ts:chainBreaks`)。破口标记格式统一为
 `<task_id>:<seq>:<kind>`,kind ∈ `prev` / `digest`(原有)、`seq` / `state`(新增)。
 
 **现在能证明**(仅针对 D1 里已有的行):
@@ -364,7 +364,7 @@ D1 里查不到,而且它会一直重试到成功或人工介入」。同一个 
 | `diverged` | 行数不等,或等长而尾 digest 不等 | 归档被改动/漏写,按 `brokenTasks` 逐条看 |
 
 DO 里没有这个任务 ⇒ `404 task_not_found`(三态说的是「两份记录的关系」,一份都没有时不猜结论);
-`task_id` 畸形 ⇒ `400 invalid_task_id`(与 `/admin/events` 同一条 `[0-9a-f-]{36}` 口径)。
+`task_id` 畸形 ⇒ `400 invalid_task_id`(与 `/api/admin/events` 同一条 `[0-9a-f-]{36}` 口径)。
 响应额外带 `do_events`/`d1_events`/`do_tail_digest`/`d1_tail_digest` 与同一套 `brokenTasks`,
 这样「差在哪」不需要再连一次库去猜。
 
@@ -424,15 +424,15 @@ Durable Workflow 把一次 attempt 切成若干独立幂等 step,崩溃后从最
 
 **为什么必须带标记**:一份 40 分钟的在途 diff 与一份自认完成的候选,如果在读端长得一模一样,人就会把前者当后者用。标记沿 `manifest → /candidate → 验证报告` 传递,判读口径统一为 **present ⇔ incomplete**(字段只在不完整时写入,缺省即完整 —— 这样历史 manifest 与新生成的在字节上同构,也不会给每次成功都加一个恒真字段去改 manifest digest):
 
-- `GET /tasks/:id/candidate`:视图新增 `patch_complete` / `patch_incomplete_reason`,`warnings` 点名「这是 writer 预算到期那一刻的在途差量,不是它自认完成的候选」,`safe_to_apply` 恒 `false`(即使后来被独立验证或被人工批准 —— 验证结论只对它自己的输入成立,而这份输入的完整性由执行面否定);
-- `GET /tasks/:id/candidate?format=patch`:响应多一个 `x-patch-complete` 头,`curl -OJ` 的人不看 body 也知道拿到的是什么;
+- `GET /api/tasks/:id/candidate`:视图新增 `patch_complete` / `patch_incomplete_reason`,`warnings` 点名「这是 writer 预算到期那一刻的在途差量,不是它自认完成的候选」,`safe_to_apply` 恒 `false`(即使后来被独立验证或被人工批准 —— 验证结论只对它自己的输入成立,而这份输入的完整性由执行面否定);
+- `GET /api/tasks/:id/candidate?format=patch`:响应多一个 `x-patch-complete` 头,`curl -OJ` 的人不看 body 也知道拿到的是什么;
 - verifier 的结构化报告在**被验 manifest 自报不完整时**带 `writer_patch_incomplete`(正常候选的报告字节不变):一个绿了的 apply+verify 不能把在途差量洗成合格候选。
 
 **BLOCKED 不再是零信息 —— 以及这一棒的边界**。exit 55 仍按 M9.5②(§13.21)分类为 `budget_abort` 并 BLOCKED 转人工:本棒**不**升格差量为正常候选、**不**新增自动返工、**不**改 `current_evidence` 的钉住规则。不改的理由:覆盖前一轮成功候选的指针是净损失信息,还会让审批的 `binding_digest` 中途换轨 —— 那是路由/审批语义的改动,不属于「只多导出一步」这一棒。人在 BLOCKED 这头取差量走事件链(失败回报同样落 `evidence.manifest` 事件,指针从来就在链上):
 
 ```
-GET /tasks/<id>            → events 里该 attempt 的 evidence.manifest 事件 → manifest_key
-   (已归档任务改读 GET /admin/events?task_id=<id> 的 canonical 原文)
+GET /api/tasks/<id>            → events 里该 attempt 的 evidence.manifest 事件 → manifest_key
+   (已归档任务改读 GET /api/admin/events?task_id=<id> 的 canonical 原文)
 cloud-agent-evidence/<manifest_key>     → patch.key + patch_complete + patch_incomplete_reason
 cloud-agent-artifacts/<patch.key>       → 击杀那一刻的差量正文(git apply 前先自己看一遍)
 ```
@@ -455,7 +455,7 @@ cloud-agent-artifacts/<patch.key>       → 击杀那一刻的差量正文(git a
 - 取最大值(最后一条 `type=result` 的 usage 是累计值)
 - 返回值写入 `attempts.tokens_used`(见 workflow extract step),供成本归因与后续 attempt 预算决策
 
-提取结果写回 `tasks.result_text`(`migrations/0002`),由 `GET /tasks/:id/result` 以 `text/plain` 直出。
+提取结果写回 `tasks.result_text`(`migrations/0002`),由 `GET /api/tasks/:id/result` 以 `text/plain` 直出。
 
 ---
 
@@ -550,7 +550,7 @@ interface EvidenceManifest {
 
 ### 为什么要单独一层
 
-C2-r6 那次单次模型调用悬挂 24 分钟(§13.19)。当时外圈能拿到的只有:`GET /tasks/:id` 的粗粒度 `state: RUNNING`,以及 `/admin/events`、`/admin/attempts` —— 后两者读的是 D1 **终态归档**,任务没跑完就是空列表。于是「悬挂 24 分钟」与「正常干活 24 分钟」在事件层面完全同形。
+C2-r6 那次单次模型调用悬挂 24 分钟(§13.19)。当时外圈能拿到的只有:`GET /api/tasks/:id` 的粗粒度 `state: RUNNING`,以及 `/api/admin/events`、`/api/admin/attempts` —— 后两者读的是 D1 **终态归档**,任务没跑完就是空列表。于是「悬挂 24 分钟」与「正常干活 24 分钟」在事件层面完全同形。
 
 **本层的验收基准一句话:同样的悬挂重现,外圈凭事件流 5 分钟内能发现。** 它是下一期无人值守监督(Supervisor)的数据底座 —— 本期只做数据路径,不做判定与分流。
 
@@ -567,7 +567,7 @@ src/obs/ingest.ts ──► 按 index.json 的字节偏移取新增完整行 ─
         ▼
 R2  obs/<task_id>/<attempt_id>/g<generation>-seg<N>.jsonl  +  index.json
         │
-        │  GET /tasks/:id/events?after=&limit=(直接读 R2,不经 D1)
+        │  GET /api/tasks/:id/events?after=&limit=(直接读 R2,不经 D1)
         ▼
 外圈 / 下一期 Supervisor
 ```
@@ -577,7 +577,7 @@ R2  obs/<task_id>/<attempt_id>/g<generation>-seg<N>.jsonl  +  index.json
 | t=0 | 模型调用挂住,qwen 不再往 stdout 写任何字节 | — |
 | t≤30s | `poll-i` 读到 0 条新增完整行 → **不落任何写**(空轮询不该刷 R2 小对象) | 事件流尾部不再增长 |
 | t=30s..N | 每拍如此:进程 `status=running`,事件数恒定 | `state=RUNNING` + `total` 不变 |
-| 任意时刻 | `GET /tasks/:id/events` | 最后一条事件的 `ts` 停在 t≈0,与当前时刻的差单调增大 |
+| 任意时刻 | `GET /api/tasks/:id/events` | 最后一条事件的 `ts` 停在 t≈0,与当前时刻的差单调增大 |
 
 判据是 **「最新事件 `ts` 距今 > 若干个 30s 轮询周期,而 attempt 仍 RUNNING」**,而不是「没有事件」(第一轮轮询之前本来就没有事件)。按 3 个周期(90s)无新增 + 外圈 60s 拉一次算,最坏 150s 出结论 —— 相对 5 分钟基准有 2 倍裕度。摄取与轮询在**同一个 step、同一拍**发生,所以「轮询节奏 == 摄取节奏」由构造保证:悬挂时不会混淆「进程还活着但观测层静默」与「观测层还在写但写的都是旧行」。
 
@@ -638,7 +638,7 @@ obs/<task_id>/<attempt_id>/index.json                   每 attempt 一份:段�
 
 ### 读端点
 
-`GET /tasks/:id/events?after=<n>&limit=<n>` —— 鉴权与其余任务端点走同一条 `checkApiToken` 路径。按 DO 里 `attempts` 的创建序拼接各 attempt 的事件,attempt 内按 `generation`、`seq` 升序。`after` 是**扁平有序流上已读的条数**(不是 `seq`:`seq` 只在 (attempt, generation) 内单调,跨 attempt 当游标会静默漏读),`limit` 缺省 500、上限 2000。任务不存在 → 404;从未摄取过事件 → 空列表而不是 404(第一轮轮询还没跑完是常态)。某 attempt 的 journal 读坏不会瞎掉整个任务:该 attempt 进 `unreadable_attempts`,其余照常返回,同时记 `obs_read_attempt_failed`。
+`GET /api/tasks/:id/events?after=<n>&limit=<n>` —— 鉴权与其余任务端点走同一条 `checkApiToken` 路径。按 DO 里 `attempts` 的创建序拼接各 attempt 的事件,attempt 内按 `generation`、`seq` 升序。`after` 是**扁平有序流上已读的条数**(不是 `seq`:`seq` 只在 (attempt, generation) 内单调,跨 attempt 当游标会静默漏读),`limit` 缺省 500、上限 2000。任务不存在 → 404;从未摄取过事件 → 空列表而不是 404(第一轮轮询还没跑完是常态)。某 attempt 的 journal 读坏不会瞎掉整个任务:该 attempt 进 `unreadable_attempts`,其余照常返回,同时记 `obs_read_attempt_failed`。
 
 ### 这一层刻意不做什么
 
@@ -669,15 +669,15 @@ obs/<task_id>/<attempt_id>/index.json                   每 attempt 一份:段�
 
 | 层 | 出口 | 数据源 | 权威? | 任务 `RUNNING` 期间有内容? |
 |---|---|---|---|---|
-| ① 控制面快照 | `GET /tasks/:id` | TaskSession DO `getSnapshot()` | **读的就是权威本人** | 有,但只有粗粒度 `state`(C2-r6 的病灶,§9.5) |
-| ② 归档读视图 | `GET /admin/events`、`/admin/attempts` | D1 终态归档 | 否(投影) | **无** —— 事件/attempt 随终态才归档 |
-| ③ 在途只读投影 | `GET /tasks/:id/events` | R2 `obs/` 段文件 journal | 否(投影) | 有,拉取式,单次 ≤2000 条 |
-| ④ 在途流式投影 | **`GET /tasks/:id/events/stream`** | 同一份 journal(经 ③ 的同一个读函数) | **否(投影)** | 有,推送式,每拍只读增量 |
+| ① 控制面快照 | `GET /api/tasks/:id` | TaskSession DO `getSnapshot()` | **读的就是权威本人** | 有,但只有粗粒度 `state`(C2-r6 的病灶,§9.5) |
+| ② 归档读视图 | `GET /api/admin/events`、`/api/admin/attempts` | D1 终态归档 | 否(投影) | **无** —— 事件/attempt 随终态才归档 |
+| ③ 在途只读投影 | `GET /api/tasks/:id/events` | R2 `obs/` 段文件 journal | 否(投影) | 有,拉取式,单次 ≤2000 条 |
+| ④ 在途流式投影 | **`GET /api/tasks/:id/events/stream`** | 同一份 journal(经 ③ 的同一个读函数) | **否(投影)** | 有,推送式,每拍只读增量 |
 | ④′ 同一投影的人眼端 | **`GET /live/:taskId`**(§9.7) | 由浏览器直连 ④ 那条流 | **否(投影的投影)** | 有,且额外给出「距最新事件多久」这个判据 |
 
 本节是第④层的**上半**;下半(Live UI / `/live`)已落地为 §9.7。
 
-**「投影」的操作性定义,不是修辞**:本端点不写任何权威状态 —— 不碰 TaskSession DO 的 storage、不追加事件、不动 D1、不新增 R2 对象。全部副作用 = 每轮一次 `getSnapshot()` 短读 + 若干次 journal 读。因此删掉这条端点不影响任何执行结论,也不使任何已归档证据变得不完整。反过来这也界定了它**不能**承担什么:帧里没有 `digest`/`prev_digest`,不构成可核验的审计序列;要举证仍以 hash chain(`GET /admin/events`)为准。
+**「投影」的操作性定义,不是修辞**:本端点不写任何权威状态 —— 不碰 TaskSession DO 的 storage、不追加事件、不动 D1、不新增 R2 对象。全部副作用 = 每轮一次 `getSnapshot()` 短读 + 若干次 journal 读。因此删掉这条端点不影响任何执行结论,也不使任何已归档证据变得不完整。反过来这也界定了它**不能**承担什么:帧里没有 `digest`/`prev_digest`,不构成可核验的审计序列;要举证仍以 hash chain(`GET /api/admin/events`)为准。
 
 为什么值得单独一条流,而不是用 ③ 分页全量重放:③ 单次上限 `MAX_OBS_LIMIT=2000`,而一次 40 分钟的长跑实测 **450+ 条且仍在涨** —— 靠「翻到最后一页看尾部」来回答「现在在干什么」,每轮都要付整段下载的代价(O(total))。流式投影把成本降到 O(new)。
 
@@ -739,7 +739,7 @@ data: {"v":1,"task_id":"…","events":450,"unreadable_attempts":[]}
 
 所以泵跑在**普通 worker handler 的 `ReadableStream`** 上,每轮只做一次**短读** `getSnapshot()`(只取 `state` 与 attempts 清单,`ObsStreamSnapshot` 刻意比快照窄:流不需要 events 与预算)。禁令的对象是「连接挂进 DO」,不是「周期性地短暂读一下 DO」—— 短读进出临界区的时长与一次普通 HTTP 请求同级。
 
-这条边界值得写明白,否则下一棒容易矫枉过正:把 attempt 清单缓存进 worker 内存以「减少 DO 读」,就会多出第二个清单口径,而扁平序的正确性恰恰依赖它与 `GET /tasks/:id` 同源。
+这条边界值得写明白,否则下一棒容易矫枉过正:把 attempt 清单缓存进 worker 内存以「减少 DO 读」,就会多出第二个清单口径,而扁平序的正确性恰恰依赖它与 `GET /api/tasks/:id` 同源。
 
 ### 尾读节奏、保活与终止条件
 
@@ -818,7 +818,7 @@ that your Worker's code had hung
 
 ### 定位:投影的投影
 
-`GET /live/:taskId` 返回一个 HTML 文档(`text/html`,CSS/JS 全内联),浏览器拿到后**自己**用 `EventSource` 连 `/tasks/<taskId>/events/stream`。服务端在这条路上只渲染骨架(任务 id、state 徽章初值、阈值常量、kind 清单),**不渲染任何事件内容**。
+`GET /live/:taskId` 返回一个 HTML 文档(`text/html`,CSS/JS 全内联),浏览器拿到后**自己**用 `EventSource` 连 `/api/tasks/<taskId>/events/stream`。服务端在这条路上只渲染骨架(任务 id、state 徽章初值、阈值常量、kind 清单),**不渲染任何事件内容**。
 
 所以它的权威性与 §9.6 同级、且只更低不更高:**只被动显示,不做任何判定,不做任何处置** —— 不 cancel 任务、不 approve、不标 `awaiting_human`、不预测终态、不写任何状态。它连「是不是挂了」都不下结论:它只把「离上一条事件过了 213 秒」这件事摆到人眼前,**判定由人做**。
 
@@ -850,11 +850,11 @@ that your Worker's code had hung
 
 ### 为什么一个「只是给人看」的页面也要鉴权
 
-`/live/:taskId` 走全局那一条 `checkApiToken`,与 `/tasks/:id/events*` 同源:无凭据 → **401**;任务不存在 → **404**(且必须在生成 HTML **之前**判掉 —— 200 + `text/html` 一旦发出就没法补状态码,同 §9.6 建流前判 404 的理由)。
+`/live/:taskId` 走全局那一条 `checkApiToken`,与 `/api/tasks/:id/events*` 同源:无凭据 → **401**;任务不存在 → **404**(且必须在生成 HTML **之前**判掉 —— 200 + `text/html` 一旦发出就没法补状态码,同 §9.6 建流前判 404 的理由)。
 
 理由不是「payload 里有敏感东西」:事件 payload 已在 ingress 过白名单脱敏(§9.5)。**要守的是任务存在性本身**,以及 `state`、事件条数、agent 正在动哪个仓库这类元信息 —— 对扫描器它们就是有价值的信号。更要紧的是:不鉴权的 404 会让「这个 taskId 存在」成为一个**无条件可问的问题**,那与鉴权后的 404 是两台机器。口径也必须是同一条:全仓凡带任务信息的出口都挂同一个 token 检查(§11 全表无例外),留一个例外就等于给下一个留位置。
 
-附带两条同源约束:`taskId` 的路径正则与 `/tasks/:id/*` **同一条** `[0-9a-f-]{36}`(畸形 id 在路由层就 404,不进渲染),而 `renderLivePage` 仍然自己转义 —— 导出函数的契约不能建立在「调用方的正则恰好够用」上(下一棒放宽路由、或别处复用本函数,就得到一个静默的注入点)。转义按上下文分两套:HTML 文本节点走 `escapeHtmlText`,`<script>` 内的 JS 字面量走 `scriptJsonString`(`</script>` 会提前闭合标签,而 script 元素内容不是 HTML 文本节点,`&lt;` 在那里不还原 —— 用同一个函数糊过去就是 XSS);流里来的数据一律 `textContent` 落地,绝不 `innerHTML`,因为脱敏管的是「不该出现的值」,管不了「看起来像标记的字符」。
+附带两条同源约束:`taskId` 的路径正则与 `/api/tasks/:id/*` **同一条** `[0-9a-f-]{36}`(畸形 id 在路由层就 404,不进渲染),而 `renderLivePage` 仍然自己转义 —— 导出函数的契约不能建立在「调用方的正则恰好够用」上(下一棒放宽路由、或别处复用本函数,就得到一个静默的注入点)。转义按上下文分两套:HTML 文本节点走 `escapeHtmlText`,`<script>` 内的 JS 字面量走 `scriptJsonString`(`</script>` 会提前闭合标签,而 script 元素内容不是 HTML 文本节点,`&lt;` 在那里不还原 —— 用同一个函数糊过去就是 XSS);流里来的数据一律 `textContent` 落地,绝不 `innerHTML`,因为脱敏管的是「不该出现的值」,管不了「看起来像标记的字符」。
 
 ### 已知的部署侧前提:EventSource 带不了 Authorization 头(401 与断连**可区分**)
 
@@ -900,7 +900,7 @@ that your Worker's code had hung
 
 - **不做任何判定与处置**:不告警、不 cancel、不 approve、不判 no-progress(那是 Supervisor,独立的消费者层,§9.8 —— 它读的正是本层的 journal)。
 - **不服务端渲染事件内容**:把首批事件烤进 HTML 会让页面的一次性快照与流的位置游标(帧 id)混成两套进度,而页面活着的时间远长于那次读的一致性窗口。
-- **不做多任务列表页**:跨任务枚举会纠缠 `/admin/tasks` 的「只读终态归档」口径(§11),是另一棒。
+- **不做多任务列表页**:跨任务枚举会纠缠 `/api/admin/tasks` 的「只读终态归档」口径(§11),是另一棒。
 - **不做事件过滤 / 搜索 / 暂停滚动 / 折叠**,不加任务操作按钮。
 - **不改 §9.6 的一个字节**:帧格式、鉴权、尾读节拍、终止条件全部只读复用。
 - **不引任何 npm 前端依赖、不加构建步骤**。
@@ -1039,7 +1039,7 @@ red。**Supervisor 是第②层的消费者,不是第①层的新读者。**
 | --- | --- |
 | 任何处置(cancel / kill / BLOCKED / 返工 / 改路由) | 观察与裁决分离;判据是启发式,误报面未量测 |
 | `enforce` 模式 | 同上 —— 先攒 shadow 样本,样本判据达成前不翻 |
-| 外部告警(邮件 / webhook / 钉钉) | finding 已经进权威链,`/admin/events` 与 §9.6 的流都是出口;再加一条出口只多一个凭据管理面 |
+| 外部告警(邮件 / webhook / 钉钉) | finding 已经进权威链,`/api/admin/events` 与 §9.6 的流都是出口;再加一条出口只多一个凭据管理面 |
 | 新建 DO / Cron Trigger / 独立 Worker | 寄生在既有 alarm 路径里才零协调成本,且**单写者天然保持** |
 | 改 §9.5 的 journal/ingest/事件协议、§9.6/§9.7 的 SSE 与 Live UI | 只读复用。特别是不能为了判据去给 journal 加未脱敏字段 |
 | 多任务聚合视图 | 本期逐 attempt 判据;跨任务全局视图留下一期(它要的是另一个读面,不是另一套判据) |
@@ -1049,7 +1049,7 @@ red。**Supervisor 是第②层的消费者,不是第①层的新读者。**
 
 ## 10. 人工审批(HITL)与证据绑定
 
-`POST /tasks/:id/approve` 接收 `{ decision: "approve" | "reject", actor?: string, attempt_id, evidence_digest }`,后两者**必填**(`submitDecision` 强制)。`accept_with_notes` 是控制面内部的降级决策(reject 举证不成立时由它写),**不由外部提交**;其它值 → 400 `invalid_decision`:
+`POST /api/tasks/:id/approve` 接收 `{ decision: "approve" | "reject", actor?: string, attempt_id, evidence_digest }`,后两者**必填**(`submitDecision` 强制)。`accept_with_notes` 是控制面内部的降级决策(reject 举证不成立时由它写),**不由外部提交**;其它值 → 400 `invalid_decision`:
 
 1. `evidence_required` — 缺 `attempt_id` 或 `evidence_digest` → 400
 2. `attempt_not_writer` — attempt 必须是 writer(裁决对象是候选本身)→ 409
@@ -1058,7 +1058,7 @@ red。**Supervisor 是第②层的消费者,不是第①层的新读者。**
 5. 通过校验 → `finishApproval`:记 `decision.recorded`(带组合 evidence_digest + fencing_token)→ CAS → DONE/REJECTED → `notifyWriter` 唤醒 writer workflow → 归档 D1(失败挂 30s alarm 重试)
 
 组合证据的组成(见 §13.9):
-- **人工审批**绑定 `[writer, verifier?]` — 调用方从 `GET /tasks/:id/evidence` 的 `binding_digest` 字段获取,先取证、后裁决
+- **人工审批**绑定 `[writer, verifier?]` — 调用方从 `GET /api/tasks/:id/evidence` 的 `binding_digest` 字段获取,先取证、后裁决
 - **自动裁决**(reviewer)由 DO 内部附裁决者自身证据:`[writer, verifier?, reviewer]`
 
 **绑定口径只有一个来源**(M7,见 §13.12):`task.current_evidence` 由控制面在 writer/verifier 回报时钉住,`computeBindingDigest`、`GET /evidence` 与 `submitDecision` 全部读它。此前 `/evidence` 取"任意角色最新 manifest"、审批按 created_at 启发式挑 verifier,两处口径不同会让一次**本来正确的**人工审批永久 409。`accept_with_notes` 同样落 DONE,advisory 内容留在事件链里,不产生返工。
@@ -1075,30 +1075,30 @@ red。**Supervisor 是第②层的消费者,不是第①层的新读者。**
 |---|---|---|---|
 | GET | `/` | 无 | 落地页(环境 + 端点列表) |
 | GET | `/healthz` | 无 | `{ ok: true, env }` |
-| POST | `/tasks` | `Bearer $WORKER_API_TOKEN` | 创建 task + 首个 attempt,启动 workflow;`spec.acceptance[]`(可选,≤8 项、每项 3–500 字符,非法 → 400 `invalid_acceptance`)、`spec.base_sha`(可选,全长度小写 hex;非法 → 400 `invalid_base_sha`,不落库、不起沙箱)、顶层 `review_evidence_mode`(可选 `shadow`/`enforce`,覆盖环境变量);返回 `{ task_id, attempt_id, workflow }` |
-| GET | `/tasks/:id` | `Bearer $WORKER_API_TOKEN` | 返回 `{ task, attempts[], events[] }`,含 `task.result_text` 与 `task.base` |
-| GET | `/tasks/:id/result` | `Bearer $WORKER_API_TOKEN` | `text/plain` 直出 agent 最终答案;尚未提取到返回 404 `{ error: "no_result_yet" }` |
-| POST | `/tasks/:id/approve` | `Bearer $WORKER_API_TOKEN` | 裁决 `approve`/`reject`,必填 `attempt_id` + `evidence_digest`(组合证据);缺 400 / 不匹配 409。`accept_with_notes` 是内部降级决策,不由外部提交 |
-| GET | `/tasks/:id/evidence` | `Bearer $WORKER_API_TOKEN` | 返回钉住的 writer manifest JSON + `binding_digest`(approve 应提交的组合证据) |
-| GET | `/tasks/:id/candidate` | `Bearer $WORKER_API_TOKEN` | 候选交付视图(只读投影,不新增状态对象):`{ status, verified, safe_to_apply, base, patch, writer_attempt_id, verifier_attempt_id, decision, binding_digest, warnings }`。`status ∈ unverified \| verified \| verification_failed \| approved \| rejected \| held_for_human`;`base` 是**这份候选自己的**基线(manifest 血统),与任务当前基线不一致时进 `warnings`。尚未有钉住候选 → 404 `no_candidate_yet` |
-| GET | `/tasks/:id/candidate?format=patch` | `Bearer $WORKER_API_TOKEN` | `text/plain` + `Content-Disposition: attachment; filename="task-<id>-<patch digest 前 12 位>.patch"`。**下发前重算补丁字节 sha256 并与 manifest 记录的 digest 比对**,不一致 → 500 `integrity_error`,不把未校验字节交出去。判定进响应头 `x-candidate-status` / `x-verified` / `x-safe-to-apply` / `x-base-sha`,只看头也不会把被否决的候选当成可提交成品 |
-| GET | `/tasks/:id/events` | `Bearer $WORKER_API_TOKEN` | **在途事件流**(§9.5):直接读 R2 的 `obs/` 段文件 journal,**不经 D1 终态归档**,所以任务 `RUNNING` 期间就有内容。返回 `{ task_id, state, events: AgentEventV1[], count, total, next_cursor, unreadable_attempts }`;按 attempt 创建序、attempt 内按 `generation`/`seq` 升序。`?after=`(扁平流上已读的条数,缺省 0)、`?limit=`(缺省 500,上限 2000;非法 → 400 `invalid_after`/`invalid_limit`)。任务不存在 → 404;从未摄取过 → 空列表 |
-| GET | `/tasks/:id/events/stream` | `Bearer $WORKER_API_TOKEN` | **在途事件的 SSE 投影**(§9.6):`text/event-stream`,与 `/events` 同一份 journal、同一个位置游标的两种读法(推/拉),互为恢复源。帧 `id` = **该帧之后已读的条数**(扁平序 1-based 位置),与 `?after=` 完全同口径 → 断线带 `Last-Event-ID: <id>` 续传不重发也不漏读(header 缺省 = 0 = 从头回放;值为空或畸形 → 400 `invalid_last_event_id`)。每拍 3s 尾读增量,零新增发 `: ping` 注释帧;任务离开 `RUNNING` 且增量推完 → 一帧 `event: end`(id = 总条数,`data` 带 `unreadable_attempts`)后关流。某 attempt 的 journal 读不到只列进 `unreadable_attempts`,**不杀流**。任务不存在 → 404(在建流之前判定)。**只读投影:不写任何权威状态** |
-| GET | `/tasks/:id/attempts/:aid/transcript` | `Bearer $WORKER_API_TOKEN` | 流式透传 R2 里的 transcript 原文 |
-| GET | `/live/:taskId` | `Bearer $WORKER_API_TOKEN` | **Live UI**(§9.7):第④层投影的人眼端。返回 `text/html`(`cache-control: no-store`),CSS/JS **全内联**、零外部依赖、无构建步骤;页面自己用 `EventSource` 连上一条端点(浏览器按标准重连并回传 `Last-Event-ID`,与帧 `id` 同口径 → 续传不需要 UI 侧代码)。顶部 = 任务 id + state 徽章;主体 = 事件时间线按到达序渲染 `seq`/`kind` 徽章(清单派生自 `OBS_EVENT_KINDS`)/`ts`/`payload.text` 摘要(>200 字符截断并标注全文长度),`tool_use` 附 `tool_names`、`raw` 附 `raw_type`、`result`/`error` 视觉强调。**核心价值 = 停滞检测**:显著位置显示「最后事件 Ns 前」且每秒自增,>90s 黄、>300s 红(验收标本 C2-r6:单次模型调用悬挂 24 分钟,当时只有人工 tail 才发现)。收到 `event: end` → 显示「流已结束」并停止计时。前端防御性解析:坏帧跳过并计数,`onerror` 有**分枝**的可见提示(401 不承诺重连)。鉴权与 `/tasks/:id/events*` 同源(无凭据 401、任务不存在 404,均在生成 HTML 之前判定 —— 要守的是**任务存在性**本身,不只是 payload);`taskId` 按上下文分两套转义(HTML 文本节点 / JS 字面量)。**只被动显示:不做任何判定、不做任何处置**(Supervisor 是独立消费者层,下一期)。⚠️ `EventSource` 不能携带 `Authorization` 头 → prod 无凭据直开得到 **401(预期:全局鉴权门有意覆盖这个出口)**;而 401 与网络断连按 `es.readyState` **可区分**(401 → 2/CLOSED 且永不重连,拒连 → 0/CONNECTING 且每 3s 重连),页面据此分分支提示,401 下如实写「不会自动重连」并指向带凭据的 API 客户端。浏览器可达性等后续产品化会话方案统一解决,**本期不引入任何临时凭据出口**(详见 §9.7「已知的部署侧前提」) |
+| POST | `/api/tasks` | `Bearer $WORKER_API_TOKEN` | 创建 task + 首个 attempt,启动 workflow;`spec.acceptance[]`(可选,≤8 项、每项 3–500 字符,非法 → 400 `invalid_acceptance`)、`spec.base_sha`(可选,全长度小写 hex;非法 → 400 `invalid_base_sha`,不落库、不起沙箱)、顶层 `review_evidence_mode`(可选 `shadow`/`enforce`,覆盖环境变量);返回 `{ task_id, attempt_id, workflow }` |
+| GET | `/api/tasks/:id` | `Bearer $WORKER_API_TOKEN` | 返回 `{ task, attempts[], events[] }`,含 `task.result_text` 与 `task.base` |
+| GET | `/api/tasks/:id/result` | `Bearer $WORKER_API_TOKEN` | `text/plain` 直出 agent 最终答案;尚未提取到返回 404 `{ error: "no_result_yet" }` |
+| POST | `/api/tasks/:id/approve` | `Bearer $WORKER_API_TOKEN` | 裁决 `approve`/`reject`,必填 `attempt_id` + `evidence_digest`(组合证据);缺 400 / 不匹配 409。`accept_with_notes` 是内部降级决策,不由外部提交 |
+| GET | `/api/tasks/:id/evidence` | `Bearer $WORKER_API_TOKEN` | 返回钉住的 writer manifest JSON + `binding_digest`(approve 应提交的组合证据) |
+| GET | `/api/tasks/:id/candidate` | `Bearer $WORKER_API_TOKEN` | 候选交付视图(只读投影,不新增状态对象):`{ status, verified, safe_to_apply, base, patch, writer_attempt_id, verifier_attempt_id, decision, binding_digest, warnings }`。`status ∈ unverified \| verified \| verification_failed \| approved \| rejected \| held_for_human`;`base` 是**这份候选自己的**基线(manifest 血统),与任务当前基线不一致时进 `warnings`。尚未有钉住候选 → 404 `no_candidate_yet` |
+| GET | `/api/tasks/:id/candidate?format=patch` | `Bearer $WORKER_API_TOKEN` | `text/plain` + `Content-Disposition: attachment; filename="task-<id>-<patch digest 前 12 位>.patch"`。**下发前重算补丁字节 sha256 并与 manifest 记录的 digest 比对**,不一致 → 500 `integrity_error`,不把未校验字节交出去。判定进响应头 `x-candidate-status` / `x-verified` / `x-safe-to-apply` / `x-base-sha`,只看头也不会把被否决的候选当成可提交成品 |
+| GET | `/api/tasks/:id/events` | `Bearer $WORKER_API_TOKEN` | **在途事件流**(§9.5):直接读 R2 的 `obs/` 段文件 journal,**不经 D1 终态归档**,所以任务 `RUNNING` 期间就有内容。返回 `{ task_id, state, events: AgentEventV1[], count, total, next_cursor, unreadable_attempts }`;按 attempt 创建序、attempt 内按 `generation`/`seq` 升序。`?after=`(扁平流上已读的条数,缺省 0)、`?limit=`(缺省 500,上限 2000;非法 → 400 `invalid_after`/`invalid_limit`)。任务不存在 → 404;从未摄取过 → 空列表 |
+| GET | `/api/tasks/:id/events/stream` | `Bearer $WORKER_API_TOKEN` | **在途事件的 SSE 投影**(§9.6):`text/event-stream`,与 `/events` 同一份 journal、同一个位置游标的两种读法(推/拉),互为恢复源。帧 `id` = **该帧之后已读的条数**(扁平序 1-based 位置),与 `?after=` 完全同口径 → 断线带 `Last-Event-ID: <id>` 续传不重发也不漏读(header 缺省 = 0 = 从头回放;值为空或畸形 → 400 `invalid_last_event_id`)。每拍 3s 尾读增量,零新增发 `: ping` 注释帧;任务离开 `RUNNING` 且增量推完 → 一帧 `event: end`(id = 总条数,`data` 带 `unreadable_attempts`)后关流。某 attempt 的 journal 读不到只列进 `unreadable_attempts`,**不杀流**。任务不存在 → 404(在建流之前判定)。**只读投影:不写任何权威状态** |
+| GET | `/api/tasks/:id/attempts/:aid/transcript` | `Bearer $WORKER_API_TOKEN` | 流式透传 R2 里的 transcript 原文 |
+| GET | `/live/:taskId` | `Bearer $WORKER_API_TOKEN` | **Live UI**(§9.7):第④层投影的人眼端。返回 `text/html`(`cache-control: no-store`),CSS/JS **全内联**、零外部依赖、无构建步骤;页面自己用 `EventSource` 连上一条端点(浏览器按标准重连并回传 `Last-Event-ID`,与帧 `id` 同口径 → 续传不需要 UI 侧代码)。顶部 = 任务 id + state 徽章;主体 = 事件时间线按到达序渲染 `seq`/`kind` 徽章(清单派生自 `OBS_EVENT_KINDS`)/`ts`/`payload.text` 摘要(>200 字符截断并标注全文长度),`tool_use` 附 `tool_names`、`raw` 附 `raw_type`、`result`/`error` 视觉强调。**核心价值 = 停滞检测**:显著位置显示「最后事件 Ns 前」且每秒自增,>90s 黄、>300s 红(验收标本 C2-r6:单次模型调用悬挂 24 分钟,当时只有人工 tail 才发现)。收到 `event: end` → 显示「流已结束」并停止计时。前端防御性解析:坏帧跳过并计数,`onerror` 有**分枝**的可见提示(401 不承诺重连)。鉴权与 `/api/tasks/:id/events*` 同源(无凭据 401、任务不存在 404,均在生成 HTML 之前判定 —— 要守的是**任务存在性**本身,不只是 payload);`taskId` 按上下文分两套转义(HTML 文本节点 / JS 字面量)。**只被动显示:不做任何判定、不做任何处置**(Supervisor 是独立消费者层,下一期)。⚠️ `EventSource` 不能携带 `Authorization` 头 → prod 无凭据直开得到 **401(预期:全局鉴权门有意覆盖这个出口)**;而 401 与网络断连按 `es.readyState` **可区分**(401 → 2/CLOSED 且永不重连,拒连 → 0/CONNECTING 且每 3s 重连),页面据此分分支提示,401 下如实写「不会自动重连」并指向带凭据的 API 客户端。浏览器可达性等后续产品化会话方案统一解决,**本期不引入任何临时凭据出口**(详见 §9.7「已知的部署侧前提」) |
 
 ### 典型调用序列
 
 ```bash
 # 1. 创建任务
-TASK=$(curl -sS -X POST $BASE/tasks \
+TASK=$(curl -sS -X POST $BASE/api/tasks \
   -H "Authorization: Bearer $WORKER_API_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"spec":{"prompt":"..."}}' | jq -r .task_id)
 
 # 2. 轮询状态
 while :; do
-  STATE=$(curl -sS $BASE/tasks/$TASK \
+  STATE=$(curl -sS $BASE/api/tasks/$TASK \
     -H "Authorization: Bearer $WORKER_API_TOKEN" | jq -r .task.state)
   echo "state=$STATE"
   [[ "$STATE" =~ ^(AWAITING_APPROVAL|DONE|REJECTED|BLOCKED)$ ]] && break
@@ -1106,24 +1106,24 @@ while :; do
 done
 
 # 3. 读 agent 答案
-curl -sS $BASE/tasks/$TASK/result \
+curl -sS $BASE/api/tasks/$TASK/result \
   -H "Authorization: Bearer $WORKER_API_TOKEN"
 
 # 4. 取证并审批(组合证据强制绑定)
-EV=$(curl -sS $BASE/tasks/$TASK/evidence \
+EV=$(curl -sS $BASE/api/tasks/$TASK/evidence \
   -H "Authorization: Bearer $WORKER_API_TOKEN")
 WRITER_ID=$(echo "$EV" | jq -r '.manifest.attempt_id')
 BINDING=$(echo "$EV" | jq -r .binding_digest)
-curl -sS -X POST $BASE/tasks/$TASK/approve \
+curl -sS -X POST $BASE/api/tasks/$TASK/approve \
   -H "Authorization: Bearer $WORKER_API_TOKEN" \
   -H "Content-Type: application/json" \
   -d "{\"decision\":\"approve\",\"actor\":\"human:me\",\"attempt_id\":\"$WRITER_ID\",\"evidence_digest\":\"$BINDING\"}"
 
 # 5. 取回候选并在它的基线上本地重放(这一步才是"补丁 Harness"的验收终点)
-CAND=$(curl -sS $BASE/tasks/$TASK/candidate -H "Authorization: Bearer $WORKER_API_TOKEN")
+CAND=$(curl -sS $BASE/api/tasks/$TASK/candidate -H "Authorization: Bearer $WORKER_API_TOKEN")
 echo "$CAND" | jq '{status, verified, safe_to_apply, base, warnings}'
 BASE_SHA=$(echo "$CAND" | jq -r .base.sha)
-curl -sS -OJ "$BASE/tasks/$TASK/candidate?format=patch" -H "Authorization: Bearer $WORKER_API_TOKEN"
+curl -sS -OJ "$BASE/api/tasks/$TASK/candidate?format=patch" -H "Authorization: Bearer $WORKER_API_TOKEN"
 git -C /path/to/repo fetch origin "$BASE_SHA" && git -C /path/to/repo checkout --detach "$BASE_SHA"
 git -C /path/to/repo apply task-$TASK-*.patch
 ```
@@ -1214,11 +1214,11 @@ qwen3.8-flash 带 reasoning,单次调用 tokens 可能很高(内部推理 + 工�
 - 给 attempt 加 `reasoning_tokens_used` 单独列,和 completion tokens 分开看
 - 在 landing page / API 提供"任务预估 token 区间"的经验值
 
-### 13.5 老任务缺 result_text — 已实现(`POST /admin/backfill-results`)
+### 13.5 老任务缺 result_text — 已实现(`POST /api/admin/backfill-results`)
 
 ~~`migrations/0002` 上线前产生的 task,`result_text` 全部为 null,需手动拉 R2 回填。~~
 
-已实现 `POST /admin/backfill-results`:扫 `result_text IS NULL` 的 task → 经 events 定位 writer attempt 的 manifest → 读 R2 transcript → extract 结果与 tokens → 回填 `tasks.result_text` / `attempts.tokens_used`。首次执行回填 10/10。注意:代理时代失败任务的 result_text 会保留 `[API Error: ...]` 文本(如实反映失败)。
+已实现 `POST /api/admin/backfill-results`:扫 `result_text IS NULL` 的 task → 经 events 定位 writer attempt 的 manifest → 读 R2 transcript → extract 结果与 tokens → 回填 `tasks.result_text` / `attempts.tokens_used`。首次执行回填 10/10。注意:代理时代失败任务的 result_text 会保留 `[API Error: ...]` 文本(如实反映失败)。
 
 ### 13.6 reviewer / verifier 角色 — 已闭环(含独立验证证据注入)
 
@@ -1238,9 +1238,9 @@ qwen3.8-flash 带 reasoning,单次调用 tokens 可能很高(内部推理 + 工�
 ~~manifest / transcript / verify 只能通过 `wrangler r2 object get` 拉。~~
 
 已实现(全部 `Bearer $WORKER_API_TOKEN`):
-- `GET /tasks/:id/evidence` — 最新 attempt 的 manifest JSON
-- `GET /tasks/:id/attempts/:aid/transcript` — 流式透传 R2 原文(text/plain)
-- `GET /tasks/:id/attempts/:aid/verify` — verify 输出(未配置时 404)
+- `GET /api/tasks/:id/evidence` — 最新 attempt 的 manifest JSON
+- `GET /api/tasks/:id/attempts/:aid/transcript` — 流式透传 R2 原文(text/plain)
+- `GET /api/tasks/:id/attempts/:aid/verify` — verify 输出(未配置时 404)
 
 ### 13.8 DO namespace 分裂 — 已解决(session_id 显式路由)
 
@@ -1258,7 +1258,7 @@ qwen3.8-flash 带 reasoning,单次调用 tokens 可能很高(内部推理 + 工�
 
 - **失败门禁**:writer `exit_code != 0` 一律不进审批流——预算内(`DEFAULT_MAX_ATTEMPTS`)自动 rework 下一个 writer;耗尽 → task **BLOCKED**(与质量否决的 REJECTED 区分)。事件链记 `writer.failed` / `writer.rework_scheduled`
 - **组合证据**:每个 decision 绑定因果链上全部证据的组合 digest `sha256(JSON.stringify([{role, attempt_id, digest}, ...]))`——人工审批 = `[writer, verifier?]`,自动裁决附裁决者 = `[writer, verifier?, reviewer]`。候选或验证记录任一字节变化,组合 digest 即变化
-- **强制校验**(`submitDecision`):`attempt_id`/`evidence_digest` 必填(400 `evidence_required`);必须指向 writer(409 `attempt_not_writer`);必须等于控制面重算的组合绑定(409 `evidence_mismatch`);仅 `AWAITING_APPROVAL` 可裁决(409 `task_not_awaiting`)。调用方从 `GET /tasks/:id/evidence` 的 `binding_digest` 取证
+- **强制校验**(`submitDecision`):`attempt_id`/`evidence_digest` 必填(400 `evidence_required`);必须指向 writer(409 `attempt_not_writer`);必须等于控制面重算的组合绑定(409 `evidence_mismatch`);仅 `AWAITING_APPROVAL` 可裁决(409 `task_not_awaiting`)。调用方从 `GET /api/tasks/:id/evidence` 的 `binding_digest` 取证
 - **验收**(2026-08-31 部署后):E2E 证实 decision 落库的 digest 与从 R2 manifest 独立重算的 `composite([w,v,r])` / `composite([w,r])` 逐字节一致;缺证据 400、伪证据 409、非 writer 409 全部拒绝
 
 ### 13.10 独立验证器 — 已实现(冻结候选 + 独立沙箱重放)
@@ -1317,7 +1317,7 @@ qwen3.8-flash 带 reasoning,单次调用 tokens 可能很高(内部推理 + 工�
 - **返工带证据 → 两轮闭环**:repo 任务要求 `hello.js` 导出 `GREETING`,而 `verify_command` 额外要求 `EXPECTED` 字段(prompt 里没有)。writer#1 成功 → verifier `exit_code=1` → `verify.rework_scheduled.instructions` 带上 stderr 原文 `hello.js must export a string field named EXPECTED` → writer#2 的 transcript 含返工段并直接推理到该字段 → verifier#2 通过 → reviewer approve → **DONE 共 2 轮**。reviewer 注意到"多了个 EXPECTED 字段"但按新契约只记为意见("…不构成验收标准"),没有为此再开一轮 —— 这正是要治的病。
 - **无进展熔断**:repo 任务 + `verify_command=false`(必败)。writer#2 与 writer#3 的候选 patch digest 相同(`6ca6458e…`)→ `gate.no_progress` 命中,**其后没有任何 verify/review 事件**(省掉一次沙箱 + 一次 LLM),`awaiting_human=true` 挂 `AWAITING_APPROVAL`;人工 `submitDecision` 200 收尾 → DONE + archived。
 - **绑定同源**:从 D1 归档事件取 writer manifest key → `wrangler r2 object get --remote` 下载 → `sha256(原文)` = `51af0193…` = `GET /evidence` 的 `digest`;`composite([{role:"writer",attempt_id,digest}])` = `c2582af6…` = `binding_digest`;用该值审批通过。负例:缺字段 400 `evidence_required`、伪 digest 409 `evidence_mismatch`、把 verifier 的 attempt_id 当 writer 提交 → 409 `attempt_not_current_writer`(M7 新增的血缘检查)。
-- **链完整性**:`GET /admin/chain-check` → `checked=37, broken=0`。
+- **链完整性**:`GET /api/admin/chain-check` → `checked=37, broken=0`。
 - **影子数据尚未成立**:归档事件里 `review.reject_assessed` **0 条** —— 本轮 reviewer 在所有任务上都 approve,没有 reject 样本可统计 `quote_not_found` 占比。因此 `REJECT_EVIDENCE_MODE` 保持 `shadow`,启用判据(≥5 个真实 reject 样本)未达成,不靠感觉切 `enforce`。
 
 **已知不覆盖**:
@@ -1366,10 +1366,10 @@ checkout --quiet --detach '<sha>'
 - **测试**：`npm test` → 98 passed，`tsc --noEmit` 干净。覆盖：注入样本（`a]b;c`、反引号、长度 39/41、大写）全拒、脚本内 SHA 只以 `'<sha>'` 出现且无 `repo_url`、三个 exit 码可达、**全部脚本函数体在子 shell 内且括号外无 `exit`**（§13.15 回归）、返工轮 `attempt.created.base_pin` 与首轮同 SHA、`exit 21 → BLOCKED`+`awaiting_human`+预算不变+不派 verifier/reviewer、`result_text` 为空串时 `base.failed` 仍留得下诊断、shadow 回落只记 `base.fallback`+`base.moved` 不误触熔断、verifier 血缘不匹配不采信、`reportArgsFrom` 键集与 `ReportArgs` 一致（防"静默丢字段"回归）、沙箱 key 配了独立值即不混用高权 key / 缺配回落且只在那一次告警、**`handleQueue` 投递路由 5 条**（`session_id` 命中正确实例 / 幽灵实例不误写 / `-1` 回报进 BLOCKED / 重投幂等 / 未知类型 ack，§13.16）。
 - **E1 无 repo 回归** ✅：天气任务闭环 DONE，证明基线代码路径与 key 注入没破坏非 repo writer。
 - **E2 pinned 基线端到端** ✅（`e38b8357` / `62edbba0`）：writer 与 verifier 报同一个 sha，`base.frozen` 落 `task.base`，manifest v2 带 `base`，返工轮继承同一 pin。
-- **E3 交付闭合（本轮验收终点）** ✅：`GET /tasks/:id/candidate?format=patch` 落盘 → 本地 `git checkout 762941318ee16e59dabbacb1b4049eec22f0d303 && git apply` 成功；下发的字节 sha256 与 `manifest.patch.digest` 一致（不一致会返回 `integrity_error` 而不是把未校验字节交出去）。
+- **E3 交付闭合（本轮验收终点）** ✅：`GET /api/tasks/:id/candidate?format=patch` 落盘 → 本地 `git checkout 762941318ee16e59dabbacb1b4049eec22f0d303 && git apply` 成功；下发的字节 sha256 与 `manifest.patch.digest` 一致（不一致会返回 `integrity_error` 而不是把未校验字节交出去）。
 - **E5 不可达基线** ✅ 双模式：`shadow` 下（`9d3a84d5` / `346a1dcb`）回落已解析的默认分支、记 `base.fallback`（detail 带 git 原文）并继续正常流程；`enforce` 下（`73fd11c4` / `c4ceadcf`）19 秒 BLOCKED，`attempts=1`、writer `tokens_used=0`（**基线不可用就不起模型**这一点被记账证实）、无 `verify.requested` / `review.requested`、预算不变。
 - **E6 注入** ✅：5 个样本（含 `a'*;touch /pwn`、39/41 位、大写）全 400 `invalid_base_sha`，D1 无记录、无沙箱。
-- **E7 向后兼容** ✅：M7 老任务 `8e8e408a` 重算 `binding_digest` = `c2582af6650e…`、writer manifest digest = `51af01939692…`，与 M7 归档**逐字节相同**（v1 manifest 无 `base`，读取路径容忍）；`GET /candidate` 对它返回 `base: null` + 警告「基线未固定：补丁只与抓取时刻的默认分支绑定，不保证能在其它 commit 上重放」，状态如实给 `held_for_human`、`safe_to_apply=false`，**没有**因为曾经 approve 就伪装成可提交。`GET /admin/chain-check` → `checked=47, broken=0`。
+- **E7 向后兼容** ✅：M7 老任务 `8e8e408a` 重算 `binding_digest` = `c2582af6650e…`、writer manifest digest = `51af01939692…`，与 M7 归档**逐字节相同**（v1 manifest 无 `base`，读取路径容忍）；`GET /candidate` 对它返回 `base: null` + 警告「基线未固定：补丁只与抓取时刻的默认分支绑定，不保证能在其它 commit 上重放」，状态如实给 `held_for_human`、`safe_to_apply=false`，**没有**因为曾经 approve 就伪装成可提交。`GET /api/admin/chain-check` → `checked=47, broken=0`。
 - **E8 凭据** ✅（结论是**否**）：容器内 `OPENAI_API_KEY` 的 sha256 前缀与 Worker 侧 `DASHSCOPE_API_KEY` 相同 —— prod 至今没有铸 `SANDBOX_MODEL_API_KEY`，所以本轮"降权"实际收益为零，与 §13.14 写明的条件一致。
 - **修好的静默丢字段（prod 才看得见）**：`base.failed.detail` 在单测里非空、在 prod 恒为 `""`。根因是 writer 的 `result_text` 恒为字符串：基线失败时 transcript 是纯文本、提取器返回 `null`、workflow 落成 `""`，而 DO 用 `args.result_text ?? attempt.error_tail` 取值——`??` 不认空串，回落永远不执行。现改为先 `trim()` 判空再回落，并给事件补 `manifest_key` 指针。上面 `73fd11c4`（修复前，detail 空）与 `c4ceadcf`（修复后，detail `exit_code=21` + `manifest_key`）是同一条路径的前后对照样本；沿 `manifest_key → manifest.transcript → 产物` 一跳即可取到真实诊断：`pinned base deadbeef… not materializable (exit 21): fatal: remote error: upload-pack: not our ref …`。
 - **enforce 判据未达成**：判据要求 ≥10 个 repo attempt 且 `base.fallback` 由我方脚本造成 0 次。现状 = 5 个 `base.frozen` + 2 个 `base.failed`（均为刻意注入的合成样本），`base.fallback` 2 次全部来自不存在的 `deadbeef…` pin，**我方脚本造成 0 次**这一半成立，样本量那一半不成立。因此 `BASE_PIN_MODE` 保持 `shadow`。测完 enforce 已立刻改回 shadow 再部署，prod 不留 enforce 状态。
@@ -1497,7 +1497,7 @@ checkout --quiet --detach '<sha>'
 
 **prod 取证状态(已闭环)**:`34a5302` 部署 `def22563`(23:31:30Z)后复验 C4(任务 `17a43e26`,r11)—— **全链绿、任务 DONE**:writer `c2c6198b` SUCCEEDED(16.8min、exit 0、6.95M tokens)、verifier `3da98ff2` SUCCEEDED(2.3min,`npm ci && tsc && npm test` → 208 测试通过)、reviewer `5e3dcd5e` approve(27s);`AttemptWorkflow.run - Ok`(非 Exception/Canceled),`longrun_started` 落日志,出站 enforce 正确(github + token-plan 放行,qwen 的 `rum.aliyuncs.com` ARMS 遥测被 allowedHosts 门拦下、无 `egress=forward`)。
 
-两个关键经验风险就此关闭:① **完成态进程记录可靠携带 exitCode** —— writer/verifier 两个 longrun 进程都以 exit 0 终态被正确读回(若缺失会被映成 `-1` → writer BLOCKED,SUCCEEDED 本身即反证);② **驱逐churn 被 durable-step 重放完全吸收** —— tail 拍到 **16 条 `getProcess - Canceled`(精确 30s 节奏 = poll 间隔)**,是 `step.sleep` 窗口里 isolate 被回收打断的轮询 RPC;但 `exec_step_failed=0`、`Exception=0`、`longrun_killed=0`,每个被取消的 poll step 都重放成功,qwen 在专用 `longrun` session 内不受 worker isolate 抖动影响跑完全程。**对照 r6/r7/r8:同样是驱逐,旧架构(单条长 exec)产出孤儿 + BLOCKED + 双烧 token,Fix C 产出零副作用的 DONE —— 这是「后台启动 + 短轮询」消灭驱逐孤儿这一类的最强实证。** 候选(`GET /admin/events`,+145 行 src/index.ts、27 新测试、base64url 不透明游标)经本地 apply→tsc→208 测试→3 条独立变异(canonical 改 parse→stringify 5 红 / ASC→DESC 10 红 / 游标 `>`→`>=` 4 红)后人工落地。
+两个关键经验风险就此关闭:① **完成态进程记录可靠携带 exitCode** —— writer/verifier 两个 longrun 进程都以 exit 0 终态被正确读回(若缺失会被映成 `-1` → writer BLOCKED,SUCCEEDED 本身即反证);② **驱逐churn 被 durable-step 重放完全吸收** —— tail 拍到 **16 条 `getProcess - Canceled`(精确 30s 节奏 = poll 间隔)**,是 `step.sleep` 窗口里 isolate 被回收打断的轮询 RPC;但 `exec_step_failed=0`、`Exception=0`、`longrun_killed=0`,每个被取消的 poll step 都重放成功,qwen 在专用 `longrun` session 内不受 worker isolate 抖动影响跑完全程。**对照 r6/r7/r8:同样是驱逐,旧架构(单条长 exec)产出孤儿 + BLOCKED + 双烧 token,Fix C 产出零副作用的 DONE —— 这是「后台启动 + 短轮询」消灭驱逐孤儿这一类的最强实证。** 候选(`GET /api/admin/events`,+145 行 src/index.ts、27 新测试、base64url 不透明游标)经本地 apply→tsc→208 测试→3 条独立变异(canonical 改 parse→stringify 5 红 / ASC→DESC 10 红 / 游标 `>`→`>=` 4 红)后人工落地。
 
 ---
 
@@ -1510,7 +1510,7 @@ checkout --quiet --detach '<sha>'
 - **提取层** `src/exec/extract.ts`:新增 `TranscriptUsage`(字段名与 qwen stream-json 原样对齐,缺的是 `undefined` 不是 0 —— 「上游没说」与「上游说没消耗」是两回事)、`extractUsageFromTranscript()`(在所有携带 usage 的事件里取**有效 total 最大**的一条:type=result 的 usage 是整轮累计值,单次调用不可能超过上下文窗口,故最大值必是累计值)与 `costWeightedFromUsage()`。`extractTokensFromTranscript()` 改为从前者派生,**既有语义逐分支等价**(无 usage → 0;缺 total → input+output;取最大不取最后),既有测试不改一条断言即过。
 - **台账层** `AttemptRecord` 与 D1 `attempts` 增加 `input_tokens` / `cache_read_tokens` / `output_tokens` / `cost_weighted_tokens` 四列(`migrations/0004`);`tokens_used` **仍是 raw total**,历史行与既有复盘口径不动。
 - **传递链**:workflow extract step → `REPORT_QUEUE` → DO 全程带 `usage`。reviewer 走 chat completions,把 `prompt_tokens`/`completion_tokens` 规范化成同一形状;上游不下发 `cache_read` → 留空,成本按全 fresh 保守计。verifier 的 transcript 是结构化 JSON 报告(无用量),如实记 null。
-- **读端**:`GET /admin/attempts` 透出四列(`proxy_token` / `idempotency_key` 仍绝不进投影);`GET /tasks/:id` 的 attempts 投影刻意不动 —— 审计面只改一处。
+- **读端**:`GET /api/admin/attempts` 透出四列(`proxy_token` / `idempotency_key` 仍绝不进投影);`GET /api/tasks/:id` 的 attempts 投影刻意不动 —— 审计面只改一处。
 
 **`cost_weighted_tokens` 的三档口径**(单位 = fresh input token 数):
 
@@ -1571,7 +1571,7 @@ r11 向量自检:`factor=1` → 6,949,711,**恰等于 raw total**(「缓存与 f
 
 与 §13.20 的分工要说清:那一节立的规矩是「不拿 token 台账执法」,本期没有违反 —— 执法依据是 qwen 自己下发的退出码,`max_model_tokens` 与四列台账在任何路由判据里都不出现。
 
-**事件形状**(进 DO 事件 hash chain —— append-only 权威层,不改链的 digest 语义;终态归档后 `/admin/events` 读得到):
+**事件形状**(进 DO 事件 hash chain —— append-only 权威层,不改链的 digest 语义;终态归档后 `/api/admin/events` 读得到):
 
 ```json
 {"kind": "route_decision", "payload": {
@@ -1622,21 +1622,21 @@ auth=(-H "authorization: Bearer $WORKER_API_TOKEN")
 
 ```bash
 # 任取一个刚跑到终态的 task_id(不要挑本节 ② 那个损坏标本)
-curl -s "$API/tasks/$TASK_ID" "${auth[@]}" | jq '{archived: .task.archived, state: .task.state, do_events: (.events|length)}'
-curl -s "$API/admin/chain-check?task_id=$TASK_ID" "${auth[@]}" | jq '{result, do_events, d1_events, broken, brokenTasks}'
+curl -s "$API/api/tasks/$TASK_ID" "${auth[@]}" | jq '{archived: .task.archived, state: .task.state, do_events: (.events|length)}'
+curl -s "$API/api/admin/chain-check?task_id=$TASK_ID" "${auth[@]}" | jq '{result, do_events, d1_events, broken, brokenTasks}'
 ```
 
 **通过标准**:第一个响应的 `archived` 为 `true`;第二个的 `result == "consistent"` 且
 `d1_events == do_events`(同一份 DO 快照的链长,两处必须同一个数)。`state` 已终态而
 `archived=false` ⇒ 归档没落地,立刻走 ③ 与 `archive_stalled`。
 
-顺带复核全局口径:`curl -s "$API/admin/chain-check" "${auth[@]}" | jq .broken` 应为 0,
+顺带复核全局口径:`curl -s "$API/api/admin/chain-check" "${auth[@]}" | jq .broken` 应为 0,
 且 `brokenTasks` 里没有 `:seq` / `:state` 后缀(§6.2.3 的两条新判据)。
 
 ### ② 损坏标本 `5489dc8a` 必须报 `not_archived`
 
 ```bash
-curl -s "$API/admin/chain-check?task_id=5489dc8a-… 全长度 id" "${auth[@]}" | jq '{result, do_events, d1_events}'
+curl -s "$API/api/admin/chain-check?task_id=5489dc8a-… 全长度 id" "${auth[@]}" | jq '{result, do_events, d1_events}'
 ```
 
 **通过标准**:`result == "not_archived"`,且 `d1_events == 0` 而 `do_events > 0`。
@@ -1645,7 +1645,7 @@ curl -s "$API/admin/chain-check?task_id=5489dc8a-… 全长度 id" "${auth[@]}" 
 的唯一实物证据,也是对账模式与 `archive_stalled` 这两条出口是否真的通的最小回归样本。
 若哪天它变成 `consistent`,说明有人手工补写过 D1 行 —— 那是数据篡改事件,按 §9 的证据口径处理。
 
-同时确认全局模式仍然看不见它:`GET /admin/chain-check` 的 `checked` 不包含这条任务。
+同时确认全局模式仍然看不见它:`GET /api/admin/chain-check` 的 `checked` 不包含这条任务。
 **这不是 bug,是本节存在的理由**(§6.2.3 第 1 条)。
 
 ### ③ 真实终态回报 RPC 的 wallTime 必须显著低于 30 秒

@@ -3,7 +3,7 @@
  *
  * 定位:与 §9.6 的 SSE 投影一样,这是**投影,非权威**,而且比它更下游一层 —— 本模块
  * 只生成一个 HTML 字符串,一个字节都不写、不做任何判定、不做任何处置(那是 Supervisor
- * 那一层的事)。数据的唯一来源仍是 `GET /tasks/:id/events/stream`。
+ * 那一层的事)。数据的唯一来源仍是 `GET /api/tasks/:id/events/stream`。
  *
  * 为什么需要单独一个「给人看」的页面,而不是让运维 `curl -N` 那条流:
  * 悬挂的真实标本 C2-r6 是**单次模型调用挂了 24 分钟**,当时靠人工 tail 才发现。人眼
@@ -53,15 +53,22 @@ export const LIVE_STALL_DANGER_SECONDS = 300;
 /**
  * 摘要显示上限(字符)。journal 里 payload.text 最长 2048(OBS_TEXT_MAX_CHARS),
  * 一屏时间线放不下也不需要放下:这里只做**显示**截断并标注原始长度,数据本身不动 ——
- * 要看全文有 `/tasks/:id/events`(以及 transcript 端点)。
+ * 要看全文有 `/api/tasks/:id/events`(以及 transcript 端点)。
  */
 export const LIVE_TEXT_SUMMARY_MAX_CHARS = 200;
 
-/** 页面唯一的数据源。与 SSE 端点同一条路径、同一个位置游标口径(帧 id → Last-Event-ID)。 */
+/**
+ * 页面唯一的数据源。与 SSE 端点同一条路径、同一个位置游标口径(帧 id → Last-Event-ID)。
+ *
+ * 路径必须挂 /api/*:API 在 /api/* 是因为 SPA fallback 会吞掉一切未匹配路径(w2 起
+ * 未匹配的 GET 返回 index.html 而不是 404),而这个注入点是页面唯一的流地址出口 ——
+ * 这里漏改在 w2 之前**完全不可见**(路径仍自洽),之后才表现为「Live 页拿不到流但
+ * HTTP 200」。由 test/api-prefix.test.ts 钉住产出以 /api/ 开头。
+ */
 export function liveStreamPath(taskId: string): string {
   // 路径段按 URL 编码:taskId 合法形状是 UUID(编码后逐字不变),但本函数是导出的
   // 纯函数,不能假设调用方只喂合法值 —— 未编码的 `?`/`#`/`/` 会把流 URL 改道。
-  return `/tasks/${encodeURIComponent(taskId)}/events/stream`;
+  return `/api/tasks/${encodeURIComponent(taskId)}/events/stream`;
 }
 
 /**
@@ -318,7 +325,7 @@ const JS = `
     if (flat.length <= TEXT_MAX) return { shown: flat, note: "" };
     return {
       shown: flat.slice(0, TEXT_MAX),
-      note: "… 已截断(全文 " + flat.length + " 字符,看 /tasks/id/events)",
+      note: "… 已截断(全文 " + flat.length + " 字符,看 /api/tasks/id/events)",
     };
   }
 
@@ -390,8 +397,8 @@ const JS = `
     connEl.className = "pill conn good";
     connEl.textContent = "流已结束";
     // end 帧只证明「已非 RUNNING」(泵的唯一终止条件),给不出具体终态:
-    // 权威终态要读 GET /tasks/:id。这里如实标注,不猜。
-    stateEl.textContent = "state: 非 RUNNING(精确值见 GET /tasks/:id)";
+    // 权威终态要读 GET /api/tasks/:id。这里如实标注,不猜。
+    stateEl.textContent = "state: 非 RUNNING(精确值见 GET /api/tasks/:id)";
   }
 
   function accept(raw, kindOfFrame) {
@@ -485,7 +492,7 @@ const JS = `
 
 export interface RenderLivePageOptions {
   /**
-   * 页面加载那一刻的任务状态(来自 `getSnapshot()`,与 `GET /tasks/:id` 同源)。
+   * 页面加载那一刻的任务状态(来自 `getSnapshot()`,与 `GET /api/tasks/:id` 同源)。
    * 传 null/undefined 表示不预置:徽章显示「未知」,由页面自己从 end 帧推断收尾。
    */
   state?: string | null;
@@ -500,7 +507,7 @@ export interface RenderLivePageOptions {
  */
 export function renderLivePage(taskId: string, opts: RenderLivePageOptions = {}): string {
   if (typeof taskId !== "string" || taskId.length === 0) {
-    // 大声失败:空 id 会生成一条指向 /tasks//events/stream 的流,页面看起来「活着」
+    // 大声失败:空 id 会生成一条指向 /api/tasks//events/stream 的流,页面看起来「活着」
     // 却永远不出事件 —— 那是最难查的一种坏(它不报错)。
     throw new Error(`live_bad_task_id ${JSON.stringify(taskId)}`);
   }
@@ -540,10 +547,10 @@ export function renderLivePage(taskId: string, opts: RenderLivePageOptions = {})
   <div class="notice">
     停滞判据:<strong>最后事件超过 ${LIVE_STALL_WARN_SECONDS}s → 黄,超过 ${LIVE_STALL_DANGER_SECONDS}s → 红</strong>。
     新数据的落地节拍是每 30s 一次(poll 相增量摄取),所以红色就等于「十多个摄取周期没有任何新事件」。
-    本页只被动显示,不做判定也不做任何处置 —— 它是投影,权威仍是 TaskSession DO(GET /tasks/${displayId})。
+    本页只被动显示,不做判定也不做任何处置 —— 它是投影,权威仍是 TaskSession DO(GET /api/tasks/${displayId})。
   </div>
   <ol id="tl"></ol>
-  <p class="empty" id="empty">还没有事件。先说清一件事:<code>EventSource</code> 无法携带 Authorization 头,而这条流只认那个头 —— 所以<strong>浏览器自己连不上 prod</strong>:无凭据直开 <code>/live/…</code> 会得到 401,而 401 下浏览器根本不会重连(顶部提示会如实写「不会自动重连」)。浏览器可达性由后续产品化会话方案统一解决,本期刻意不引入临时凭据出口。当下要对照数据,请用带凭据的 API 客户端:<code>curl -N "$BASE/tasks/${displayId}/events/stream" -H "authorization: Bearer $TOKEN"</code>。</p>
+  <p class="empty" id="empty">还没有事件。先说清一件事:<code>EventSource</code> 无法携带 Authorization 头,而这条流只认那个头 —— 所以<strong>浏览器自己连不上 prod</strong>:无凭据直开 <code>/live/…</code> 会得到 401,而 401 下浏览器根本不会重连(顶部提示会如实写「不会自动重连」)。浏览器可达性由后续产品化会话方案统一解决,本期刻意不引入临时凭据出口。当下要对照数据,请用带凭据的 API 客户端:<code>curl -N "$BASE/api/tasks/${displayId}/events/stream" -H "authorization: Bearer $TOKEN"</code>。</p>
 </main>
 <script>${script}</script>
 </body>

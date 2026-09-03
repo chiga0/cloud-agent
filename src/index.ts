@@ -68,25 +68,25 @@ function landingHtml(env: Env): string {
     <strong>API</strong>
     <dl>
       <dt>GET /healthz</dt><dd>公开,返回 <code>{"ok":true}</code></dd>
-      <dt>POST /tasks</dt><dd>创建任务(需要 <code>Authorization: Bearer WORKER_API_TOKEN</code>)</dd>
-      <dt>GET /tasks/:id</dt><dd>查询任务、attempts 与事件链(需鉴权)</dd>
-      <dt>GET /tasks/:id/result</dt><dd>读取 agent 最终答案(纯文本,需鉴权)</dd>
-      <dt>POST /tasks/:id/approve</dt><dd>审批,只收 <code>approve</code> / <code>reject</code>(必须带 attempt_id + evidence_digest,需鉴权;<code>accept_with_notes</code> 是控制面内部降级决策,不由外部提交)</dd>
-      <dt>GET /tasks/:id/evidence</dt><dd>钉住的候选 manifest + approve 所需 attempt_id / binding_digest(需鉴权)</dd>
-      <dt>GET /tasks/:id/candidate</dt><dd>候选交付视图:基线 commit、patch 引用、判定标签与诚实性告警(需鉴权)。被预算击杀的差量在此自报:<code>patch_complete=false</code> + <code>patch_incomplete_reason</code>(如 <code>budget_abort(exit=55)</code>),此时 <code>safe_to_apply</code> 恒 <code>false</code></dd>
-      <dt>GET /tasks/:id/candidate?format=patch</dt><dd>下载补丁正文(<code>curl -o candidate.patch</code> 后本地 <code>git apply</code>);下发前重算 sha256,状态在 <code>x-candidate-status</code> / <code>x-safe-to-apply</code> / <code>x-patch-complete</code> 头里</dd>
-      <dt>GET /tasks/:id/events</dt><dd>在途事件流(需鉴权):读 Observation 层的 R2 段文件 journal,<strong>不经 D1 终态归档</strong>,因此任务 <code>RUNNING</code> 期间就有内容 —— 这是它相对 <code>/admin/events</code>(只读已归档的 hash chain)的核心增量。数据来自 poll 相每 30s 的 transcript 增量摄取:<strong>模型悬挂表现为「新事件停止而进程 alive」,凭最后一条事件的 <code>ts</code> 与轮询周期对比即可在 5 分钟内发现</strong>。按 attempt 创建序、attempt 内按 <code>generation</code> 与 <code>seq</code> 升序返回 <code>{"task_id",state,"events":[AgentEventV1],"count",total,"next_cursor","unreadable_attempts"}</code>;信封为 <code>{v:1,task_id,attempt_id,generation,seq,ts,kind,payload}</code>,<code>kind</code> ∈ system/assistant/user/tool_use/tool_result/result/error/raw(认不出的行不丢)。payload 已在 ingress 过白名单:只留类型/工具名/token 用量/时长/退出码等枚举字段,自由文本 ≤2048 字符并对平台注入的凭据值精确打码。分页:<code>?after=</code>(扁平有序流上已读的条数,默认 0)、<code>?limit=</code>(默认 500,上限 2000,非数字或越界 → 400);<code>next_cursor</code> 无后续时为 <code>null</code>。任务不存在 → 404;从未摄取过事件 → 空列表而不是 404</dd>
-      <dt>GET /tasks/:id/attempts/:aid/transcript</dt><dd>attempt 的 transcript 原文(verifier 为 JSON 验证报告,需鉴权)</dd>
-      <dt>GET /admin/chain-check</dt><dd>校验归档事件 hash chain(需鉴权)。<strong>两种模式</strong>:不带参数 = 全局扫描 D1 <code>events</code> 表,返回 <code>{checked,broken,brokenTasks}</code>,破口标记 <code>&lt;task_id&gt;:&lt;seq&gt;:&lt;kind&gt;</code>,kind ∈ <code>prev</code>/<code>digest</code>(内容被改)、<code>seq</code>(序号不严格递增/重号)、<code>state</code>(状态行已是终态而链尾转换不是)。⚠ 全局模式<strong>看不见未归档的任务</strong>(events 只在归档成功时写)。带 <code>?task_id=</code>(36 字符 UUID,畸形 → 400)= <strong>DO↔D1 对账模式</strong>:同时读 DO 链与 D1 行,返回 <code>{mode:"reconcile",result,do_events,d1_events,do_tail_digest,d1_tail_digest,broken,brokenTasks}</code>,<code>result</code> 三态 = <code>consistent</code> / <code>not_archived</code>(DO 有链而 D1 零行)/ <code>diverged</code>(行数或尾 digest 不等);DO 无该任务记录 → 404 <code>task_not_found</code>。判据边界与运维含义见 <code>docs/architecture.md</code> §6.2</dd>
-      <dt>GET /admin/tasks</dt><dd>归档任务列表(需鉴权):<strong>只读</strong>投影,数据源仅为 D1 归档的 <code>tasks</code> 表 —— 任务到终态才归档,因此<strong>不含仍在 DO 中运行、尚未归档的任务</strong>(实时状态看 <code>GET /tasks/:id</code>)。按 <code>updated_at</code> 降序返回 <code>{"tasks":[{id,state,created_at,updated_at,version}],"count":N}</code>;可选 <code>?state=</code> 精确过滤(合法取值见状态机,非法 → 400)、可选 <code>?limit=</code>(默认 50,上限 200,非数字或越界 → 400)</dd>
-      <dt>GET /admin/events</dt><dd>归档事件流(需鉴权):按任务回放审计事件的 hash chain。<strong>只读</strong>投影,数据源仅为 D1 归档的 <code>events</code> 表 —— 事件随任务终态才归档,因此<strong>只含已归档(终态)任务的事件</strong>,<strong>看不到仍在 DO 中运行、尚未归档的在途事件</strong>(实时状态看 <code>GET /tasks/:id</code>)。<code>?task_id=</code>(36 字符 UUID)<strong>必填</strong>:每 task 的 <code>seq</code> 才是分页脊线,跨 task 分页无意义;缺失或畸形 → 400。按 <code>seq</code> 升序(审计回放顺序)返回 <code>{"events":[{seq,kind,digest,prev_digest,created_at,canonical}],"next_cursor":&lt;string|null&gt;}</code>。<code>canonical</code> 是 D1 <code>payload</code> 列<strong>逐字原文</strong>(即 <code>JSON.stringify({task_id,kind,payload})</code>,正是被 hash 的那个串),不解析、不重新序列化 —— 客户端因此能独立重算 <code>digest == sha256Hex((prev_digest ?? "GENESIS") + canonical)</code> 并逐条核对 <code>prev_digest</code>,即在本地重放一遍 <code>/admin/chain-check</code>。安全:审计 journal 按构造<strong>绝不携带</strong>一次性模型代理凭据 <code>proxy_token</code>(它只存在于 <code>attempts</code> 表,从不进事件链)。游标分页:<code>?limit=</code>(默认 50,上限 200,非数字或越界 → 400)、<code>?cursor=</code>(不透明游标,首页省略;畸形 → 400),<code>next_cursor</code> 为下一页起点、无后续时为 <code>null</code>;过滤不命中返回空列表而不是 404</dd>
-      <dt>GET /admin/attempts</dt><dd>归档 attempt 列表(需鉴权):按任务复盘各 attempt(writer / verifier / reviewer)的终态与 token 消耗。<strong>只读</strong>投影,数据源仅为 D1 归档的 <code>attempts</code> 表 —— attempt 随任务终态才归档,因此<strong>不含尚未归档的在途 attempt</strong>(实时状态看 <code>GET /tasks/:id</code>)。按 <code>created_at</code> 降序返回 <code>{"attempts":[{id,task_id,role,state,tokens_used,input_tokens,cache_read_tokens,output_tokens,cost_weighted_tokens,max_model_tokens,max_wall_seconds,workflow_instance_id,created_at,finished_at}],"count":N}</code>(<code>count</code> 是本次返回条数,受 limit 截断)。口径:<code>tokens_used</code> 是 raw total(历史可比,<strong>不是成本</strong> —— r11 实测其 96.9% 是最便宜的隐式缓存命中);四元组拆分与 <code>cost_weighted_tokens</code>(缓存命中按 <code>CACHE_READ_COST_FACTOR</code> 折扣加权)才是成本口径,今后看成本看后者。四列与 <code>cost_weighted_tokens</code> 为 <code>null</code> 表示该记录产生时未记过拆分口径(M8 前的历史行),<strong>不等于消耗为 0</strong>。安全投影:<code>proxy_token</code>(一次性模型代理凭据)<strong>绝不下发</strong>,内部去重用的 <code>idempotency_key</code> 同样不进投影。可选过滤器按 AND 组合:<code>?task_id=</code>(36 字符 UUID,畸形 → 400)、<code>?role=</code>(writer/reviewer/verifier)、<code>?state=</code>(RUNNING/SUCCEEDED/FAILED/BLOCKED;合法取值来自权威声明,非法 → 400,不命中返回空列表)、<code>?limit=</code>(默认 50,上限 200,非数字或越界 → 400)</dd>
+      <dt>POST /api/tasks</dt><dd>创建任务(需要 <code>Authorization: Bearer WORKER_API_TOKEN</code>)</dd>
+      <dt>GET /api/tasks/:id</dt><dd>查询任务、attempts 与事件链(需鉴权)</dd>
+      <dt>GET /api/tasks/:id/result</dt><dd>读取 agent 最终答案(纯文本,需鉴权)</dd>
+      <dt>POST /api/tasks/:id/approve</dt><dd>审批,只收 <code>approve</code> / <code>reject</code>(必须带 attempt_id + evidence_digest,需鉴权;<code>accept_with_notes</code> 是控制面内部降级决策,不由外部提交)</dd>
+      <dt>GET /api/tasks/:id/evidence</dt><dd>钉住的候选 manifest + approve 所需 attempt_id / binding_digest(需鉴权)</dd>
+      <dt>GET /api/tasks/:id/candidate</dt><dd>候选交付视图:基线 commit、patch 引用、判定标签与诚实性告警(需鉴权)。被预算击杀的差量在此自报:<code>patch_complete=false</code> + <code>patch_incomplete_reason</code>(如 <code>budget_abort(exit=55)</code>),此时 <code>safe_to_apply</code> 恒 <code>false</code></dd>
+      <dt>GET /api/tasks/:id/candidate?format=patch</dt><dd>下载补丁正文(<code>curl -o candidate.patch</code> 后本地 <code>git apply</code>);下发前重算 sha256,状态在 <code>x-candidate-status</code> / <code>x-safe-to-apply</code> / <code>x-patch-complete</code> 头里</dd>
+      <dt>GET /api/tasks/:id/events</dt><dd>在途事件流(需鉴权):读 Observation 层的 R2 段文件 journal,<strong>不经 D1 终态归档</strong>,因此任务 <code>RUNNING</code> 期间就有内容 —— 这是它相对 <code>/api/admin/events</code>(只读已归档的 hash chain)的核心增量。数据来自 poll 相每 30s 的 transcript 增量摄取:<strong>模型悬挂表现为「新事件停止而进程 alive」,凭最后一条事件的 <code>ts</code> 与轮询周期对比即可在 5 分钟内发现</strong>。按 attempt 创建序、attempt 内按 <code>generation</code> 与 <code>seq</code> 升序返回 <code>{"task_id",state,"events":[AgentEventV1],"count",total,"next_cursor","unreadable_attempts"}</code>;信封为 <code>{v:1,task_id,attempt_id,generation,seq,ts,kind,payload}</code>,<code>kind</code> ∈ system/assistant/user/tool_use/tool_result/result/error/raw(认不出的行不丢)。payload 已在 ingress 过白名单:只留类型/工具名/token 用量/时长/退出码等枚举字段,自由文本 ≤2048 字符并对平台注入的凭据值精确打码。分页:<code>?after=</code>(扁平有序流上已读的条数,默认 0)、<code>?limit=</code>(默认 500,上限 2000,非数字或越界 → 400);<code>next_cursor</code> 无后续时为 <code>null</code>。任务不存在 → 404;从未摄取过事件 → 空列表而不是 404</dd>
+      <dt>GET /api/tasks/:id/attempts/:aid/transcript</dt><dd>attempt 的 transcript 原文(verifier 为 JSON 验证报告,需鉴权)</dd>
+      <dt>GET /api/admin/chain-check</dt><dd>校验归档事件 hash chain(需鉴权)。<strong>两种模式</strong>:不带参数 = 全局扫描 D1 <code>events</code> 表,返回 <code>{checked,broken,brokenTasks}</code>,破口标记 <code>&lt;task_id&gt;:&lt;seq&gt;:&lt;kind&gt;</code>,kind ∈ <code>prev</code>/<code>digest</code>(内容被改)、<code>seq</code>(序号不严格递增/重号)、<code>state</code>(状态行已是终态而链尾转换不是)。⚠ 全局模式<strong>看不见未归档的任务</strong>(events 只在归档成功时写)。带 <code>?task_id=</code>(36 字符 UUID,畸形 → 400)= <strong>DO↔D1 对账模式</strong>:同时读 DO 链与 D1 行,返回 <code>{mode:"reconcile",result,do_events,d1_events,do_tail_digest,d1_tail_digest,broken,brokenTasks}</code>,<code>result</code> 三态 = <code>consistent</code> / <code>not_archived</code>(DO 有链而 D1 零行)/ <code>diverged</code>(行数或尾 digest 不等);DO 无该任务记录 → 404 <code>task_not_found</code>。判据边界与运维含义见 <code>docs/architecture.md</code> §6.2</dd>
+      <dt>GET /api/admin/tasks</dt><dd>归档任务列表(需鉴权):<strong>只读</strong>投影,数据源仅为 D1 归档的 <code>tasks</code> 表 —— 任务到终态才归档,因此<strong>不含仍在 DO 中运行、尚未归档的任务</strong>(实时状态看 <code>GET /api/tasks/:id</code>)。按 <code>updated_at</code> 降序返回 <code>{"tasks":[{id,state,created_at,updated_at,version}],"count":N}</code>;可选 <code>?state=</code> 精确过滤(合法取值见状态机,非法 → 400)、可选 <code>?limit=</code>(默认 50,上限 200,非数字或越界 → 400)</dd>
+      <dt>GET /api/admin/events</dt><dd>归档事件流(需鉴权):按任务回放审计事件的 hash chain。<strong>只读</strong>投影,数据源仅为 D1 归档的 <code>events</code> 表 —— 事件随任务终态才归档,因此<strong>只含已归档(终态)任务的事件</strong>,<strong>看不到仍在 DO 中运行、尚未归档的在途事件</strong>(实时状态看 <code>GET /api/tasks/:id</code>)。<code>?task_id=</code>(36 字符 UUID)<strong>必填</strong>:每 task 的 <code>seq</code> 才是分页脊线,跨 task 分页无意义;缺失或畸形 → 400。按 <code>seq</code> 升序(审计回放顺序)返回 <code>{"events":[{seq,kind,digest,prev_digest,created_at,canonical}],"next_cursor":&lt;string|null&gt;}</code>。<code>canonical</code> 是 D1 <code>payload</code> 列<strong>逐字原文</strong>(即 <code>JSON.stringify({task_id,kind,payload})</code>,正是被 hash 的那个串),不解析、不重新序列化 —— 客户端因此能独立重算 <code>digest == sha256Hex((prev_digest ?? "GENESIS") + canonical)</code> 并逐条核对 <code>prev_digest</code>,即在本地重放一遍 <code>/api/admin/chain-check</code>。安全:审计 journal 按构造<strong>绝不携带</strong>一次性模型代理凭据 <code>proxy_token</code>(它只存在于 <code>attempts</code> 表,从不进事件链)。游标分页:<code>?limit=</code>(默认 50,上限 200,非数字或越界 → 400)、<code>?cursor=</code>(不透明游标,首页省略;畸形 → 400),<code>next_cursor</code> 为下一页起点、无后续时为 <code>null</code>;过滤不命中返回空列表而不是 404</dd>
+      <dt>GET /api/admin/attempts</dt><dd>归档 attempt 列表(需鉴权):按任务复盘各 attempt(writer / verifier / reviewer)的终态与 token 消耗。<strong>只读</strong>投影,数据源仅为 D1 归档的 <code>attempts</code> 表 —— attempt 随任务终态才归档,因此<strong>不含尚未归档的在途 attempt</strong>(实时状态看 <code>GET /api/tasks/:id</code>)。按 <code>created_at</code> 降序返回 <code>{"attempts":[{id,task_id,role,state,tokens_used,input_tokens,cache_read_tokens,output_tokens,cost_weighted_tokens,max_model_tokens,max_wall_seconds,workflow_instance_id,created_at,finished_at}],"count":N}</code>(<code>count</code> 是本次返回条数,受 limit 截断)。口径:<code>tokens_used</code> 是 raw total(历史可比,<strong>不是成本</strong> —— r11 实测其 96.9% 是最便宜的隐式缓存命中);四元组拆分与 <code>cost_weighted_tokens</code>(缓存命中按 <code>CACHE_READ_COST_FACTOR</code> 折扣加权)才是成本口径,今后看成本看后者。四列与 <code>cost_weighted_tokens</code> 为 <code>null</code> 表示该记录产生时未记过拆分口径(M8 前的历史行),<strong>不等于消耗为 0</strong>。安全投影:<code>proxy_token</code>(一次性模型代理凭据)<strong>绝不下发</strong>,内部去重用的 <code>idempotency_key</code> 同样不进投影。可选过滤器按 AND 组合:<code>?task_id=</code>(36 字符 UUID,畸形 → 400)、<code>?role=</code>(writer/reviewer/verifier)、<code>?state=</code>(RUNNING/SUCCEEDED/FAILED/BLOCKED;合法取值来自权威声明,非法 → 400,不命中返回空列表)、<code>?limit=</code>(默认 50,上限 200,非数字或越界 → 400)</dd>
     </dl>
   </div>
 
   <div class="card">
     <strong>CLI 示例</strong>
-    <pre style="overflow:auto"><code>curl -X POST ${base}/tasks \\
+    <pre style="overflow:auto"><code>curl -X POST ${base}/api/tasks \\
   -H "Authorization: Bearer $WORKER_API_TOKEN" \\
   -H "Content-Type: application/json" \\
   -d '{"spec":{"prompt":"在 /workspace 写一个 hello.py 并运行","acceptance":["存在 hello.py","运行输出 hello"]}}'</code></pre>
@@ -209,7 +209,7 @@ async function handleGetEvidence(env: Env, taskId: string): Promise<Response> {
 }
 
 /**
- * GET /tasks/:id/candidate —— 候选交付接口(只读,不写任何外部系统)。
+ * GET /api/tasks/:id/candidate —— 候选交付接口(只读,不写任何外部系统)。
  *
  * 下发补丁前必须重算字节 sha256 并与 manifest 记录的 digest 比对:内容寻址
  * 只在写入时成立,把未校验的字节交出去等于让「拿到的补丁」和「验证过的补丁」
@@ -307,13 +307,13 @@ async function handleGetAttemptTranscript(
   });
 }
 
-/** Observation 事件的读端点分页口径(与 /admin/* 的归档 limit 刻意不同:这里读 R2 段文件)。 */
+/** Observation 事件的读端点分页口径(与 /api/admin/* 的归档 limit 刻意不同:这里读 R2 段文件)。 */
 const DEFAULT_OBS_LIMIT = 500;
 const MAX_OBS_LIMIT = 2000;
 
 /**
  * query 里出现了参数名,空值就不是「缺省」:`?after=` 被当成 0 会让客户端从头再读
- * 一遍已经看过的流(分页最典型的静默重放)。/admin/events 的空 cursor 同样判非法。
+ * 一遍已经看过的流(分页最典型的静默重放)。/api/admin/events 的空 cursor 同样判非法。
  */
 function parseObsInt(raw: string): number {
   return raw.trim().length === 0 ? Number.NaN : Number(raw);
@@ -347,16 +347,16 @@ function parseObsLimit(raw: string | null): { limit: number; error: string | nul
 }
 
 /**
- * GET /tasks/:id/events —— 在途事件的只读投影(数据源:**R2 journal,不经 D1**)。
+ * GET /api/tasks/:id/events —— 在途事件的只读投影(数据源:**R2 journal,不经 D1**)。
  *
- * 这就是它与 GET /admin/events 的全部差别:后者读的是终态才归档的 hash chain,
- * 任务 RUNNING 时返回空 —— 于是 C2-r6 那种 24 分钟模型悬挂,外圈在 /tasks/:id 里
+ * 这就是它与 GET /api/admin/events 的全部差别:后者读的是终态才归档的 hash chain,
+ * 任务 RUNNING 时返回空 —— 于是 C2-r6 那种 24 分钟模型悬挂,外圈在 /api/tasks/:id 里
  * 只看到 `state: RUNNING`,与正常无异。本端点直接读 poll 相每 30s 增量摄取的段文件,
  * 因此「新事件停止但进程 alive」这件事在事件流里 5 分钟内就是可见的(判据:最后一条
  * 事件的 ts 与当前时刻的差,对比 poll 周期 30s)。
  *
  * 有序返回该任务**全部 attempt** 的事件:attempt 顺序取 TaskSession DO 里的 attempts
- * 数组序(= 创建序,与 GET /tasks/:id 同源),attempt 内按 generation、seq 升序。
+ * 数组序(= 创建序,与 GET /api/tasks/:id 同源),attempt 内按 generation、seq 升序。
  * 不解析、不加工 payload:journal 里是什么就返回什么(白名单已在 ingress 完成)。
  *
  * 某 attempt 的 index 读坏了不能让整个任务看不到事件:记 stderr 并把该 attempt 列进
@@ -423,7 +423,7 @@ async function handleGetTaskEvents(url: URL, env: Env, taskId: string): Promise<
 }
 
 /**
- * GET /tasks/:id/events/stream —— 在途事件的 **SSE 投影**(第④层可观测架构的上半)。
+ * GET /api/tasks/:id/events/stream —— 在途事件的 **SSE 投影**(第④层可观测架构的上半)。
  *
  * 与 handleGetTaskEvents 是同一个位置游标的两种读法(拉/推),两者互为恢复源:
  * 流断了就 `GET /events?after=<最后看到的 id>`,分页翻不动了就带 `Last-Event-ID` 重连。
@@ -502,7 +502,7 @@ async function handleGetTaskEventStream(req: Request, env: Env, taskId: string):
  * 此处仍需浏览器实测的是文案在真实页面上的可读性;分支判据本身已实测并由单测钉住。
  */
 async function handleLivePage(env: Env, taskId: string): Promise<Response> {
-  // 与 /tasks/:id/events* 完全同源的 404 语义,且必须在生成 HTML **之前**判掉:
+  // 与 /api/tasks/:id/events* 完全同源的 404 语义,且必须在生成 HTML **之前**判掉:
   // 一旦 200 + text/html 发出去,就没法再补一个 404(同 §9.6 建流前判 404 的理由)。
   const snap = await TaskSession.from(env, taskId).getSnapshot();
   if (!snap) return Response.json({ error: { type: "not_found" } }, { status: 404 });
@@ -647,7 +647,7 @@ async function handleChainCheck(env: Env): Promise<Response> {
 }
 
 /**
- * `GET /admin/chain-check?task_id=` —— DO↔D1 对账模式。
+ * `GET /api/admin/chain-check?task_id=` —— DO↔D1 对账模式。
  *
  * 为什么必须有这个模式:全局模式的数据源是 `SELECT DISTINCT task_id FROM events`,
  * 而 events 只在归档成功时才写 —— **未归档的任务对它完全不可见**,连「有事件行但缺了
@@ -670,7 +670,7 @@ async function handleChainReconcile(env: Env, taskId: string): Promise<Response>
       {
         error: {
           type: "task_not_found",
-          detail: "no TaskSession DO record for this task_id; /admin/chain-check cannot reconcile it",
+          detail: "no TaskSession DO record for this task_id; /api/admin/chain-check cannot reconcile it",
         },
       },
       { status: 404 },
@@ -709,7 +709,7 @@ const DEFAULT_ADMIN_LIMIT = 50;
 const MAX_ADMIN_LIMIT = 200;
 
 /**
- * 归档读端点(`/admin/tasks`、`/admin/attempts`)共用的 limit 口径:缺省 50,
+ * 归档读端点(`/api/admin/tasks`、`/api/admin/attempts`)共用的 limit 口径:缺省 50,
  * 只接受 [1, 200] 内的整数。`error` 非空即 400 —— 一份规则,不各写一份。
  */
 function parseAdminLimit(raw: string | null):
@@ -732,10 +732,10 @@ interface ArchivedTaskRow {
 }
 
 /**
- * GET /admin/tasks —— 归档任务列表(只读投影,数据源仅为 D1 `tasks` 表)。
+ * GET /api/admin/tasks —— 归档任务列表(只读投影,数据源仅为 D1 `tasks` 表)。
  *
  * 归档只在终态发生,所以这里**看不到仍在 DO 中运行、尚未归档的任务** —— 它是
- * 复盘与「捞需要人工处理的任务」的视图,不是实时看板;实时状态仍走 /tasks/:id。
+ * 复盘与「捞需要人工处理的任务」的视图,不是实时看板;实时状态仍走 /api/tasks/:id。
  * 不引入新的状态对象,也不碰控制面状态机与归档写路径。
  */
 async function handleAdminTasks(url: URL, env: Env): Promise<Response> {
@@ -794,15 +794,15 @@ interface ArchivedAttemptRow {
   finished_at: string | null;
 }
 
-/** 与 `/tasks/:id` 路由同一个 id 口径:36 字符 `[0-9a-f-]` UUID。 */
+/** 与 `/api/tasks/:id` 路由同一个 id 口径:36 字符 `[0-9a-f-]` UUID。 */
 const TASK_ID_RE = /^[0-9a-f-]{36}$/;
 
 /**
- * GET /admin/attempts —— 归档 attempt 列表(只读投影,数据源仅为 D1 `attempts` 表)。
+ * GET /api/admin/attempts —— 归档 attempt 列表(只读投影,数据源仅为 D1 `attempts` 表)。
  *
  * 按任务复盘各 attempt(writer/verifier/reviewer)的执行结果、终态与 token 消耗。
- * 与 /admin/tasks 同理:归档只在终态发生,**看不到仍在 DO 中运行、尚未归档的
- * 在途 attempt** —— 实时状态仍走 /tasks/:id。不新增状态对象,不碰状态机与归档
+ * 与 /api/admin/tasks 同理:归档只在终态发生,**看不到仍在 DO 中运行、尚未归档的
+ * 在途 attempt** —— 实时状态仍走 /api/tasks/:id。不新增状态对象,不碰状态机与归档
  * 写路径;role/state 的合法取值直接引用权威声明(ATTEMPT_ROLES / ATTEMPT_STATES),
  * 不在这里另立清单。
  *
@@ -937,7 +937,7 @@ function decodeEventCursor(raw: string): number | null {
 }
 
 /**
- * GET /admin/events —— 归档事件流的只读投影(数据源仅为 D1 `events` 表)。
+ * GET /api/admin/events —— 归档事件流的只读投影(数据源仅为 D1 `events` 表)。
  *
  * 用途是按任务回放审计 hash chain,所以刻意不做任何服务端加工:`canonical` 逐字
  * 透出,重算 digest 留给客户端(`digest == sha256Hex((prev_digest ?? "GENESIS") +
@@ -946,11 +946,11 @@ function decodeEventCursor(raw: string): number | null {
  * 按构造不进事件链(它只存在于 attempts 表),journal 因而不是凭据的第二条出口。
  *
  * `?task_id=` 必填:分页脊线是每 task 的 seq(唯一索引 idx_events_task_seq),跨
- * task 的 seq 互不相干,混在一起分页没有意义。`?limit=` 与 `/admin/tasks`、
- * `/admin/attempts` 共用 parseAdminLimit;`?cursor=` 省略即首页。
+ * task 的 seq 互不相干,混在一起分页没有意义。`?limit=` 与 `/api/admin/tasks`、
+ * `/api/admin/attempts` 共用 parseAdminLimit;`?cursor=` 省略即首页。
  *
  * 归档只在终态发生,因此这里**看不到仍在 DO 中运行、尚未归档的在途事件** —— 实时
- * 状态仍走 /tasks/:id。不新增状态对象,不碰状态机与归档写路径。
+ * 状态仍走 /api/tasks/:id。不新增状态对象,不碰状态机与归档写路径。
  */
 async function handleAdminEvents(url: URL, env: Env): Promise<Response> {
   const taskId = url.searchParams.get("task_id");
@@ -1033,11 +1033,18 @@ export default {
       });
     }
 
+    // 鉴权门位置保持不变:在 /healthz、GET / 之后,一切 /api/* 与 /live 之前。
     if (!checkApiToken(req, env)) return unauthorized();
 
-    if (url.pathname === "/tasks" && req.method === "POST") return handleCreateTask(req, env);
+    // API 一律挂 /api/*:w2 起本 Worker 挂 Static Assets 并配 single-page-application
+    // fallback,届时任何未匹配的 GET 会返回 SPA 的 index.html(200 + text/html)。
+    // 客户端路由与旧 API 路径同形(如 /tasks/:id 既是详情页路由又是 JSON 端点)会被静默
+    // 吞掉,内容协商方案已否决 —— 前缀分区是唯一干净解。旧路径**不留**别名/重定向
+    // (部署窗口由操作员控制,不存在两种 URL 需同时可用的时间片),由
+    // test/api-prefix.test.ts 钉成可执行事实。新增端点漏挂 /api 的防线也在该测试。
+    if (url.pathname === "/api/tasks" && req.method === "POST") return handleCreateTask(req, env);
 
-    if (url.pathname === "/admin/chain-check" && req.method === "GET") {
+    if (url.pathname === "/api/admin/chain-check" && req.method === "GET") {
       // `?task_id=` 是**对账模式**(DO↔D1),不是全局模式的一个过滤条件。
       // 旧实现静默忽略它、返回与全局检查逐字节相同的 200 —— 那等于让运维以为
       // 「查过了,没问题」,而它查的根本不是自己问的那件事。畸形 id 一律 400。
@@ -1057,28 +1064,28 @@ export default {
       return handleChainReconcile(env, reconcileId);
     }
 
-    if (url.pathname === "/admin/tasks" && req.method === "GET") {
+    if (url.pathname === "/api/admin/tasks" && req.method === "GET") {
       return handleAdminTasks(url, env);
     }
 
-    if (url.pathname === "/admin/attempts" && req.method === "GET") {
+    if (url.pathname === "/api/admin/attempts" && req.method === "GET") {
       return handleAdminAttempts(url, env);
     }
 
-    if (url.pathname === "/admin/events" && req.method === "GET") {
+    if (url.pathname === "/api/admin/events" && req.method === "GET") {
       return handleAdminEvents(url, env);
     }
 
-    // Live UI(第④层下半)。id 的正则与下面 /tasks/:id/* **同一条**([0-9a-f-]{36}):
+    // Live UI(第④层下半)。id 的正则与下面 /api/tasks/:id/* **同一条**([0-9a-f-]{36}):
     // 畸形 id 在这里就 404,不进渲染 —— 但 renderLivePage 仍然自己转义,理由见它上方注释。
-    // 刻意不做 /live 列表页:那需要跨任务枚举,与 /admin/tasks 的归档口径纠缠,是另一棒。
+    // 刻意不做 /live 列表页:那需要跨任务枚举,与 /api/admin/tasks 的归档口径纠缠,是另一棒。
     const liveMatch = /^\/live\/([0-9a-f-]{36})$/.exec(url.pathname);
     if (liveMatch && req.method === "GET") {
       return handleLivePage(env, liveMatch[1]);
     }
 
     const taskMatch =
-      /^\/tasks\/([0-9a-f-]{36})(\/approve|\/result|\/evidence|\/candidate|\/events\/stream|\/events)?$/.exec(url.pathname);
+      /^\/api\/tasks\/([0-9a-f-]{36})(\/approve|\/result|\/evidence|\/candidate|\/events\/stream|\/events)?$/.exec(url.pathname);
     if (taskMatch) {
       if (req.method === "GET" && !taskMatch[2]) return handleGetTask(env, taskMatch[1]);
       if (req.method === "GET" && taskMatch[2] === "/result") {
@@ -1102,7 +1109,7 @@ export default {
     }
 
     const attemptMatch =
-      /^\/tasks\/([0-9a-f-]{36})\/attempts\/([0-9a-f-]{36})\/transcript$/.exec(url.pathname);
+      /^\/api\/tasks\/([0-9a-f-]{36})\/attempts\/([0-9a-f-]{36})\/transcript$/.exec(url.pathname);
     if (attemptMatch && req.method === "GET") {
       return handleGetAttemptTranscript(env, attemptMatch[1], attemptMatch[2]);
     }

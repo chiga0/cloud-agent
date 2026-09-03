@@ -6,7 +6,7 @@ import { ATTEMPT_STATES, type AttemptState } from "../src/control/session";
 import { applyMigrations } from "./d1";
 
 /**
- * GET /admin/attempts —— 归档 attempt 列表的读模型投影。
+ * GET /api/admin/attempts —— 归档 attempt 列表的读模型投影。
  *
  * 用例直接对 D1 `attempts` 表建模(不经过 DO),因为该端点承诺的数据源就只有这张表。
  * 三条硬要求各有对应用例:合法取值来自权威导出 ATTEMPT_ROLES / ATTEMPT_STATES
@@ -71,7 +71,7 @@ async function request(path: string, token: string | null = TOKEN): Promise<Resp
 }
 
 const getAttempts = (query = "", token: string | null = TOKEN) =>
-  request(`/admin/attempts${query}`, token);
+  request(`/api/admin/attempts${query}`, token);
 
 async function getJson<T>(query: string): Promise<{ status: number; body: T }> {
   const res = await getAttempts(query);
@@ -169,7 +169,7 @@ async function countRows(table: string): Promise<number> {
 // 迁移含不可重复执行的 ALTER TABLE:整个文件应用一次,而不是每个 suite 一次
 beforeAll(applyMigrations);
 
-describe("GET /admin/attempts", () => {
+describe("GET /api/admin/attempts", () => {
   beforeEach(async () => {
     clock = 0;
     await env.DB.prepare("DELETE FROM decisions").run();
@@ -369,7 +369,7 @@ describe("GET /admin/attempts", () => {
     expect(await countRows("attempts")).toBe(3);
   });
 
-  it("?task_id 的格式口径与 /tasks/:id 路由一致(36 字符 [0-9a-f-])", async () => {
+  it("?task_id 的格式口径与 /api/tasks/:id 路由一致(36 字符 [0-9a-f-])", async () => {
     // 与路由同一字符类:36 位小写 hex/连字符即合法,不做多余的 "能不能 parse 成 UUID" 收紧
     for (const ok of ["0".repeat(36), crypto.randomUUID(), "a".repeat(36)]) {
       const res = await getAttempts(`?task_id=${ok}`);
@@ -455,9 +455,9 @@ describe("GET /admin/attempts", () => {
     expect(raw?.idempotency_key).toBe(idempotencyKey);
   });
 
-  it("鉴权与 GET /admin/tasks、GET /admin/chain-check 走同一条 checkApiToken 路径", async () => {
+  it("鉴权与 GET /api/admin/tasks、GET /api/admin/chain-check 走同一条 checkApiToken 路径", async () => {
     expect(TOKEN).toBeTruthy();
-    for (const path of ["/admin/attempts", "/admin/tasks", "/admin/chain-check"]) {
+    for (const path of ["/api/admin/attempts", "/api/admin/tasks", "/api/admin/chain-check"]) {
       expect((await request(path, null)).status, `${path} 缺 token 应 401`).toBe(401);
       expect((await request(path, "wrong-token")).status, `${path} 错 token 应 401`).toBe(401);
     }
@@ -495,7 +495,7 @@ describe("GET /admin/attempts", () => {
     const res = await request("/");
     expect(res.status).toBe(200);
     const html = await res.text();
-    expect(html).toContain("<dt>GET /admin/attempts</dt>");
+    expect(html).toContain("<dt>GET /api/admin/attempts</dt>");
     // 漏掉这句,读者就会把复盘视图当实时看板
     expect(html).toContain("不含尚未归档的在途 attempt");
     expect(html).toContain("数据源仅为 D1 归档的 <code>attempts</code> 表");

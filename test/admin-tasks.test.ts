@@ -6,7 +6,7 @@ import type { TaskState } from "../src/types";
 import { applyMigrations } from "./d1";
 
 /**
- * GET /admin/tasks —— 归档任务列表的读模型投影。
+ * GET /api/admin/tasks —— 归档任务列表的读模型投影。
  *
  * 这个端点的意义就是「D1 里已经归档的那份事实」,所以用例直接对 `tasks` 表
  * 建模(不经过 DO):状态集必须与权威转换表一致、limit 边界要挡住、一次 GET
@@ -44,7 +44,7 @@ async function request(path: string, token: string | null = TOKEN): Promise<Resp
 }
 
 const getTasks = (query = "", token: string | null = TOKEN) =>
-  request(`/admin/tasks${query}`, token);
+  request(`/api/admin/tasks${query}`, token);
 
 async function getJson<T>(query: string): Promise<{ status: number; body: T }> {
   const res = await getTasks(query);
@@ -83,7 +83,7 @@ async function tableSnapshot(): Promise<Array<{ id: string; state: string; versi
 // 迁移含不可重复执行的 ALTER TABLE:整个文件应用一次,而不是每个 suite 一次
 beforeAll(applyMigrations);
 
-describe("GET /admin/tasks", () => {
+describe("GET /api/admin/tasks", () => {
   beforeEach(async () => {
     await env.DB.prepare("DELETE FROM tasks").run();
   });
@@ -184,9 +184,9 @@ describe("GET /admin/tasks", () => {
     }
   });
 
-  it("鉴权与 GET /admin/chain-check 走同一条 checkApiToken 路径", async () => {
+  it("鉴权与 GET /api/admin/chain-check 走同一条 checkApiToken 路径", async () => {
     expect(TOKEN).toBeTruthy();
-    for (const path of ["/admin/tasks", "/admin/chain-check"]) {
+    for (const path of ["/api/admin/tasks", "/api/admin/chain-check"]) {
       expect((await request(path, null)).status, `${path} 缺 token 应 401`).toBe(401);
       expect((await request(path, "wrong-token")).status, `${path} 错 token 应 401`).toBe(401);
     }
@@ -207,7 +207,7 @@ describe("GET /admin/tasks", () => {
     const res = await request("/");
     expect(res.status).toBe(200);
     const html = await res.text();
-    expect(html).toContain("<dt>GET /admin/tasks</dt>");
+    expect(html).toContain("<dt>GET /api/admin/tasks</dt>");
     // 端点列表里漏掉「不含未归档任务」这句,读者就会把复盘视图当实时看板
     expect(html).toContain("不含仍在 DO 中运行、尚未归档的任务");
   });

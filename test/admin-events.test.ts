@@ -7,7 +7,7 @@ import { applyMigrations } from "./d1";
 import readme from "../README.md?raw";
 
 /**
- * GET /admin/events —— 归档事件流(hash chain)的读模型投影。
+ * GET /api/admin/events —— 归档事件流(hash chain)的读模型投影。
  *
  * 用例直接对 D1 `events` 表建模(不经过 DO),因为该端点承诺的数据源只有这张表。
  * 端点的立身之本是「客户端拿到返回的字节就能自己把链验一遍」,所以夹具按
@@ -67,7 +67,7 @@ async function request(path: string, token: string | null = TOKEN): Promise<Resp
 }
 
 const getEvents = (query = "", token: string | null = TOKEN) =>
-  request(`/admin/events${query}`, token);
+  request(`/api/admin/events${query}`, token);
 
 async function getJson<T>(query: string): Promise<{ status: number; body: T }> {
   const res = await getEvents(query);
@@ -301,7 +301,7 @@ const HONESTY_PHRASES = [
 // 迁移含不可重复执行的 ALTER TABLE:整个文件应用一次,而不是每个 suite 一次
 beforeAll(applyMigrations);
 
-describe("GET /admin/events", () => {
+describe("GET /api/admin/events", () => {
   beforeEach(async () => {
     clock = 0;
     await env.DB.prepare("DELETE FROM decisions").run();
@@ -410,11 +410,11 @@ describe("GET /admin/events", () => {
       await replayChain(events, "跨页 ");
     });
 
-    it("与 GET /admin/chain-check 同口径:服务端说没断,客户端也说没断", async () => {
+    it("与 GET /api/admin/chain-check 同口径:服务端说没断,客户端也说没断", async () => {
       const taskId = await seedTask();
       await seedChain(taskId, withMessy(taskId, manySpecs(4)));
 
-      const check = await request("/admin/chain-check");
+      const check = await request("/api/admin/chain-check");
       expect(check.status).toBe(200);
       expect(await check.json()).toEqual({ checked: 1, broken: 0, brokenTasks: [] });
 
@@ -526,7 +526,7 @@ describe("GET /admin/events", () => {
   });
 
   describe("参数校验", () => {
-    it("?task_id 必填:省略即 400(/admin/attempts 里可选,这里不行)", async () => {
+    it("?task_id 必填:省略即 400(/api/admin/attempts 里可选,这里不行)", async () => {
       await seedChain(await seedTask(), manySpecs(2));
 
       for (const query of ["", "?limit=5", "?cursor=abc"]) {
@@ -534,13 +534,13 @@ describe("GET /admin/events", () => {
         expect(status, `省略 task_id(${JSON.stringify(query)}) 应被拒绝`).toBe(400);
         expect(body.error.type).toBe("invalid_task_id");
       }
-      // 对照:同一套夹具下 /admin/attempts 不带 task_id 是合法的
-      const attempts = await request("/admin/attempts?limit=5");
+      // 对照:同一套夹具下 /api/admin/attempts 不带 task_id 是合法的
+      const attempts = await request("/api/admin/attempts?limit=5");
       expect(attempts.status).toBe(200);
       await attempts.arrayBuffer();
     });
 
-    it("?task_id 的格式口径与 /tasks/:id 路由一致(36 字符 [0-9a-f-])", async () => {
+    it("?task_id 的格式口径与 /api/tasks/:id 路由一致(36 字符 [0-9a-f-])", async () => {
       for (const ok of ["0".repeat(36), crypto.randomUUID(), "a".repeat(36)]) {
         const res = await getEvents(`?task_id=${ok}`);
         expect(res.status, `task_id=${ok} 应被接受`).toBe(200);
@@ -575,7 +575,7 @@ describe("GET /admin/events", () => {
       expect(await countEvents(taskId)).toBe(2);
     });
 
-    it("limit 缺省 50、上限 200 可用,与 /admin/tasks、/admin/attempts 同一份规则", async () => {
+    it("limit 缺省 50、上限 200 可用,与 /api/admin/tasks、/api/admin/attempts 同一份规则", async () => {
       const taskId = await seedTask();
       await seedChain(taskId, manySpecs(120));
 
@@ -584,9 +584,9 @@ describe("GET /admin/events", () => {
       expect((await getJson<EventsBody>(`?task_id=${taskId}&limit=200`)).body.events).toHaveLength(120);
       expect((await getJson<EventsBody>(`?task_id=${taskId}&limit=1`)).body.events).toHaveLength(1);
 
-      // 与 /admin/tasks 同一份规则:连 400 的 detail 措辞都不允许分叉
+      // 与 /api/admin/tasks 同一份规则:连 400 的 detail 措辞都不允许分叉
       const mine = (await getJson<ErrorBody>(`?task_id=${taskId}&limit=0`)).body.error.detail;
-      const shared = (await (await request("/admin/tasks?limit=0")).json() as ErrorBody).error.detail;
+      const shared = (await (await request("/api/admin/tasks?limit=0")).json() as ErrorBody).error.detail;
       expect(mine).toBe(shared);
       expect(mine).toBe("limit must be an integer within [1, 200]");
     });
@@ -596,7 +596,7 @@ describe("GET /admin/events", () => {
       await seedChain(taskId, manySpecs(2));
 
       // " 5" 不在这个清单里:共用的 parseAdminLimit 走 Number(),空白包裹的数字按既
-      // 有口径放行 —— 那是 /admin/tasks、/admin/attempts 同样的行为,这里不另立规则。
+      // 有口径放行 —— 那是 /api/admin/tasks、/api/admin/attempts 同样的行为,这里不另立规则。
       for (const limit of ["0", "-0", "-1", "201", "abc", "1.5", "", "1e400", "200.0.1"]) {
         const { status, body } = await getJson<ErrorBody>(`?task_id=${taskId}&limit=${encodeURIComponent(limit)}`);
         expect(status, `limit=${JSON.stringify(limit)} 应被拒绝`).toBe(400);
@@ -676,17 +676,17 @@ describe("GET /admin/events", () => {
       expect(await snapshot()).toEqual(before);
     });
 
-    it("鉴权与 GET /admin/tasks、/admin/attempts、/admin/chain-check 走同一条 checkApiToken 路径", async () => {
+    it("鉴权与 GET /api/admin/tasks、/api/admin/attempts、/api/admin/chain-check 走同一条 checkApiToken 路径", async () => {
       const taskId = await seedTask();
       await seedChain(taskId, manySpecs(2));
       expect(TOKEN).toBeTruthy();
 
-      for (const path of ["/admin/events", "/admin/tasks", "/admin/attempts", "/admin/chain-check"]) {
+      for (const path of ["/api/admin/events", "/api/admin/tasks", "/api/admin/attempts", "/api/admin/chain-check"]) {
         expect((await request(path, null)).status, `${path} 缺 token 应 401`).toBe(401);
         expect((await request(path, "wrong-token")).status, `${path} 错 token 应 401`).toBe(401);
       }
       // 鉴权先于参数校验:缺 task_id 也不是 400,而是 401
-      const unauthed = await request("/admin/events", null);
+      const unauthed = await request("/api/admin/events", null);
       expect(unauthed.status).toBe(401);
       expect((await unauthed.json() as { error: { type: string } }).error.type).toBe("unauthorized");
     });
@@ -713,14 +713,14 @@ describe("GET /admin/events", () => {
       const live = await getJson<EventsBody>(`?task_id=${taskId}`);
 
       const html = await (await request("/")).text();
-      expect(html).toContain("<dt>GET /admin/events</dt>");
+      expect(html).toContain("<dt>GET /api/admin/events</dt>");
       expect(documentedEventFields(html, "落地页")).toEqual(PROJECTED_FIELDS);
       expect(Object.keys(live.body.events[0]).sort()).toEqual(PROJECTED_FIELDS);
       for (const phrase of HONESTY_PHRASES) {
         expect(html, `落地页应写明「${phrase}」`).toContain(phrase);
       }
-      // 漏掉「实时状态另看 /tasks/:id」,读者就会把归档视图当实时看板
-      expect(html).toContain("实时状态看 <code>GET /tasks/:id</code>");
+      // 漏掉「实时状态另看 /api/tasks/:id」,读者就会把归档视图当实时看板
+      expect(html).toContain("实时状态看 <code>GET /api/tasks/:id</code>");
     });
 
     it("README 登记该端点,字段清单与落地页、实际返回三方对齐", async () => {
@@ -728,8 +728,8 @@ describe("GET /admin/events", () => {
       await seedChain(taskId, manySpecs(2));
       const live = await getJson<EventsBody>(`?task_id=${taskId}`);
 
-      expect(readme).toContain("GET /admin/events");
-      expect(readme).toContain("/admin/events?task_id=<task_id>");
+      expect(readme).toContain("GET /api/admin/events");
+      expect(readme).toContain("/api/admin/events?task_id=<task_id>");
       expect(documentedEventFields(readme, "README")).toEqual(PROJECTED_FIELDS);
       expect(documentedEventFields(readme, "README")).toEqual(
         documentedEventFields(await (await request("/")).text(), "落地页"),
@@ -746,7 +746,7 @@ describe("GET /admin/events", () => {
 });
 
 /**
- * GET /admin/chain-check(c11b 第 3 条)—— 完整性监控补口径。
+ * GET /api/admin/chain-check(c11b 第 3 条)—— 完整性监控补口径。
  *
  * 全局模式的数据源是 `SELECT DISTINCT task_id FROM events`,只看已归档的 D1 行。
  * prod 事故里它返回 checked=79 / broken=0,而当时正有一条任务每 30 秒空转一次归档失败:
@@ -758,7 +758,7 @@ describe("GET /admin/events", () => {
  *
  * 夹具全部复用本文件既有的 seedTask / seedChain(同一份 sha256Hex 口径),不新建 DO fixture。
  */
-describe("GET /admin/chain-check", () => {
+describe("GET /api/admin/chain-check", () => {
   beforeEach(async () => {
     clock = 0;
     await env.DB.prepare("DELETE FROM decisions").run();
@@ -790,13 +790,13 @@ describe("GET /admin/chain-check", () => {
   }
 
   async function globalCheck(): Promise<CheckBody> {
-    const res = await request("/admin/chain-check");
+    const res = await request("/api/admin/chain-check");
     expect(res.status).toBe(200);
     return (await res.json()) as CheckBody;
   }
 
   async function reconcile(taskId: string): Promise<{ status: number; body: ReconcileBody | ErrorBody }> {
-    const res = await request(`/admin/chain-check?task_id=${taskId}`);
+    const res = await request(`/api/admin/chain-check?task_id=${taskId}`);
     return { status: res.status, body: (await res.json()) as ReconcileBody | ErrorBody };
   }
 
@@ -917,7 +917,7 @@ describe("GET /admin/chain-check", () => {
   });
 
   /**
-   * 对账模式。DO 侧用 name-based id 取实例(与 /tasks/:id 同一路径),
+   * 对账模式。DO 侧用 name-based id 取实例(与 /api/tasks/:id 同一路径),
    * 归档走真实写路径(reportExecution → archiveWithRetry),这样两侧的记录
    * 都是产品代码产出的,不是夹具拼出来的。
    */
@@ -1001,7 +1001,7 @@ describe("GET /admin/chain-check", () => {
     });
 
     it("旧实现静默忽略的 ?task_id= 现在必须真的回答它:畸形 400、无 DO 记录 404", async () => {
-      const malformed = await request("/admin/chain-check?task_id=nope");
+      const malformed = await request("/api/admin/chain-check?task_id=nope");
       expect(malformed.status).toBe(400);
       expect(((await malformed.json()) as ErrorBody).error.type).toBe("invalid_task_id");
 

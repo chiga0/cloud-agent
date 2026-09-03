@@ -103,7 +103,7 @@ interface CurrentEvidence {
 
 /**
  * attempt 生命周期的唯一权威取值集(RUNNING + 三个终态)。类型由这个常量元组
- * 派生,归档读投影(`GET /admin/attempts` 的 `?state=`)引用同一份声明 ——
+ * 派生,归档读投影(`GET /api/admin/attempts` 的 `?state=`)引用同一份声明 ——
  * 状态的增删只改这里,读端自动跟上。
  */
 export const ATTEMPT_STATES = ["RUNNING", "SUCCEEDED", "FAILED", "BLOCKED"] as const;

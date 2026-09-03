@@ -93,7 +93,7 @@ describe("GET /live/:taskId", () => {
     const body = await res.text();
 
     expect(body).toContain("EventSource");
-    expect(body).toContain(`/tasks/${taskId}/events/stream`);
+    expect(body).toContain(`/api/tasks/${taskId}/events/stream`);
     expect(body).toContain("最后事件");
     // 阈值是判据,必须能在产物里读到具体数字(缺省渲染成 JS 常量声明)
     expect(LIVE_STALL_WARN_SECONDS).toBe(90);
@@ -121,7 +121,7 @@ describe("GET /live/:taskId", () => {
     expect(body).toContain("<script>");
   });
 
-  it("鉴权与 404 语义和 /tasks/:id/events 同源:无凭据 401、不存在 404", async () => {
+  it("鉴权与 404 语义和 /api/tasks/:id/events 同源:无凭据 401、不存在 404", async () => {
     expect(TOKEN).toBeTruthy();
     const { taskId } = await seedRunningTask();
     expect((await request(`/live/${taskId}`, { token: null })).status).toBe(401);
@@ -131,7 +131,7 @@ describe("GET /live/:taskId", () => {
     expect(missing.status).toBe(404);
     expect(((await missing.json()) as ErrorBody).error.type).toBe("not_found");
 
-    // 畸形 id 与缺 id:走的是全局兜底 404(路由正则同 /tasks/:id/*),不进渲染。
+    // 畸形 id 与缺 id:走的是全局兜底 404(路由正则同 /api/tasks/:id/*),不进渲染。
     expect((await request("/live/not-a-uuid")).status).toBe(404);
     expect((await request("/live")).status).toBe(404);
   });
@@ -141,7 +141,7 @@ describe("GET /live/:taskId", () => {
     const body = await (await request(`/live/${taskId}`)).text();
     const urlInPage = /var STREAM_URL = "([^"]*)";/.exec(body);
     expect(urlInPage, "页面必须把流地址渲染成 JS 字符串常量").not.toBeNull();
-    expect(urlInPage![1]).toBe(`/tasks/${taskId}/events/stream`);
+    expect(urlInPage![1]).toBe(`/api/tasks/${taskId}/events/stream`);
     expect(urlInPage![1]).toBe(liveStreamPath(taskId));
 
     // 真去连一次:200 的 event-stream,且 data 可解析回带 kind/seq/ts/payload 的信封。
@@ -169,7 +169,7 @@ describe("renderLivePage(纯函数)", () => {
     expect(page.match(/<script/g)).toHaveLength(1);
     expect(page).toContain("&lt;script&gt;alert(1)&lt;/script&gt;");
     // 流路径里走的是 URL 编码,不是 HTML 转义(&amp; 在 URL 里不会被还原)
-    expect(page).toContain("/tasks/%3Cscript%3Ealert(1)%3C%2Fscript%3E/events/stream");
+    expect(page).toContain("/api/tasks/%3Cscript%3Ealert(1)%3C%2Fscript%3E/events/stream");
   });
 
   it("escapeHtmlText:& 最先替换(否则 &lt; 会被二次替换成 &amp;lt;)", () => {

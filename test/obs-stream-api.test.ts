@@ -9,7 +9,7 @@ import { SseReader, type SseFrame, ident } from "./sse";
 import { applyMigrations } from "./d1";
 
 /**
- * GET /tasks/:id/events/stream —— 走真实 HTTP 路由的 SSE 投影。
+ * GET /api/tasks/:id/events/stream —— 走真实 HTTP 路由的 SSE 投影。
  *
  * 这组用例钉的是**契约**:路由、鉴权、400 口径、帧形状、以及最重要的一条 ——
  * 帧 id 与 `GET /events` 的 `after` 是同一个数(「往返自洽」用例)。上一轮把事件帧
@@ -110,7 +110,7 @@ async function readStream(
   taskId: string,
   opts: { lastEventId?: string; count: number | null; token?: string | null },
 ): Promise<{ status: number; frames: SseFrame[]; contentType: string | null }> {
-  const res = await request(`/tasks/${taskId}/events/stream`, opts);
+  const res = await request(`/api/tasks/${taskId}/events/stream`, opts);
   const sse = new SseReader(res.body!.getReader());
   try {
     const frames = opts.count === null ? await sse.drain() : await sse.take(opts.count);
@@ -122,7 +122,7 @@ async function readStream(
 
 beforeAll(applyMigrations);
 
-describe("GET /tasks/:id/events/stream", () => {
+describe("GET /api/tasks/:id/events/stream", () => {
   it("RUNNING 即可回放全部已有事件:Content-Type、id 从 1 起严格递增、data 可解析回信封", async () => {
     const { taskId, attemptIds } = await seedTask([5]);
     const { status, frames, contentType } = await readStream(taskId, { count: 5 });
@@ -146,7 +146,7 @@ describe("GET /tasks/:id/events/stream", () => {
     expect(taskId).toBeTruthy();
     const { frames } = await readStream(taskId, { count: 6 });
     const streamed = SseReader.events(frames);
-    const paged = (await (await request(`/tasks/${taskId}/events`)).json()) as EventsBody;
+    const paged = (await (await request(`/api/tasks/${taskId}/events`)).json()) as EventsBody;
     expect(streamed.map(ident)).toEqual(paged.events.map(ident));
     expect(SseReader.eventIds(frames)).toEqual([1, 2, 3, 4, 5]);
     expect(paged.total).toBe(5);
@@ -167,7 +167,7 @@ describe("GET /tasks/:id/events/stream", () => {
     const lastId = SseReader.eventIds(frames)[SseReader.eventIds(frames).length - 1];
     expect(lastId).toBe(5);
 
-    const paged = (await (await request(`/tasks/${taskId}/events?after=${lastId}`)).json()) as EventsBody;
+    const paged = (await (await request(`/api/tasks/${taskId}/events?after=${lastId}`)).json()) as EventsBody;
     expect(paged.events).toEqual([]);
     expect(paged.total).toBe(5);
 
@@ -179,7 +179,7 @@ describe("GET /tasks/:id/events/stream", () => {
 
   it("口径同源的可执行证据:中间帧 id=2 时,?after=2 与 Last-Event-ID: 2 读出同一批事件", async () => {
     const { taskId } = await seedTask([5], { terminal: true });
-    const paged = (await (await request(`/tasks/${taskId}/events?after=2`)).json()) as EventsBody;
+    const paged = (await (await request(`/api/tasks/${taskId}/events?after=2`)).json()) as EventsBody;
     const stream = await readStream(taskId, { lastEventId: "2", count: 4 });
     const eventFrames = stream.frames.filter((f) => f.event === "agent");
     expect(eventFrames.map((f) => f.id)).toEqual([3, 4, 5]);
@@ -190,7 +190,7 @@ describe("GET /tasks/:id/events/stream", () => {
   it("end 帧:任务离开 RUNNING 且增量推完 → 一帧 end 后流关闭", async () => {
     const { taskId, state } = await seedTask([4], { terminal: true });
     expect(state).toBe("BLOCKED");
-    const res = await request(`/tasks/${taskId}/events/stream`);
+    const res = await request(`/api/tasks/${taskId}/events/stream`);
     const sse = new SseReader(res.body!.getReader());
     try {
       const frames = await sse.drain();
@@ -206,12 +206,12 @@ describe("GET /tasks/:id/events/stream", () => {
   it("非法 Last-Event-ID → 400 invalid_last_event_id;header 缺省 = 0 合法", async () => {
     const { taskId } = await seedTask([1]);
     for (const raw of ["abc", "-1", "1.5", "", "   ", "1e400", "0x10"]) {
-      const res = await request(`/tasks/${taskId}/events/stream`, { lastEventId: raw });
+      const res = await request(`/api/tasks/${taskId}/events/stream`, { lastEventId: raw });
       expect(res.status, `last-event-id=${JSON.stringify(raw)} 应被拒绝`).toBe(400);
       expect(((await res.json()) as ErrorBody).error.type).toBe("invalid_last_event_id");
     }
     // 合法值开的是真流:读完必须取消,否则在 workerd 里留一个还在等下一拍的泵。
-    const ok = await request(`/tasks/${taskId}/events/stream`, { lastEventId: "0" });
+    const ok = await request(`/api/tasks/${taskId}/events/stream`, { lastEventId: "0" });
     expect(ok.status).toBe(200);
     await ok.body!.cancel();
   });
@@ -219,9 +219,9 @@ describe("GET /tasks/:id/events/stream", () => {
   it("鉴权与 /events 同一条 checkApiToken 路径;任务不存在 → 404", async () => {
     expect(TOKEN).toBeTruthy();
     const { taskId } = await seedTask([1]);
-    expect((await request(`/tasks/${taskId}/events/stream`, { token: null })).status).toBe(401);
-    expect((await request(`/tasks/${taskId}/events/stream`, { token: "wrong" })).status).toBe(401);
-    const missing = await request(`/tasks/${crypto.randomUUID()}/events/stream`);
+    expect((await request(`/api/tasks/${taskId}/events/stream`, { token: null })).status).toBe(401);
+    expect((await request(`/api/tasks/${taskId}/events/stream`, { token: "wrong" })).status).toBe(401);
+    const missing = await request(`/api/tasks/${crypto.randomUUID()}/events/stream`);
     expect(missing.status).toBe(404);
     expect(((await missing.json()) as ErrorBody).error.type).toBe("not_found");
   });
