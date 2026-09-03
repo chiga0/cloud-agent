@@ -47,10 +47,12 @@ import {
  * 唯一权威。D1 只承担终态归档(查询/报表),运行中的一切状态只存在于 DO storage。
  *
  * 并发模型:DO 的 RPC 在同一 isolate 内可并发执行(输入门不保护 RPC),
- * `loadAll → await → saveAll` 会在 await 边界交错。所有会写状态的 RPC
+ * `loadAll → await → persist` 会在 await 边界交错。所有会写状态的 RPC
  * 用 `blockConcurrencyWhile` 包住整个临界区,保证串行;事件链由单写者
- * 顺序追加,不分叉。Workflow 重放导致的重复 RPC 靠幂等约定收敛
- * (attempt 非 RUNNING 即忽略;idempotency_key 查重)。
+ * 顺序追加,不分叉。临界区内只允许一次落盘(`persist`:链与状态进同一个事务),
+ * 所以「链前进了而状态没前进」不可表示 —— 被杀的 RPC 什么都不留(§6.1)。
+ * Workflow 重放导致的重复 RPC 靠幂等约定收敛
+ * (attempt 非 RUNNING 即忽略、链里已有本 attempt 的终态事件即忽略;idempotency_key 查重)。
  * 状态转换一律经状态机转换表校验,非法转换抛 AuthorityConflict。
  */
 
@@ -153,11 +155,53 @@ interface SessionData {
   attempts: AttemptRecord[];
   decisions: DecisionRecord[];
   events: EventRecord[];
+  /** 已封箱分片的键,按 seq 升序。loadAll 读回,persist 原样写回同一个列表。 */
+  arcKeys: string[];
+  /** 尚未封箱的当前分片。appendEvent 只改这个数组,不碰 storage。 */
+  curShard: EventRecord[];
+  /** 本轮被塞满的分片(键 → 内容),由 persist 一次性落盘。 */
+  sealedShards: Array<[string, EventRecord[]]>;
 }
 
 type ReportArgs = Parameters<TaskSession["reportExecution"]>[0];
 
 const EVENTS_PER_SHARD = 100;
+
+/**
+ * 链尾 seq,空链为 0 —— 下一个事件的 seq 恒等于 `lastSeq(events) + 1`。
+ * 取号(`appendEvent`)与计数器对账(`reconcileNextSeq`)共用这一个口径,免得两处
+ * 各自数链、算出差来没人发现。events 必须已按 seq 升序(loadAll 排过序,
+ * appendEvent 只会追加更大的 seq)。
+ */
+function lastSeq(events: EventRecord[]): number {
+  return events.length > 0 ? events[events.length - 1].seq : 0;
+}
+
+/**
+ * 链里本 attempt 的终态事件(`attempt.exec_finished` / `attempt.blocked`),没有则 null。
+ *
+ * 判据只按 `attempt_id` 找那一条,不做重放:本函数回答「这件事链里有过吗」,
+ * 不回答「链上发生过什么,所以状态该是什么」—— 后者是 event-sourcing 重放器的活,
+ * 状态机历史仍由 attempt/task 行承载。
+ */
+/**
+ * 从链上那条终态事件推出 attempt 应有的状态。只看事件 kind 与它自带的 exit_code,
+ * 不遍历链、不重放转换 —— 推不出来的字段一律不猜。
+ */
+function derivedTerminalState(e: EventRecord): AttemptState {
+  if (e.kind === "attempt.blocked") return "BLOCKED";
+  const payload = e.payload as { exit_code?: unknown } | null;
+  return payload?.exit_code === 0 ? "SUCCEEDED" : "FAILED";
+}
+
+function terminalEventOfChain(events: EventRecord[], attemptId: string): EventRecord | null {
+  for (const e of events) {
+    if (e.kind !== "attempt.exec_finished" && e.kind !== "attempt.blocked") continue;
+    const payload = e.payload as { attempt_id?: unknown } | null;
+    if (payload?.attempt_id === attemptId) return e;
+  }
+  return null;
+}
 
 /** DO storage 里的 Supervisor 去重表键((attempt,kind,rule,severity) → 上次上报 ms)。 */
 const SUPERVISOR_REPORTED_KEY = "supervisor:reported";
@@ -213,29 +257,90 @@ export class TaskSession extends DurableObject<Env> {
     const attempts = (await this.ctx.storage.get<AttemptRecord[]>("attempts")) ?? [];
     const decisions = (await this.ctx.storage.get<DecisionRecord[]>("decisions")) ?? [];
     const events: EventRecord[] = [];
-    const arc = (await this.ctx.storage.get<string[]>("events:arc")) ?? [];
-    for (let i = 0; i < arc.length; i++) {
-      const shard = await this.ctx.storage.get<EventRecord[]>(arc[i]);
+    const arcKeys = (await this.ctx.storage.get<string[]>("events:arc")) ?? [];
+    for (let i = 0; i < arcKeys.length; i++) {
+      const shard = await this.ctx.storage.get<EventRecord[]>(arcKeys[i]);
       if (shard) events.push(...shard);
     }
-    const cur = (await this.ctx.storage.get<EventRecord[]>("events:cur")) ?? [];
-    events.push(...cur);
+    const curShard = (await this.ctx.storage.get<EventRecord[]>("events:cur")) ?? [];
+    events.push(...curShard);
     events.sort((a, b) => a.seq - b.seq);
-    return { task, attempts, decisions, events };
+    this.reconcileNextSeq(task, events);
+    return { task, attempts, decisions, events, arcKeys, curShard, sealedShards: [] };
   }
 
-  private async saveAll(s: SessionData): Promise<void> {
+  /**
+   * 把 `task.next_seq` 对账成「链尾 + 1」。
+   *
+   * 取号权已经交给事件链(`appendEvent` 读链尾),计数器只剩对账职责 —— 因为**链是唯一
+   * 在一次被杀之后仍然前进的结构**:RPC 死在两步之间时,先落盘的那一层才作数。既然
+   * 计数器不再由 `appendEvent` 推进,它就成了一个可能落后的镜像,读的时候必须以链为准。
+   *
+   * 只在 loadAll 里比一次,不在 appendEvent 里比:后者每轮追加都跑,而计数器恰恰是
+   * 那个「不推进」的字段,拿它当每次追加的前置断言必然天天误报。
+   */
+  private reconcileNextSeq(task: TaskRecord | null, events: EventRecord[]): void {
+    if (!task) return;
+    const chain = lastSeq(events) + 1;
+    if (task.next_seq === chain) return;
+    console.warn(`seq_reconciled task=${task.id} stored=${task.next_seq} chain=${chain}`);
+    task.next_seq = chain;
+  }
+
+  /**
+   * 唯一的持久化出口:状态三份 + 事件链(当前分片、本轮新封箱分片、分片索引)收进
+   * **一次** `put`。DO 的单次多键 put 是一个存储事务,要么全落要么全不落 ——
+   * 「链前进了而状态陈旧」这个 prod 事故形状(probe 任务 5489dc8a:3 次重试各从陈旧
+   * `next_seq` 取号,同一批 6 个事件写 4 份)从此在结构上不可表示。
+   *
+   * 不变式靠调用方维持:每条 RPC / alarm 的临界区都在 `finally` 里经
+   * `inCriticalSection` 落到这里,所以「appendEvent 之后走不到落盘出口」的路径不存在。
+   * 少了这条纪律,原子写会把故障模式从「多写一份」换成更糟的「静默丢事件」。
+   *
+   * 体积上放得下(实测口径):单值 ≤ 128 KiB、单值+键 ≤ 2 MiB、单次 put 合计 ≤ 2 MB;
+   * prod 最大的一条已归档链 10,210 B / 41 条 / 单条最大 397 B ⇒ 满分片(100 条)≈ 40 KB,
+   * 结构开销按 2× 算 ≈ 80 KB < 128 KiB;本方法一次写六个键 ≈ 240 KB ≪ 2 MB。
+   */
+  private async persist(s: SessionData): Promise<void> {
     if (!s.task) return;
-    await this.ctx.storage.put("task", s.task);
-    await this.ctx.storage.put("attempts", s.attempts);
-    await this.ctx.storage.put("decisions", s.decisions);
+    s.task.next_seq = lastSeq(s.events) + 1;
+    const batch: Record<string, unknown> = {
+      task: s.task,
+      attempts: s.attempts,
+      decisions: s.decisions,
+      "events:cur": s.curShard,
+      "events:arc": s.arcKeys,
+    };
+    for (const [key, shard] of s.sealedShards) batch[key] = shard;
+    await this.ctx.storage.put(batch);
+    s.sealedShards = [];
   }
 
-  /** 追加事件到 hash chain。单写者串行执行,链不会分叉。 */
+  /**
+   * 临界区出口:业务体无论正常返回还是抛异常,都必须落一次盘。
+   *
+   * 抛异常时 workerd 会连带丢弃本轮的存储写(并把该实例的 input gate 打成 broken),
+   * 于是外部可观测形态就是「链与状态要么都落、要么都不落」—— 与 prod 里 RPC 被击杀后
+   * 重新 loadAll 的结果一致。这里仍然在 finally 里 persist,是为了让**不**被丢弃的
+   * 那部分实现(异常发生在 put 之后、或写出口本身失败)也永远交出与链自洽的状态,
+   * 而不是留下半份。
+   */
+  private async inCriticalSection<T>(
+    body: (s: SessionData) => Promise<T>,
+  ): Promise<T> {
+    const s = await this.loadAll();
+    try {
+      return await body(s);
+    } finally {
+      await this.persist(s);
+    }
+  }
+
+  /** 追加事件到 hash chain。单写者串行执行,链不会分叉。只改内存,落盘由 persist 负责。 */
   private async appendEvent(s: SessionData, kind: string, payload: unknown): Promise<void> {
     const taskId = s.task!.id;
     const canonical = JSON.stringify({ task_id: taskId, kind, payload });
-    const seq = s.task!.next_seq++;
+    const seq = lastSeq(s.events) + 1;
     const prev = s.events.length > 0 ? s.events[s.events.length - 1].digest : null;
     const digest = await sha256Hex((prev ?? "GENESIS") + canonical);
     const record: EventRecord = {
@@ -249,17 +354,14 @@ export class TaskSession extends DurableObject<Env> {
     };
     s.events.push(record);
 
-    let cur = (await this.ctx.storage.get<EventRecord[]>("events:cur")) ?? [];
-    cur.push(record);
-    if (cur.length >= EVENTS_PER_SHARD) {
-      const arc = (await this.ctx.storage.get<string[]>("events:arc")) ?? [];
-      const key = `evt:${arc.length}`;
-      await this.ctx.storage.put(key, cur);
-      arc.push(key);
-      await this.ctx.storage.put("events:arc", arc);
-      cur = [];
+    s.curShard.push(record);
+    if (s.curShard.length >= EVENTS_PER_SHARD) {
+      // 键沿用 `evt:<已封箱数>`:本轮新封箱的要接在读回来的 arcKeys 之后编号。
+      const key = `evt:${s.arcKeys.length}`;
+      s.sealedShards.push([key, s.curShard]);
+      s.arcKeys.push(key);
+      s.curShard = [];
     }
-    await this.ctx.storage.put("events:cur", cur);
   }
 
   private setState(s: SessionData, to: TaskState): void {
@@ -276,8 +378,7 @@ export class TaskSession extends DurableObject<Env> {
     taskId: string,
     reviewEvidenceMode?: ReviewEvidenceMode,
   ): Promise<{ task_id: string; spec_digest: string }> {
-    return this.ctx.blockConcurrencyWhile(async () => {
-      const s = await this.loadAll();
+    return this.ctx.blockConcurrencyWhile(() => this.inCriticalSection(async (s) => {
       if (s.task) return { task_id: s.task.id, spec_digest: s.task.spec_digest };
       // base_sha 会被原样重放进多个新沙箱执行,校验必须在入口做,而不是在用的时候
       const pin = (spec as { base_sha?: unknown })?.base_sha;
@@ -308,9 +409,8 @@ export class TaskSession extends DurableObject<Env> {
         current_evidence: null,
       };
       await this.appendEvent(s, "task.created", { spec_digest: specDigest, base: s.task.base });
-      await this.saveAll(s);
       return { task_id: s.task.id, spec_digest: specDigest };
-    });
+    }));
   }
 
   // ---- RPC: 启动 attempt(幂等:同 idempotency_key 只创建一个) ----
@@ -324,13 +424,11 @@ export class TaskSession extends DurableObject<Env> {
     verify_context?: { writer_manifest_key: string };
     instructions?: string[];
   }): Promise<{ attempt_id: string; workflow_instance_id: string | null }> {
-    return this.ctx.blockConcurrencyWhile(async () => {
-      const s = await this.loadAll();
+    return this.ctx.blockConcurrencyWhile(() => this.inCriticalSection(async (s) => {
       if (!s.task) throw new Error("task not found");
       const result = await this.startAttemptInternal(s, args);
-      await this.saveAll(s);
       return result;
-    });
+    }));
   }
 
   private async startAttemptInternal(
@@ -462,9 +560,8 @@ export class TaskSession extends DurableObject<Env> {
     patch_digest?: string | null;
     base?: BaseReport | null;
     review?: ReviewVerdict;
-  }): Promise<{ ok: boolean; ignored?: boolean; error?: string }> {
-    return this.ctx.blockConcurrencyWhile(async () => {
-      const s = await this.loadAll();
+  }): Promise<{ ok: boolean; ignored?: boolean; error?: string; reason?: string }> {
+    return this.ctx.blockConcurrencyWhile(() => this.inCriticalSection(async (s) => {
       if (!s.task) return { ok: false, error: "task not found" };
       if (s.task.state === "DONE" || s.task.state === "REJECTED") {
         return { ok: true, ignored: true };
@@ -472,6 +569,20 @@ export class TaskSession extends DurableObject<Env> {
       const attempt = s.attempts.find((a) => a.id === args.attempt_id);
       if (!attempt) return { ok: false, error: "unknown_attempt" };
       if (attempt.state !== "RUNNING") return { ok: true, ignored: true };
+      // 兜底判据:链里已有本 attempt 的终态事件 ⇒ 这次是重复回报,一个事件都不再追加。
+      // 为什么要第二条:`attempt.state` 是链的投影,读它判重等于拿「可能没落盘的那一层」
+      // 当证据 —— prod 5489dc8a 的幂等判据读的恰好是没落盘的状态。主修是原子写
+      // (`persist` 单次多键 put),它把这条路径变成不可达;留着是因为判据本身
+      // 也该读权威那一层,而不是读它的镜像。
+      const alreadyInChain = terminalEventOfChain(s.events, args.attempt_id);
+      if (alreadyInChain) {
+        // 刻意不做事件溯源重放器:只把 attempt 从 RUNNING 挪出,状态行的其余字段
+        // (error_tail / 用量台账)可能仍是陈旧值 —— 这是**已接受的残留风险**,
+        // 理由见 docs/architecture.md:该组合已被原子写排除,不再是活跃故障面。
+        attempt.state = derivedTerminalState(alreadyInChain);
+        if (!attempt.finished_at) attempt.finished_at = this.now();
+        return { ok: true, ignored: true, reason: "already_in_chain" };
+      }
 
       attempt.finished_at = this.now();
       attempt.tokens_used = args.tokens ?? 0;
@@ -519,7 +630,6 @@ export class TaskSession extends DurableObject<Env> {
             await this.onVerifyFailed(s, args.attempt_id, args.error ?? "verifier workflow error", null);
           }
         }
-        await this.saveAll(s);
         return { ok: true };
       }
 
@@ -557,9 +667,8 @@ export class TaskSession extends DurableObject<Env> {
         await this.onReviewerReport(s, attempt, args);
       }
 
-      await this.saveAll(s);
       return { ok: true };
-    });
+    }));
   }
 
   /**
@@ -1204,8 +1313,7 @@ export class TaskSession extends DurableObject<Env> {
     decision: "approve" | "reject";
     actor: string;
   }): Promise<{ ok: boolean; error?: string; state?: TaskState }> {
-    return this.ctx.blockConcurrencyWhile(async () => {
-      const s = await this.loadAll();
+    return this.ctx.blockConcurrencyWhile(() => this.inCriticalSection(async (s) => {
       if (!s.task) return { ok: false, error: "task not found" };
       if (!args.attempt_id || !args.evidence_digest) {
         return { ok: false, error: "evidence_required", state: s.task.state };
@@ -1229,9 +1337,8 @@ export class TaskSession extends DurableObject<Env> {
         decision: args.decision,
         evidenceDigest: binding,
       });
-      await this.saveAll(s);
       return { ok: true };
-    });
+    }));
   }
 
   /** 终态收敛:记录 decision → 状态转换 → 唤醒 writer → 清 alarm → 归档 D1。 */
@@ -1594,14 +1701,12 @@ export class TaskSession extends DurableObject<Env> {
     mode: SupervisorMode;
     reported: Array<{ attempt_id: string; kind: string; rule: string; severity: string }>;
   }> {
-    return this.ctx.blockConcurrencyWhile(async () => {
-      const s = await this.loadAll();
+    return this.ctx.blockConcurrencyWhile(() => this.inCriticalSection(async (s) => {
       if (!s.task) return { mode: this.supervisorMode(), reported: [] };
       const mode = this.supervisorMode();
       const nowMs = Date.now();
       const before = s.events.length;
-      const appended = await this.runSupervisorTick(s, mode, nowMs);
-      if (appended) await this.saveAll(s);
+      await this.runSupervisorTick(s, mode, nowMs);
       const written = s.events
         .slice(before)
         .filter((e) => e.kind === "supervisor_finding")
@@ -1615,7 +1720,7 @@ export class TaskSession extends DurableObject<Env> {
           return { attempt_id: p.attempt_id, kind: p.kind, rule: p.rule, severity: p.severity };
         });
       return { mode, reported: written };
-    });
+    }));
   }
 
   // ---- alarm:归档重试 + attempt 超时兜底 ----
@@ -1623,8 +1728,7 @@ export class TaskSession extends DurableObject<Env> {
   async alarm(): Promise<void> {
     // alarm 与 RPC 并发:不复用同一临界区,陈旧快照可能把已裁决的任务改写成
     // BLOCKED,并把陈旧行覆盖回 D1 归档。
-    return this.ctx.blockConcurrencyWhile(async () => {
-      const s = await this.loadAll();
+    return this.ctx.blockConcurrencyWhile(() => this.inCriticalSection(async (s) => {
       if (!s.task) return;
 
       if (
@@ -1636,7 +1740,6 @@ export class TaskSession extends DurableObject<Env> {
         } catch {
           await this.ctx.storage.setAlarm(Date.now() + 30_000);
         }
-        await this.saveAll(s);
         return;
       }
 
@@ -1669,8 +1772,8 @@ export class TaskSession extends DurableObject<Env> {
             await this.ctx.storage.setAlarm(Date.now() + 30_000);
           }
         }
-        // 只有真的改了状态才回写:提前触发(无人过期)时不写,避免与并发 RPC 互踩快照
-        await this.saveAll(s);
+        // 回写一律在临界区出口的 persist 里完成:blockConcurrencyWhile 已保证没有并发 RPC
+        // 与本 alarm 交错,「只在 changed 时才写」省下的那次写换不来任何安全边际。
       }
 
       // alarm 是一次性的:本次触发没有任何 attempt 过期时也必须续期,
@@ -1686,10 +1789,8 @@ export class TaskSession extends DurableObject<Env> {
       // 静默写者)。必须在续期之前跑:判据与下一次醒来的时刻共用同一个 nowMs 基准。
       const mode = this.supervisorMode();
       if (!terminal && mode !== "off") {
-        const reportedSomething = await this.runSupervisorTick(s, mode, nowMs);
-        // 与上面 changed 同一纪律,但条件不同:这里回写的理由 next_seq 被事件推进过,
-        // 不持久化会让下一次 loadAll 读到旧 next_seq 从而重号 seq。
-        if (reportedSomething) await this.saveAll(s);
+        await this.runSupervisorTick(s, mode, nowMs);
+        // 与上面同一纪律:事件只进内存,落盘交给临界区出口的 persist。
       }
 
       const next = nextWatchdogAlarm({
@@ -1700,6 +1801,6 @@ export class TaskSession extends DurableObject<Env> {
         supervisorTickMs: mode === "off" ? undefined : this.supervisorTickMs(),
       });
       if (next != null) await this.ctx.storage.setAlarm(next);
-    });
+    }));
   }
 }

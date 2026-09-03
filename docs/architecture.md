@@ -212,6 +212,57 @@ M1 起权威从「Worker 直接 CAS D1 行」迁到 `TaskSession` DO,早期的 `
 - `version` 是 fencing token:`setState` 每次 +1,并作为 `fencing_token` 写进 decisions 与归档。它现在的作用是**让外部读到的视图可判断新旧**,不再承担"调用方先读后写"的乐观锁义务——串行化已在 DO 内部完成。
 - 事件按 task 单调 `seq` 追加、分片(每片 100 条),链内单写者。~~同一 task 并发 `appendEvent` 会读到同一个 prev 从而分叉~~ 已修(0003 加 seq + DO 串行),`GET /admin/chain-check` 可持续复核(§13.1)。
 
+### 6.1 一次 RPC 被杀不得损坏权威链(c11)
+
+prod 任务 `5489dc8a` 的故障形状:`appendEvent` 是写穿的 —— `const seq = s.task!.next_seq++` 之后
+立刻 `put` 事件分片,而 `task`/`attempts`/`decisions` 只在最后一步 `saveAll` 落盘。一次 RPC 在两步
+之间被击杀(`exceededWallTime`,wall=30004ms)⇒ **链已前进、状态陈旧**,而幂等判据读的恰好是那份
+没落盘的状态。Workflow 的 3 次重试各从陈旧 `next_seq` 取号,同一批 6 个事件被写 4 份;次生灾害是
+重号的链撞 `migrations/0003` 的 `CREATE UNIQUE INDEX idx_events_task_seq` ⇒ 整批归档永久失败。
+三处改动把这类损坏变成结构上不可表示:
+
+1. **链与状态同一次原子写**。`appendEvent` 只改内存(链数组 + 当前分片),唯一的落盘出口是
+   `private async persist(s)`:一次 `ctx.storage.put({...})` 多键写覆盖 `task` / `attempts` /
+   `decisions` / `events:cur` / 本轮新封箱分片 / `events:arc` —— DO 的单次多键 put 是一个存储事务,
+   要么全落要么全不落。每条写路径(RPC 与 `alarm`)整体经 `inCriticalSection` 进入,业务体无论正常
+   返回还是抛异常,都在 `finally` 里落到同一个出口。**这是本节的硬约束:「链写了、异常路径跳过落盘」
+   的组合一旦存在,故障模式就从「多写一份」退化成「静默丢事件」,那是更坏的失效**(理由见下面第 5 条)。
+   `saveAll` 已删除 —— 留两套写出口等于留下可被绕过的第二扇门。
+2. **取号来自链,不来自计数器**。`seq = lastSeq(events) + 1`(链尾 + 1)。`task.next_seq` 字段与
+   归档 schema 都保留,但降级为**对账字段**:`persist` 只做同步镜像,对账放在 `loadAll`(读到的计数器
+   vs 读到的链),不相等时以链为准并 `console.warn("seq_reconciled task=… stored=… chain=…")`,一次
+   载入最多一条。为什么对账在 `loadAll` 而不在 `appendEvent`:后者每轮都跑,而计数器恰恰是那个不再
+   被追加动作推进的字段,拿它当每次追加的前置断言必然在每个追加事件的轮次误报。
+   为什么建立在链上:**链是唯一在一次被杀之后仍然前进的结构,凡不可重放的分配器都必须建立在
+   已落盘的那一层上。**
+3. **终态回报的判重读链(兜底,不是主修)**。`reportExecution` 在 `attempt.state !== "RUNNING"`
+   之外加一条:链里已有本 attempt 的 `attempt.exec_finished` / `attempt.blocked`(按 `attempt_id`
+   匹配)⇒ 不追加任何事件,落一次状态,返回 `{ ok: true, ignored: true, reason: "already_in_chain" }`。
+   **已接受的残留风险(这是取舍,不是遗漏)**:判重命中时状态行的其余字段(`error_tail`、用量台账)
+   可能仍是陈旧值 —— 这里刻意不写事件溯源重放器,不从链反推状态机历史。该组合之所以可以接受,是因为
+   第 1 条已把它变成**不可达路径**:留这条判据的意义是让「读证据的那一层」也站在权威一侧,
+   而不是给状态行补数据。
+4. **`waitUntil` 不等于 fire-and-forget 的许可证**。`ctx.waitUntil` 只延长实例寿命,既不参与本轮的
+   storage 事务,也不保证跑完(实例被驱逐、进程被杀、异常吞掉都会让它蒸发)。所以它只能承载
+   「丢了也无所谓」的副作用 —— 现存的唯一用途是 `destroyAttemptSandbox`(销毁容器,失败留日志,
+   平台回收兜底)。任何权威写进 `waitUntil` 都是把第 1 条的原子性从根上游拆掉。
+5. **宁可整批归档失败,也不静默丢事件**。归档撞 UNIQUE 索引时整批 `DB.batch` 失败、`archived` 保持
+   false、alarm 重试 —— 代价是这个任务在 D1 里查不到,但链本身仍然自洽、chain-check 仍然说得清
+   是谁不对。静默丢事件的代价相反:链与归档从此**互相印证一个不存在的历史**,而没有任何信号。
+   可检测的失败优于不可检测的"成功"。
+
+体积结论(实测口径,不是估计):DO storage 单键 ≤ 2 MiB、**单值 ≤ 128 KiB(131072 B)**、单次 `put`
+的 key+value 合计 ≤ 2 MB。prod 最大的一条已归档链 = 10,210 B / 41 条 / 平均 249 B / 单条最大 397 B
+⇒ 一个满分片(`EVENTS_PER_SHARD = 100`)≈ 40 KB,结构开销按 2× 算 ≈ 80 KB < 128 KiB;
+`persist` 一次写六个键 ≈ 240 KB ≪ 2 MB。所以分片结构不需要为体积改动。
+
+测试口径(workerd 实测语义,写在这里免得下一个人重新摸索):**一次抛异常的 RPC 会把该轮 storage 写
+整体丢弃**,并把该 DO 实例的 input gate 打成 broken(此后每次调用返回同一个错误,且给测试进程留下
+一条 `durableObjectReset` unhandled rejection,足以把整个套件染红)。因此「链已前进、状态陈旧」的
+半写残骸在 miniflare 里既造不出来也读不到;`test/session-do.test.ts` 的 (a)(b)(c) 钉的是可观测的
+那一半 —— 取号连续无重号直到 `idx_events_task_seq` 吃下整批、重放 4 次链只前进一块、异常轮次照样交出
+与链自洽的状态。
+
 ---
 
 ## 7. 执行面 — Workflow + Sandbox + Extract

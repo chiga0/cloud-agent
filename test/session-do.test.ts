@@ -846,3 +846,126 @@ describe("attempt token 台账落库", () => {
     expect(row.cost_weighted_tokens).toBe(R11_COST);
   });
 });
+
+/**
+ * c11 主修:一次 DO RPC 被杀不得把权威链写成「重号 + 不可归档」的损坏状态。
+ *
+ * 三条用例受同一条平台事实约束(workerd 的实测语义,不是本仓的选择):**抛异常的 RPC
+ * 会整体丢弃该轮的 storage 写**,并把该 DO 实例的 input gate 打成 broken —— 之后每次
+ * 调用都返回同一个错误,且每个这样的调用都会给测试进程留下一条 unhandled rejection
+ * (`durableObjectReset`)。所以「链已前进、状态陈旧」的残骸在 miniflare 里既造不出来
+ * 也读不到,而任何让 RPC 往外抛的用例都会把整个套件染红。用例因此钉可观测的那一半:
+ * 取号与归档看的是链(唯一在被杀后仍前进的结构),而不是 `task.next_seq`。
+ */
+describe("事件与状态同一次原子写(c11)", () => {
+  async function chainOf(stub: Stub) {
+    return (await stub.getSnapshot())!;
+  }
+
+  async function driveToDone(stub: Stub, taskId: string): Promise<void> {
+    await stub.createTask({ prompt: "atomic write" } as never, taskId);
+    await writerOk(stub);
+    await reviewerReport(stub, { exit_code: 0, review: { decision: "approve", reason: "看着可以" } });
+    const snap = await chainOf(stub);
+    if (snap.task.state === "AWAITING_APPROVAL") {
+      const ev = await stub.getEvidenceSummary();
+      const done = await stub.submitDecision({
+        attempt_id: ev.writer_attempt_id!,
+        evidence_digest: ev.binding_digest!,
+        decision: "approve",
+        actor: "human:test",
+      });
+      expect(done.ok).toBe(true);
+    }
+  }
+
+  it("(a) 取号来自链尾:归档写进 D1 时 (task_id, seq) 不重号", async () => {
+    const taskId = crypto.randomUUID();
+    const stub = newStub();
+    await driveToDone(stub, taskId);
+
+    const snap = await chainOf(stub);
+    expect(snap.task.state).toBe("DONE");
+    const seqs = snap.events.map((e) => e.seq);
+    // 链是 1..N 连续无重号:任何一次从陈旧计数器取号的重放都会在这里露出来
+    expect(seqs).toEqual(seqs.map((_, i) => i + 1));
+    // next_seq 降级为对账字段:它是链的镜像,不是取号来源
+    expect(snap.task.next_seq).toBe(seqs.length + 1);
+
+    // 真实代码路径上的 UNIQUE 约束(migrations/0003 idx_events_task_seq):prod 事故里
+    // 重号的链正是撞它,导致整批归档永久失败。归档落地 ⇒ 索引吃下了这一批。
+    const archived = await env.DB.prepare(
+      "SELECT COUNT(*) AS rows_total, COUNT(DISTINCT seq) AS seqs_unique FROM events WHERE task_id = ?",
+    )
+      .bind(taskId)
+      .first<{ rows_total: number; seqs_unique: number }>();
+    expect(archived!.rows_total).toBe(seqs.length);
+    expect(archived!.seqs_unique).toBe(seqs.length);
+  });
+
+  it("(b) 同一份终态回报重放 4 次:链只前进一块", async () => {
+    const stub = newStub();
+    await createTask(stub);
+    const { attempt_id } = await stub.startAttempt({
+      role: "writer",
+      idempotency_key: crypto.randomUUID(),
+      ...BUDGET,
+    });
+    const report = { attempt_id, exit_code: 0, result_text: "已按要求完成" };
+    const first = await stub.reportExecution(report);
+    expect(first.ok).toBe(true);
+
+    const seqsFirst = (await chainOf(stub)).events.map((e) => e.seq);
+    expect(new Set(seqsFirst).size).toBe(seqsFirst.length);
+
+    for (let i = 0; i < 4; i++) {
+      const again = await stub.reportExecution(report);
+      expect(again).toMatchObject({ ok: true, ignored: true });
+    }
+
+    const replayed = await chainOf(stub);
+    // 链一块都没再前进:重复回报既不再追加事件,也不推进取号
+    expect(replayed.events.map((e) => e.seq)).toEqual(seqsFirst);
+    expect(replayed.task.next_seq).toBe(seqsFirst.length + 1);
+  });
+
+  it("(c) 本轮内部抛异常:照样落盘,且落下的内容与链自洽", async () => {
+    const taskId = crypto.randomUUID();
+    const stub = newStub();
+    await stub.createTask({ prompt: "mid-round failure" } as never, taskId);
+    await writerOk(stub);
+    // reviewer 抖动一次 ⇒ awaiting_human + AWAITING_APPROVAL:终态只能由人工给,
+    // 于是下面这条 submitDecision 会走完整的 finishApproval(含唤醒 writer)。
+    await reviewerReport(stub, { exit_code: 12, error: "reviewer boom" });
+    const awaiting = await chainOf(stub);
+    expect(awaiting.task.state).toBe("AWAITING_APPROVAL");
+    const ev = await stub.getEvidenceSummary();
+
+    const bag = env as unknown as Record<string, unknown>;
+    const realWorkflow = bag.ATTEMPT_WORKFLOW;
+    // 抽掉 workflow 绑定 ⇒ finishApproval 唤醒 writer 时抛 ⇒ notifyWriter 自己接住并往
+    // 链里补一条 workflow.notify_failed。异常被吞在业务体里,落盘出口照常执行:
+    // 要钉的就是「异常轮次也交出与链自洽的状态」,而不是把事件丢在半路。
+    delete bag.ATTEMPT_WORKFLOW;
+    const done = await stub.submitDecision({
+      attempt_id: ev.writer_attempt_id!,
+      evidence_digest: ev.binding_digest!,
+      decision: "approve",
+      actor: "human:test",
+    });
+    bag.ATTEMPT_WORKFLOW = realWorkflow;
+    expect(done.ok).toBe(true);
+
+    const snap = await chainOf(stub);
+    expect(snap.task.state).toBe("DONE");
+    const seqs = snap.events.map((e) => e.seq);
+    expect(seqs).toEqual(seqs.map((_, i) => i + 1));
+    expect(kinds(snap)).toContain("workflow.notify_failed");
+    // 链与状态一起前进:归档批次与链逐条对齐(静默丢事件会让这里少几行)
+    const rows = await env.DB.prepare("SELECT COUNT(*) AS c FROM events WHERE task_id = ?")
+      .bind(taskId)
+      .first<{ c: number }>();
+    expect(rows!.c).toBe(seqs.length);
+  });
+});
+
