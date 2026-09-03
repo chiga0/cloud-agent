@@ -506,6 +506,8 @@ event: end
 data: {"v":1,"task_id":"…","events":450,"unreadable_attempts":[]}
 ```
 
+> **prod 客户端观测不到 `x-accel-buffering`**(2026-09-03 定性,非回归):它是给中间盒的消费型指令头(nginx 系约定),Cloudflare 边缘按语义消费后不向客户端转发 —— 同一 Response 上代码设置的 `cache-control: no-cache, no-transform` 原样可见,证明头透传本身无恙。客户端侧验证「禁缓冲生效」看 `cache-control`,不要用本头做断言。
+
 - 事件帧的 `data` 就是 `AgentEventV1` 原文(§9.5 的信封),**不解析、不加工、不重排字段** —— 脱敏已在 ingress 完成,读端点再加工就是第二个口径。
 - `event:` 名固定 `agent`(事件帧)与 `end`(终止帧);`end` 的 `data` 形状版本 `v` 是 `OBS_SSE_FRAME_V`,与 `AgentEventV1.v` **各自独立演进**。
 - **`data:` 恒为一行**。一个裸换行会把一条事件切成两帧、把后续行当新帧解析 —— 那是 SSE 注入。`JSON.stringify` 已把 `\n`/`\r` 转义成两字符序列,注入这条路天然封死;剩下 U+2028/U+2029:对 JSON 合法、对 SSE 分行规则非法,而不少语言的分句函数(Python 的 `splitlines` 即一例)会当换行处理 —— 而 payload 里装的正是 agent 的任意自由文本。所以 `sseData()` 显式转义这两个码位,让「一帧一个 data 行」对任何客户端都成立(测试逐帧断言 `data:` 行数为 1)。
