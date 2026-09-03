@@ -30,6 +30,8 @@ interface ExecOutcome {
   transcript: ArtifactRef;
   stderr: ArtifactRef;
   patch?: ArtifactRef;
+  /** 预算到期导出的差量:随证据上翻,读模型据此说明「这不是自认完成的候选」 */
+  patchIncompleteReason?: string;
   /** repo 任务:本次执行实际所基于的精确 commit(writer 与 verifier 必须同值) */
   base?: BaseReport;
   /** reviewer 专用:模型正文(受 max_tokens 约束,体积小,可直接进步骤返回值) */
@@ -44,9 +46,17 @@ function slim(r: {
   transcript: ArtifactRef;
   stderr: ArtifactRef;
   patch?: ArtifactRef;
+  patchIncompleteReason?: string;
   base?: BaseReport;
 }): ExecOutcome {
-  return { exitCode: r.exitCode, transcript: r.transcript, stderr: r.stderr, patch: r.patch, base: r.base };
+  return {
+    exitCode: r.exitCode,
+    transcript: r.transcript,
+    stderr: r.stderr,
+    patch: r.patch,
+    patchIncompleteReason: r.patchIncompleteReason,
+    base: r.base,
+  };
 }
 
 const EXEC_RETRIES = { retries: { limit: 2, delay: "10 seconds", backoff: "exponential" } } as const;
@@ -297,6 +307,9 @@ export class AttemptWorkflow extends WorkflowEntrypoint<Env, AttemptParams> {
       });
 
       const manifestRef = await step.do("evidence", async () => {
+        // 「有 patch 且带不完整原因」才写字段:两个条件都必要 —— 原因字段可能在
+        // 没有 patch 的失败路径上被上游带上,那时无处可挂,写进 manifest 只会造假。
+        const incompletePatch = Boolean(run.patch && run.patchIncompleteReason);
         const manifest: EvidenceManifest = {
           schema_version: 2,
           task_id: p.task_id,
@@ -308,6 +321,8 @@ export class AttemptWorkflow extends WorkflowEntrypoint<Env, AttemptParams> {
           transcript: run.transcript,
           artifacts: [run.stderr],
           patch: run.patch,
+          patch_complete: incompletePatch ? false : undefined,
+          patch_incomplete_reason: incompletePatch ? run.patchIncompleteReason : undefined,
           base: run.base?.sha ? { sha: run.base.sha, source: run.base.source } : undefined,
         };
         return writeManifest(this.env.EVIDENCE, manifest);

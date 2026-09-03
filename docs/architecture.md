@@ -243,11 +243,47 @@ Durable Workflow 把一次 attempt 切成若干独立幂等 step,崩溃后从最
 4. 写 `/workspace/task.txt` = prompt(镜像由 `sandbox/Dockerfile` 预装 qwen-code,不再现场 `npm install`;缺二进制即 `exit 127` 直接失败并落证据,不做兜底 shim)。repo 任务的 prompt 前置【基线约束】:工作副本已 detach 到 `<sha>`,禁止 `git fetch/pull/switch/checkout` 与改写历史 —— 不写清这一点,writer 会自作主张「同步到最新」,把候选做进另一个世界。
 5. `exec` 跑 `qwen -p "$(cat task.txt)" --output-format stream-json --auth-type openai --yolo --max-session-turns 12 --max-wall-time 5m`
 6. 软失败检测:qwen 在 API 错误时仍 exit=0,但最后一条 `type=result` 的 `result` 字段会含 `[API Error:...]`。识别后上翻 exit_code=11
-7. transcript / stderr 写 R2(内容寻址);成功且为 repo 任务时导出候选 patch —— **断言式**:`cat-file -e` 确认基线对象在 → `git add -A` → `git diff '<base_sha>' --binary`,任一步非零即 `exit 23` 且**不产出半成品补丁**(宁可失败,也不交出一张不知道对谁有效的补丁)
+7. transcript / stderr 写 R2(内容寻址);**成功或预算到期**且为 repo 任务时导出工作树差量(到期那一支的产物自称不完整,见 §7.2.1)—— **断言式**:`cat-file -e` 确认基线对象在 → `git add -A` → `git diff '<base_sha>' --binary`,正常路径任一步非零即 `exit 23` 且**不产出半成品补丁**(宁可失败,也不交出一张不知道对谁有效的补丁)
 8. 返回 `{ exitCode, transcript, stderr, patch, base }`,`base = { sha, source }` 随证据链上翻到控制面
 9. **验证语义不在此执行**:`verify_command` 由独立 verifier 在另一沙箱**同一基线**上重放(见 §13.10);非 repo 任务无验证
 
 **软失败检测的意义**:qwen-code 把 API 错误嵌入 stream-json 的 result 事件而不是反映在退出码,如果不识别会把"401/限流"当成"任务成功"。
+
+### 7.2.1 预算到期时的产物语义(exit 55 / 53)
+
+**墙钟到期不等于工作全部归零。** `--max-wall-time` / `--max-session-turns` 是 qwen 自己下发的退出码(`EXIT_BUDGET_ABORT=55` / `EXIT_SESSION_TURNS_LIMIT=53`,定义在 `src/routing/classify.ts`),进程停下的那一刻**容器还活着** —— 销毁发生在 attempt 终态时(DO 的 `reportExecution` → `destroyAttemptSandbox`),而 collect 相排在它之前。所以那份跑了几十分钟的工作树差量一直就地可取,此前只是没人去取。
+
+要治的病(prod 标本 `5489dc8a`、`dbcc8fc0`,两次同形):writer 干净做完或做到一半 → 墙钟到期以 exit 55 收场 → 导出分支的条件是 `exitCode === 0`,**补丁从未被导出** → BLOCKED 那头的人拿到的信息量只有一个退出码,两次各白烧 ≈25 万 token。
+
+`collectQwenAttempt` 的导出条件因此从「仅 `exitCode === 0`」放宽为「`exitCode === 0` **或**预算类退出码」。四条边界,一条不乱:
+
+| 情形 | 处置 |
+|---|---|
+| exit 55/53 + 工作树有差量 | 导出,并**自称不完整**:manifest 落 `patch_complete: false` + `patch_incomplete_reason: "budget_abort(exit=55)"` |
+| exit 55/53 + `git diff` 为零(被杀在只读阶段) | **不产出候选**(零差量是事实,不是一份空补丁),留一行可 grep 的 `budget_abort_no_diff` |
+| exit 55/53 + 补丁超 `MAX_PATCH_BYTES` | 不产候选,留 `budget_abort_patch_export_failed` 日志。**上限不绕开**;也**不把 55 改写成 24** —— 换码会让同一次死亡从 `route_decision(budget_abort)` 改轨到 `base.failed`,而路由语义不变是这一棒的前提 |
+| 非预算类失败(exit 1、API 错误上翻的 11、容量事实的 -1) | 一律不导:那种时刻的工作树状态不可知,导出来的是猜测,不是证据 |
+
+`exitCode === 0` 那一支的字节行为一字未改 —— 包括零差量时仍产出空补丁(那是 writer 自认「无需改动」,与「被杀时还没写文件」是两件事,所以那一侧不做判空)。
+
+**为什么必须带标记**:一份 40 分钟的在途 diff 与一份自认完成的候选,如果在读端长得一模一样,人就会把前者当后者用。标记沿 `manifest → /candidate → 验证报告` 传递,判读口径统一为 **present ⇔ incomplete**(字段只在不完整时写入,缺省即完整 —— 这样历史 manifest 与新生成的在字节上同构,也不会给每次成功都加一个恒真字段去改 manifest digest):
+
+- `GET /tasks/:id/candidate`:视图新增 `patch_complete` / `patch_incomplete_reason`,`warnings` 点名「这是 writer 预算到期那一刻的在途差量,不是它自认完成的候选」,`safe_to_apply` 恒 `false`(即使后来被独立验证或被人工批准 —— 验证结论只对它自己的输入成立,而这份输入的完整性由执行面否定);
+- `GET /tasks/:id/candidate?format=patch`:响应多一个 `x-patch-complete` 头,`curl -OJ` 的人不看 body 也知道拿到的是什么;
+- verifier 的结构化报告在**被验 manifest 自报不完整时**带 `writer_patch_incomplete`(正常候选的报告字节不变):一个绿了的 apply+verify 不能把在途差量洗成合格候选。
+
+**BLOCKED 不再是零信息 —— 以及这一棒的边界**。exit 55 仍按 M9.5②(§13.21)分类为 `budget_abort` 并 BLOCKED 转人工:本棒**不**升格差量为正常候选、**不**新增自动返工、**不**改 `current_evidence` 的钉住规则。不改的理由:覆盖前一轮成功候选的指针是净损失信息,还会让审批的 `binding_digest` 中途换轨 —— 那是路由/审批语义的改动,不属于「只多导出一步」这一棒。人在 BLOCKED 这头取差量走事件链(失败回报同样落 `evidence.manifest` 事件,指针从来就在链上):
+
+```
+GET /tasks/<id>            → events 里该 attempt 的 evidence.manifest 事件 → manifest_key
+   (已归档任务改读 GET /admin/events?task_id=<id> 的 canonical 原文)
+cloud-agent-evidence/<manifest_key>     → patch.key + patch_complete + patch_incomplete_reason
+cloud-agent-artifacts/<patch.key>       → 击杀那一刻的差量正文(git apply 前先自己看一遍)
+```
+
+> 为什么差量从事件链取而不是直接出现在 `/candidate`:`/candidate` 是 `current_evidence` 的投影,而 M7 的失败门禁规定 writer 失败产物不进审批流、不钉证据。读端对 `patch_complete` 的处理已经就位(视图、下载头、验证报告三处),将来若决定把被击杀的差量也钉成候选,这一棒不必再动执行面。
+
+取证日志三条,都带退出码,可 grep:`budget_abort_no_diff`(到期且无差量)、`budget_abort_patch_export_failed`(到期且导出失败/超限)、`patch too large:`(容器内预检的超限原文,§13.17 那条上限的既有出口)。
 
 ### 7.3 答案提取与记账 (src/exec/extract.ts)
 
@@ -331,10 +367,14 @@ interface EvidenceManifest {
   transcript: ArtifactRef;        // qwen 的 stream-json 输出
   artifacts: ArtifactRef[];       // 当前实际只放 stderr
   patch?: ArtifactRef;            // writer 导出的候选变更(repo 任务),供 verifier 重放
+  patch_complete?: boolean;       // **只在不完整时写 false**;缺省 = 完整(含本字段引入前的历史 manifest)
+  patch_incomplete_reason?: string; // 如 "budget_abort(exit=55)":击杀那一刻的在途差量,见 §7.2.1
   base?: { sha: string; source: "resolved_default" | "pinned" };  // 该候选所基于的精确 commit
   model_calls_digest?: string;    // 预留:整轮 model call 的 Merkle 根
 }
 ```
+
+> **为什么 `patch_complete` 只在不完整时出现**:manifest 的 key 含正文 digest,给每一次成功导出都加一个恒真字段,会让同一份产出在字段引入前后落进不同 key、语义却毫无变化;而缺省对读取方必须是「完整」—— 历史 manifest 全部出自 exit 0 的干净退出,把它判读成不完整是造假。口径统一为 **present ⇔ incomplete**。
 
 > **为什么 `base` 必须在 manifest 里**:没有它,patch 只能对「当时那条默认分支」说话 —— 跨轮 `patch_digest` 比较失去意义,证据也无法自证「基于哪个世界」。`TaskRecord.base` 是任务级权威,manifest 的 `base` 是这份候选自己的血统;两者不一致时(基线在候选产生后变了)交付视图报的是**候选的**基线。
 >
@@ -1395,6 +1435,8 @@ r11 向量自检:`factor=1` → 6,949,711,**恰等于 raw total**(「缓存与 f
 **为什么环境签名必须 shadow**:它是错误文本的启发式匹配,存在真实误报面。仓内惯例是「有否决权的开关先攒样本再 enforce」—— `REJECT_EVIDENCE_MODE`(§13.12)、`BASE_PIN_MODE`(§13.13)、`EGRESS_MODE`(§13.14)皆如此,本条同一口径。**切 enforce 的判据先写死,以免将来靠感觉**:`route_decision ∧ outcome_kind=env_transient` 的样本 ≥10 条、且人工复核误报率 <10%,才谈处置;而届时的处置首选**重试 verifier**(换容器重验有意义),不是 BLOCKED 转人工,更不是返工 writer。
 
 **刻意不做**:不改 exit 53/55 的产生侧(qwen 的预算机制不动);不写 env_transient 的 enforce 与 `retry_verifier` 分支(样本未够,不写半截的 retry);不动 evidence / binding / digest / 审批逻辑;不改 writer/verifier 的执行行为本身(只改它们结束后的路由);不做 Supervisor 与外圈告警(下一期,与本 case 正交)。
+
+**后续(M9.5④):分类不变,但 BLOCKED 不再是零信息**。分流把「预算到期」从返工里摘出来,省下的是下一轮的 25 万 token;它治不了另一半 —— 人被转到 BLOCKED 时手里仍然只有一个退出码,writer 跑掉的那 40 分钟整份蒸发。本期补的就是这一半:导出条件放宽到预算类退出码,产物自称不完整(`patch_complete: false` + 原因),读端口径见 §7.2.1 与 §9 的 manifest schema。**分类与处置一字未动** —— 55 仍是 `budget_abort` 仍 BLOCKED,差量不升格成候选、不触发自动返工、`current_evidence` 的钉住规则不变(所以它从事件链取,不在 `/candidate` 上出现)。
 
 **验证与边界**(2026-09-02 本地):`npm run typecheck` 干净;`npm test` → 21 文件 **354** 条全绿(基线 323 + 新增 31:`test/routing-classify.test.ts` 22 条判据穷举 + `test/routing-do.test.ts` 9 条真 DO 路由)。新增夹具 `test/fixtures/env-transient-report.ts` 保存标本的 `stderr_tail` 形态(四处引文原样保留,其余按 npm 10 的既有输出形态补全,夹具里写明了保真度边界)。DO 侧钉法:`exit 55` → `route_decision{budget_abort,blocked,enforced=true}` + `BLOCKED` + `awaiting_human` + writer attempt 数不变 + 无 `writer.rework_scheduled`;`exit 53` 与 `exit 55` 的 reason 可分辨;shadow 环境签名与同形普通质量失败的**路由行为逐字段等值**(事件种类序列、`verify.rework_scheduled` 的字段集 / reason / attempt_number、attempt 计数、`task.state`),只有分类字段不同;`route_decision` 在链上的位置(`writer.failed` 之后、`task.transition` 之前)、seq 单调、digest 前继,以及 BLOCKED 归档后从 D1 `events` 读回的 canonical 原文与 digest 同值。质量路径一条断言未改即全绿 —— 那就是「语义不变」的回归证据。**变异验证五条**(逐条改坏判据,确认用例真能抓到它声称抓的东西;数字为变红条数,还原后全绿):`EXIT_BUDGET_ABORT` 55→54 → 5 红;删掉环境判据的 `apply.exit_code!==0` 约束 → 1 红(apply 失败被洗成环境问题);`quality_fallback` 模式 enforce→shadow → 4 红(`enforced=true` 断言);删掉 verifier 侧接线 → 3 红(`route_decision` 缺失);预算判据放开到两个角色 → 2 红(role 区分失守 —— verifier 的 53/55 会被当预算到期停成 BLOCKED,把真质量失败洗白)。**prod 未取证**:53/55 分流的可达性由测试证明,真实命中要等下一个撞预算的 attempt;`env_transient` 的 shadow 样本从本版本部署起才开始积累。
 

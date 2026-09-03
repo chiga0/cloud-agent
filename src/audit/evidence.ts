@@ -45,6 +45,21 @@ export interface EvidenceManifest {
   artifacts: ArtifactRef[];
   /** writer 导出的候选变更 patch(repo 任务),供独立验证器重放 */
   patch?: ArtifactRef;
+  /**
+   * 补丁完整性。**只在不完整时写入**,缺省 = 完整(含本字段引入前的全部历史
+   * manifest —— 那时预算到期根本导不出补丁,不存在不完整样本)。
+   *
+   * 为什么不写成 `patch_complete: true` 覆盖正常路径:manifest 的 key 含正文
+   * digest,给每次成功都加一个恒真字段会让历史 manifest 与新生成的在字节上
+   * 分叉,而语义毫无变化。读端一律按「present ⇔ incomplete」判读。
+   *
+   * `false` 的语义是「这是 writer 被预算击杀那一刻的在途差量」,不是 writer 自认
+   * 完成的候选:它可以不完整、不可编译,甚至只是半成品文件的一半。读模型必须把
+   * 这句话原样带出去,否则一份 40 分钟的差量会伪装成一个候选。
+   */
+  patch_complete?: boolean;
+  /** 不完整原因,形如 `budget_abort(exit=55)`;与 patch_complete=false 成对出现 */
+  patch_incomplete_reason?: string;
   base?: BaseRef;
   model_calls_digest?: string;
 }

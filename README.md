@@ -75,6 +75,20 @@ curl -s localhost:8787/tasks/<task_id>/candidate -H "authorization: Bearer $TOKE
 curl -s -OJ "localhost:8787/tasks/<task_id>/candidate?format=patch" -H "authorization: Bearer $TOKEN"
 git -C <你的仓库> checkout <candidate.base.sha> && git apply task-<task_id>-<patch前12位>.patch
 
+# 预算到期(exit 55 墙钟 / 53 turns)时的产物语义:墙钟到期不再等于工作全部归零。
+# qwen 自己按预算干净退出时容器还活着(销毁在 attempt 终态),所以那份在途差量现在会被导出,
+# 但它**自称不完整**:manifest / 视图写 patch_complete=false + patch_incomplete_reason="budget_abort(exit=55)",
+# warnings 点名「不是 writer 自认完成的候选」,safe_to_apply 恒 false(下载响应同义头 x-patch-complete: false)。
+# 分类与处置一字未动:55 仍是 budget_abort 仍 BLOCKED 转人工,差量不升格成候选、不自动返工;
+# 零差量(被杀在只读阶段)不伪造空候选,只留一行可 grep 的 budget_abort_no_diff。详见 docs/architecture.md §7.2.1。
+#
+# BLOCKED 任务不再是零信息 —— 被击杀那轮的差量从事件链取(/candidate 只投影钉住的 current_evidence,
+# 而失败回报按 M7 门禁不钉证据):
+curl -s localhost:8787/tasks/<task_id> -H "authorization: Bearer $TOKEN" \
+  | jq -r '.events[] | select(.kind=="evidence.manifest") | .payload' | jq -c '{attempt_id, manifest_key}'
+wrangler r2 object get "cloud-agent-evidence/<manifest_key>"   # 内含 patch.key + patch_complete + patch_incomplete_reason
+wrangler r2 object get "cloud-agent-artifacts/<patch.key>" --file ./aborted.diff   # 人工接续的起点,不是成品
+
 curl -N localhost:8787/tasks/<task_id>/events/stream -H "authorization: Bearer $TOKEN"   # GET /tasks/:id/events/stream:SSE 在途事件流(第④层可观测的投影,**非权威**,不写任何状态)—— 帧 id = 该帧之后已读的条数,与 /events 的 `?after=` 完全同口径,断线带 `Last-Event-ID` 续传不重发不漏读;每拍 3s 推增量,任务离开 RUNNING 且增量推完则一帧 `end` 后关流(详见 docs/architecture.md §9.6)
 
 curl -s "localhost:8787/live/<task_id>" -H "authorization: Bearer $TOKEN" -o live.html && $BROWSER live.html   # GET /live/:taskId:上面那条流的人眼端(第④层下半,docs/architecture.md §9.7)—— 全内联、零外部依赖的单页 HTML,页面自己用 `EventSource` 连 /tasks/:id/events/stream。核心价值是**停滞检测**:「最后事件 Ns 前」每秒自增,>90s 黄、>300s 红(C2-r6 那种 24 分钟模型悬挂,5 分钟内肉眼可判,不必再人工 tail)。时间线按到达序渲染 seq/kind 徽章/ts/payload.text 摘要(>200 字符截断标注),`tool_use` 显示 tool_names、`raw` 显示 raw_type,收到 `end` 帧显示「流已结束」并停表;坏帧跳过并计数。**只被动显示:不做任何判定与处置**。判定由 Supervisor 做(第②层 Observation 的独立消费者,docs/architecture.md §9.8):它寄生在既有 watchdog alarm 里每 `SUPERVISOR_TICK_SECONDS`(缺省 60)醒一次,读 journal 判 stall/loop/no_progress 三类启发式,把结论写成权威链上的 `supervisor_finding` 事件 —— **只记事件,不做任何处置**(不 cancel/kill/BLOCKED/改路由)。启用点是 `wrangler.jsonc` 的 `SUPERVISOR_MODE`(代码缺省 `off`,prod 显式配 `shadow`,先攒样本再谈 enforce)。鉴权与 /tasks/:id/events* 同源:无凭据 401、任务不存在 404。⚠️ 已知前提:`EventSource` 不能携带 `Authorization` 头,浏览器直连会得到 401 并显示重连提示 —— 打通需要部署侧注入凭据(§9.7)

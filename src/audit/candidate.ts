@@ -43,6 +43,13 @@ export interface CandidateInput {
   candidate_base: BaseRef | null;
   evidence: CandidateEvidence | null;
   patch: ArtifactRef | null;
+  /**
+   * 钉住的 manifest 自报的补丁完整性。`false` = 这份差量是 writer 被预算击杀那一刻
+   * 的在途状态(见 evidence.ts `patch_complete`)。**缺省即完整**:本字段引入前的
+   * 历史 manifest 没有它,那些候选都是 exit 0 导出的,按不完整判读反而造假。
+   */
+  patch_complete?: boolean;
+  patch_incomplete_reason?: string;
   decision: CandidateDecision | null;
   binding_digest: string | null;
 }
@@ -57,6 +64,10 @@ export interface CandidateView {
   /** 应用该补丁时应处的 commit;null = 基线未固定,重放不保证成功 */
   base: { sha: string | null; source: BaseSource } | null;
   patch: ArtifactRef | null;
+  /** 补丁是否自认完整。false = 击杀那一刻的在途差量,绝不等于「可以直接提交」 */
+  patch_complete: boolean;
+  /** 不完整原因(如 `budget_abort(exit=55)`);完整时为 null */
+  patch_incomplete_reason: string | null;
   writer_attempt_id: string | null;
   verifier_attempt_id: string | null;
   state: string;
@@ -97,11 +108,23 @@ export function assembleCandidate(input: CandidateInput): CandidateView {
   const delivered = input.candidate_base ?? null;
 
   const warnings: string[] = [];
+  // 只有显式 false 才判为不完整:字段引入前的历史 manifest 没有它,而那些候选都是
+  // writer 干净退出时导出的 —— 把缺省读成不完整会假告警。
+  const patchIncomplete = input.patch_complete === false;
   if (!ev) {
     warnings.push("尚无钉住的候选证据:writer 未回报,或回报未落证据。");
   }
   if (!input.patch) {
     warnings.push("该候选没有可下载的补丁文件(非 repo 任务,或 writer 未导出变更)。");
+  }
+  if (patchIncomplete) {
+    // 这句话是本棒存在的全部理由:被击杀的在途差量必须自己说明自己,否则一份
+    // 40 分钟的 diff 与一份自认完成的候选在读端长得一模一样。
+    warnings.push(
+      `补丁不完整(${input.patch_incomplete_reason ?? "执行面未说明原因"}):这是 writer 预算到期那一刻` +
+        `的在途差量,不是它自认完成的候选。未经独立验证,未跑完的编辑可能在内,` +
+        `不应直接提交 —— 只作为人工接续的起点。`,
+    );
   }
   if (!delivered || delivered.source === "unknown_legacy") {
     warnings.push(
@@ -133,10 +156,17 @@ export function assembleCandidate(input: CandidateInput): CandidateView {
     task_id: input.task_id,
     status,
     verified,
+    // 不完整的差量永不「可安全应用」,即使它后来的轮次被验证过:验证结论只对它自己的
+    // 输入成立,而这份输入的完整性由执行面否定。
     safe_to_apply:
-      (status === "verified" || status === "approved") && Boolean(input.patch) && Boolean(delivered),
+      (status === "verified" || status === "approved") &&
+      Boolean(input.patch) &&
+      Boolean(delivered) &&
+      !patchIncomplete,
     base: delivered ? { sha: delivered.sha, source: delivered.source } : null,
     patch: input.patch,
+    patch_complete: !patchIncomplete,
+    patch_incomplete_reason: patchIncomplete ? (input.patch_incomplete_reason ?? null) : null,
     writer_attempt_id: ev?.writer_attempt_id ?? null,
     verifier_attempt_id: ev?.verifier_attempt_id ?? null,
     state: input.state,

@@ -151,6 +151,42 @@ describe("assembleCandidate:基线口径", () => {
   });
 });
 
+/**
+ * 预算到期导出的差量必须在最后一公里自称不完整(prod 标本 5489dc8a / dbcc8fc0:
+ * writer 被击杀时的工作树差量此前根本导不出来)。判读口径与 manifest 一致:
+ * **只有显式 false 才是不完整**,历史 manifest 缺该字段 = 干净退出的完整候选。
+ */
+describe("assembleCandidate:不完整差量(自称不完整)", () => {
+  it("manifest 缺 patch_complete → 视为完整,不新增告警(历史候选零影响)", () => {
+    const v = view();
+    expect(v.patch_complete).toBe(true);
+    expect(v.patch_incomplete_reason).toBeNull();
+    expect(v.safe_to_apply).toBe(true);
+    expect(v.warnings.some((w) => w.includes("补丁不完整"))).toBe(false);
+  });
+
+  it("patch_complete=false → 点名原因、不给 safe_to_apply、告警说清不是自认完成的候选", () => {
+    const v = view({ patch_complete: false, patch_incomplete_reason: "budget_abort(exit=55)" });
+    expect(v.patch_complete).toBe(false);
+    expect(v.patch_incomplete_reason).toBe("budget_abort(exit=55)");
+    expect(v.safe_to_apply).toBe(false);
+    const warn = v.warnings.find((w) => w.includes("补丁不完整"));
+    expect(warn).toContain("budget_abort(exit=55)");
+    expect(warn).toContain("不是它自认完成的候选");
+  });
+
+  it("被击杀的差量即使后来被批准,也不能标成可直接提交", () => {
+    const v = view({
+      patch_complete: false,
+      patch_incomplete_reason: "budget_abort(exit=53)",
+      state: "DONE",
+      decision: { decision: "approve", actor: "human:api", by: "human" },
+    });
+    expect(v.status).toBe("approved");
+    expect(v.safe_to_apply).toBe(false);
+  });
+});
+
 describe("candidateFileName", () => {
   it("文件名带 task 与 patch digest 前缀,便于本地核对拿到的是哪一份", () => {
     expect(candidateFileName("t1", SHA_B)).toBe(`task-t1-${SHA_B.slice(0, 12)}.patch`);

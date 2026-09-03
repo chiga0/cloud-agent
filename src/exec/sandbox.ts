@@ -1,6 +1,7 @@
 import { getSandbox } from "@cloudflare/sandbox";
 import type { BasePinMode, BaseReport, Env } from "../types";
 import { putArtifact, type ArtifactRef } from "../audit/evidence";
+import { EXIT_BUDGET_ABORT, EXIT_SESSION_TURNS_LIMIT } from "../routing/classify";
 import {
   BASE_ERRORS,
   DEFAULT_MAX_PATCH_BYTES,
@@ -17,8 +18,23 @@ export interface SandboxRunResult {
   transcript: ArtifactRef;
   stderr: ArtifactRef;
   patch?: ArtifactRef;
+  /**
+   * 预算到期导出的差量在这里自称不完整(与 `patch` 同生同灭)。正常路径刻意留
+   * undefined 而不是 true:出口是「present ⇔ incomplete」,与 manifest 字段口径一致。
+   */
+  patchIncompleteReason?: string;
   /** repo 任务:候选实际所基于的精确 commit 及其来源 */
   base?: BaseReport;
+}
+
+/**
+ * qwen 自己按预算干净退出的两个码(墙钟/工具次数 55、session turns 53)。
+ * 它们与 exit 1 这类失败的差别是决定性的:**进程是自己在容器还活着、工作树还在
+ * 的时刻停下的**,所以那份差量当场可取。非预算类失败(崩溃、API 错误上翻的 11)
+ * 不在此列 —— 那种时刻的工作树状态不可知,导出来的是猜,不是证据。
+ */
+function isBudgetExit(code: number): boolean {
+  return code === EXIT_BUDGET_ABORT || code === EXIT_SESSION_TURNS_LIMIT;
 }
 
 /**
@@ -225,13 +241,25 @@ export async function collectQwenAttempt(
   const base = args.base;
 
   let patch: ArtifactRef | undefined;
-  if (exitCode === 0 && args.exportPatch && args.repoUrl && base?.sha) {
+  let patchIncompleteReason: string | undefined;
+  const abortedByBudget = isBudgetExit(exitCode);
+  if ((exitCode === 0 || abortedByBudget) && args.exportPatch && args.repoUrl && base?.sha) {
     const exp = await sandbox.exec(
       exportPatchScript(base.sha, Number(env.MAX_PATCH_BYTES) || DEFAULT_MAX_PATCH_BYTES),
     );
     if (exp.exitCode !== 0) {
       // 容量事实不产候选:基线对象被 agent 改写历史丢掉,或补丁超出大小上限。
       // 宁可不产出候选,也不给下游一个无法重放/回传的半成品。
+      if (abortedByBudget) {
+        // 到期那一支不借用上面的退出码改写:把 55 换成 24 会让同一次死亡从
+        // `route_decision(budget_abort)` 改轨到 `base.failed`,而本棒的前提正是
+        // 路由语义一字不动。差量导不出来就如实留零,日志可 grep。
+        console.warn(
+          `budget_abort_patch_export_failed exit=${exitCode} export_exit=${exp.exitCode} ` +
+            `attempt=${args.attemptId} err=${exp.stderr.slice(-200)}`,
+        );
+        return { exitCode, transcript, stderr: stderrRef, base };
+      }
       return {
         exitCode: exp.exitCode || BASE_ERRORS.PATCH_EXPORT_FAILED,
         transcript,
@@ -240,8 +268,23 @@ export async function collectQwenAttempt(
       };
     }
     const file = await sandbox.readFile(PATCH_PATH);
+    if (abortedByBudget && file.content.length === 0) {
+      // 被杀在只读阶段(qwen 一分钟没写文件):零差量是事实,不是一份空补丁候选。
+      // exit 0 那侧不做这个判空 —— 那是 writer 自己宣称「无需改动」,语义不同。
+      console.info(
+        `budget_abort_no_diff exit=${exitCode} attempt=${args.attemptId} ` +
+          `base=${base.sha} worktree_matches_base=true`,
+      );
+      return { exitCode, transcript, stderr: stderrRef, base };
+    }
     patch = await putArtifact(env.ARTIFACTS, file.content, `attempts/${args.attemptId}`);
+    if (abortedByBudget) {
+      // 容器的销毁发生在 attempt 终态时(DO 的 reportExecution),collect 这一步还在
+      // 容器存活期内,所以差量就地可取;但它承载的是「击杀那一刻的在途状态」——
+      // 未跑完的编辑、半写的文件都可能在内,必须自称不完整。
+      patchIncompleteReason = `budget_abort(exit=${exitCode})`;
+    }
   }
 
-  return { exitCode, transcript, stderr: stderrRef, patch, base };
+  return { exitCode, transcript, stderr: stderrRef, patch, patchIncompleteReason, base };
 }

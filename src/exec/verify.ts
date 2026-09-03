@@ -10,6 +10,15 @@ export interface VerifyReport {
   task_id: string;
   attempt_id: string;
   writer_manifest_key: string;
+  /**
+   * 被验的补丁由执行面自报不完整时的原因(如 `budget_abort(exit=55)`)。**只在
+   * 不完整时写入**,与 manifest 的口径一致;正常候选的报告字节不变,历史样本零影响。
+   *
+   * 为什么要单独带这一句:验证报告是「这份 diff 在干净沙箱里能不能重放 + 验收命令
+   * 过不过」的结论,而预算到期的差量本来就不是一个自认完成的候选 —— 让它在自己的
+   * 验证报告里也说得清结论适用于什么,否则一份 pass 会把在途差量洗成合格候选。
+   */
+  writer_patch_incomplete?: string;
   /** 候选所基于的精确 commit;legacy 表示 v1 manifest 没带基线,只能按当时默认分支验 */
   base: BaseReport;
   apply: { exit_code: number; stderr_tail: string };
@@ -25,6 +34,8 @@ export interface VerifyPrepareResult {
   apply: { exit_code: number; stderr_tail: string };
   /** false = apply 失败,候选不可重放,不启动 verify 进程 */
   launched: boolean;
+  /** 从 writer manifest 读到的不完整原因,原样进验证报告 */
+  writer_patch_incomplete?: string;
 }
 
 /**
@@ -59,6 +70,13 @@ export async function prepareVerifyAttempt(
   const patchObj = await env.ARTIFACTS.get(manifest.patch.key);
   if (!patchObj) throw new Error(`patch artifact missing: ${manifest.patch.key}`);
   const patchText = await patchObj.text();
+  // 结论要跟着输入走:如果被验的是一份自报不完整、可能编译不过、也可能连一半功能都没写完
+  // 的在途差量,报告必须带着这句话落证 —— 否则一个 apply+verify 全绿会把「击杀时的
+  // 差量」洗成「合格的候选」。
+  const writerPatchIncomplete =
+    manifest.patch_complete === false
+      ? (manifest.patch_incomplete_reason ?? "unspecified")
+      : undefined;
 
   const sandbox = getSandbox(env.Sandbox, args.attemptId);
   await checkoutRepo(sandbox, args.spec.repo_url);
@@ -102,10 +120,10 @@ export async function prepareVerifyAttempt(
       LONGRUN_SCRIPT,
       longRunScript({ workdir: REPO_DIR, command: args.spec.verify_command }),
     );
-    return { base, apply: applyReport, launched: true };
+    return { base, apply: applyReport, launched: true, writer_patch_incomplete: writerPatchIncomplete };
   }
   // apply 失败,或没有 verify_command(仅以 apply 成功为证据):不起长进程
-  return { base, apply: applyReport, launched: false };
+  return { base, apply: applyReport, launched: false, writer_patch_incomplete: writerPatchIncomplete };
 }
 
 /**
@@ -120,7 +138,12 @@ export async function collectVerifyAttempt(
     taskId: string;
     writerManifestKey: string;
   },
-  prep: { base: BaseReport; apply: { exit_code: number; stderr_tail: string }; launched: boolean },
+  prep: {
+    base: BaseReport;
+    apply: { exit_code: number; stderr_tail: string };
+    launched: boolean;
+    writer_patch_incomplete?: string;
+  },
   outcome: { exitCode: number | null } | null,
 ): Promise<SandboxRunResult> {
   let exitCode: number;
@@ -146,6 +169,8 @@ export async function collectVerifyAttempt(
     task_id: args.taskId,
     attempt_id: args.attemptId,
     writer_manifest_key: args.writerManifestKey,
+    // undefined 会被 JSON.stringify 丢掉,所以正常候选的报告字节与本棒之前一致
+    writer_patch_incomplete: prep.writer_patch_incomplete,
     base: prep.base,
     apply: prep.apply,
     verify,
