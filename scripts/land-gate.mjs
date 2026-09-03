@@ -384,6 +384,18 @@ export async function runGate(opts, deps) {
       g.digest_ok = false;
       return refuse(EXIT.GATE, "candidate", "manifest.patch.digest 缺失 — 无 digest 可比,拒绝");
     }
+    // 执行面自称不完整的差量不是候选:它是 writer 被预算击杀那一刻的在途工作树,
+    // 未跑完的编辑可能在内,从未按「完整候选」的口径验证过。读端(视图 / x-patch-complete
+    // 头)已经把这句话带出来,但只看头的消费方仍可能漏读 —— 落地是唯一不可逆的动作,
+    // 这里按 manifest 的同一判据(present ⇔ incomplete)再拦一道,绝不依赖调用方自觉。
+    if (evidence?.manifest?.patch_complete === false) {
+      g.digest_ok = false;
+      return refuse(
+        EXIT.GATE,
+        "candidate",
+        `patch incomplete (${evidence.manifest.patch_incomplete_reason ?? "执行面未说明原因"}) — 抢救出的在途差量不是候选,拒绝落地`,
+      );
+    }
     const patchBytes = await deps.fetchPatch(opts, evidence);
     const computed = await deps.sha256Hex(patchBytes);
     if (computed !== patchDigest) {

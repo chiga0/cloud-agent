@@ -25,7 +25,7 @@ import {
 } from "./longrun";
 import { ingestObsBestEffort } from "../obs/ingest";
 
-interface ExecOutcome {
+export interface ExecOutcome {
   exitCode: number;
   transcript: ArtifactRef;
   stderr: ArtifactRef;
@@ -56,6 +56,42 @@ function slim(r: {
     patch: r.patch,
     patchIncompleteReason: r.patchIncompleteReason,
     base: r.base,
+  };
+}
+
+/**
+ * 证据 manifest 的唯一材质化点。
+ *
+ * 为什么从 `run` 的 step 里提出来:这份对象是执行面与读面之间唯一的合同,而合同
+ * 必须由**生产者**写、由消费者读,测试才能钉住接线。之前它长在 step 闭包里,读端
+ * 测试只能手搓 manifest(c12 的变异验证因此有 5 条绿:V6「构造 manifest 时不写字段」
+ * 改坏了没有任何测试会红)。现在测试直接调本函数造证据,再喂给 handler。
+ *
+ * 字段口径一字未改:`patch_complete` 只在「有 patch 且带不完整原因」时写 false,
+ * 缺省 = 完整(见 evidence.ts 的 present ⇔ incomplete 约定),历史 manifest 字节不变。
+ */
+export function buildAttemptManifest(
+  p: { task_id: string; attempt_id: string; role: string; spec_digest?: string; model: string },
+  run: Pick<ExecOutcome, "transcript" | "stderr" | "patch" | "patchIncompleteReason" | "base">,
+  producedAt: string,
+): EvidenceManifest {
+  // 「有 patch 且带不完整原因」才写字段:两个条件都必要 —— 原因字段可能在
+  // 没有 patch 的失败路径上被上游带上,那时无处可挂,写进 manifest 只会造假。
+  const incompletePatch = Boolean(run.patch && run.patchIncompleteReason);
+  return {
+    schema_version: 2,
+    task_id: p.task_id,
+    attempt_id: p.attempt_id,
+    role: p.role,
+    produced_at: producedAt,
+    spec_digest: p.spec_digest ?? "",
+    model: p.model,
+    transcript: run.transcript,
+    artifacts: [run.stderr],
+    patch: run.patch,
+    patch_complete: incompletePatch ? false : undefined,
+    patch_incomplete_reason: incompletePatch ? run.patchIncompleteReason : undefined,
+    base: run.base?.sha ? { sha: run.base.sha, source: run.base.source } : undefined,
   };
 }
 
@@ -307,25 +343,7 @@ export class AttemptWorkflow extends WorkflowEntrypoint<Env, AttemptParams> {
       });
 
       const manifestRef = await step.do("evidence", async () => {
-        // 「有 patch 且带不完整原因」才写字段:两个条件都必要 —— 原因字段可能在
-        // 没有 patch 的失败路径上被上游带上,那时无处可挂,写进 manifest 只会造假。
-        const incompletePatch = Boolean(run.patch && run.patchIncompleteReason);
-        const manifest: EvidenceManifest = {
-          schema_version: 2,
-          task_id: p.task_id,
-          attempt_id: p.attempt_id,
-          role: p.role,
-          produced_at: new Date().toISOString(),
-          spec_digest: p.spec_digest ?? "",
-          model: p.model,
-          transcript: run.transcript,
-          artifacts: [run.stderr],
-          patch: run.patch,
-          patch_complete: incompletePatch ? false : undefined,
-          patch_incomplete_reason: incompletePatch ? run.patchIncompleteReason : undefined,
-          base: run.base?.sha ? { sha: run.base.sha, source: run.base.source } : undefined,
-        };
-        return writeManifest(this.env.EVIDENCE, manifest);
+        return writeManifest(this.env.EVIDENCE, buildAttemptManifest(p, run, new Date().toISOString()));
       });
 
       const report: ReportMessage = {

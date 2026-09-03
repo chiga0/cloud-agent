@@ -335,6 +335,30 @@ describe("守门链:任一门不过即终止", () => {
     expect(calls).not.toContain("openWorktree");
   });
 
+  /**
+   * c12 在执行面让被墙钟击杀的差量自称不完整(`patch_complete: false` + 原因)。
+   * 落地端是唯一不可逆的动作:一份在途差量即使 digest 对得上、即使能干净 apply,
+   * 也不是候选 —— 它从未按「完整候选」的口径被验证过。门必须自己读 manifest 拦下,
+   * 不能依赖调用方去看 `x-patch-complete` 头。
+   */
+  it("manifest 自称补丁不完整 → 拒绝且不取补丁本体,更不碰 git", async () => {
+    const { deps, calls } = fakeDeps({
+      fetchEvidence: async () =>
+        evidenceResponse({
+          manifest: Object.assign({}, (evidenceResponse() as Record<string, any>).manifest, {
+            patch_complete: false,
+            patch_incomplete_reason: "budget_abort(exit=55)",
+          }),
+        }),
+    });
+    const outcome = await runGate(landOpts({ execute: true, push: true }), deps);
+    expect(outcome.exitCode).toBe(EXIT.GATE);
+    expect(outcome.reason).toContain("budget_abort(exit=55)");
+    expect(outcome.gates).toEqual({ done_state: true, manifest_cross: true, digest_ok: false, apply_ok: null, tests_ok: null });
+    expect(calls).not.toContain("fetchPatch");
+    for (const step of GIT_WRITE_STEPS) expect(calls, step).not.toContain(step);
+  });
+
   it("git apply --check 失败 → apply_ok=false 且不进验证/提交,临时 worktree 被回收", async () => {
     const { deps, calls } = fakeDeps({ applyCheck: async () => ({ ok: false, detail: "patch does not apply" }) });
     const outcome = await runGate(landOpts({ execute: true }), deps);

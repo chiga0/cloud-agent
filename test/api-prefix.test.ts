@@ -83,6 +83,7 @@ function apiEndpoints(taskId: string, attemptId: string): Array<{ method: string
     { method: "GET", path: `/api/tasks/${taskId}/result` },
     { method: "GET", path: `/api/tasks/${taskId}/evidence` },
     { method: "GET", path: `/api/tasks/${taskId}/candidate` },
+    { method: "GET", path: `/api/tasks/${taskId}/rescue` },
     { method: "GET", path: `/api/tasks/${taskId}/events` },
     { method: "GET", path: `/api/tasks/${taskId}/events/stream` },
     { method: "POST", path: `/api/tasks/${taskId}/approve`, body: { decision: "nope" } }, // → 400

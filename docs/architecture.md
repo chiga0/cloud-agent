@@ -428,16 +428,36 @@ Durable Workflow 把一次 attempt 切成若干独立幂等 step,崩溃后从最
 - `GET /api/tasks/:id/candidate?format=patch`:响应多一个 `x-patch-complete` 头,`curl -OJ` 的人不看 body 也知道拿到的是什么;
 - verifier 的结构化报告在**被验 manifest 自报不完整时**带 `writer_patch_incomplete`(正常候选的报告字节不变):一个绿了的 apply+verify 不能把在途差量洗成合格候选。
 
-**BLOCKED 不再是零信息 —— 以及这一棒的边界**。exit 55 仍按 M9.5②(§13.21)分类为 `budget_abort` 并 BLOCKED 转人工:本棒**不**升格差量为正常候选、**不**新增自动返工、**不**改 `current_evidence` 的钉住规则。不改的理由:覆盖前一轮成功候选的指针是净损失信息,还会让审批的 `binding_digest` 中途换轨 —— 那是路由/审批语义的改动,不属于「只多导出一步」这一棒。人在 BLOCKED 这头取差量走事件链(失败回报同样落 `evidence.manifest` 事件,指针从来就在链上):
+**BLOCKED 不再是零信息 —— 以及这一棒的边界**。exit 55 仍按 M9.5②(§13.21)分类为 `budget_abort` 并 BLOCKED 转人工:本棒**不**升格差量为正常候选、**不**新增自动返工、**不**改 `current_evidence` 的钉住规则。不改的理由:覆盖前一轮成功候选的指针是净损失信息,还会让审批的 `binding_digest` 中途换轨 —— 那是路由/审批语义的改动,不属于「只多导出一步」这一棒。
 
-```
-GET /api/tasks/<id>            → events 里该 attempt 的 evidence.manifest 事件 → manifest_key
-   (已归档任务改读 GET /api/admin/events?task_id=<id> 的 canonical 原文)
-cloud-agent-evidence/<manifest_key>     → patch.key + patch_complete + patch_incomplete_reason
-cloud-agent-artifacts/<patch.key>       → 击杀那一刻的差量正文(git apply 前先自己看一遍)
-```
+> §7.2.1 的历史边界(c12 交付时的self-限制):人在 BLOCKED 这头取差量走事件链(失败回报同样落 `evidence.manifest` 事件,指针从来就在链上)。**这一条已被 §7.2.2 的 `GET /api/tasks/:id/rescue` 取代为常规路径**,下面的手工路线保留为端点不可用时的兜底取证法:
+>
+> ```
+> GET /api/tasks/<id>            → events 里该 attempt 的 evidence.manifest 事件 → manifest_key
+>    (已归档任务改读 GET /api/admin/events?task_id=<id> 的 canonical 原文)
+> cloud-agent-evidence/<manifest_key>     → patch.key + patch_complete + patch_incomplete_reason
+> cloud-agent-artifacts/<patch.key>       → 击杀那一刻的差量正文(git apply 前先自己看一遍)
+> ```
 
 > 为什么差量从事件链取而不是直接出现在 `/candidate`:`/candidate` 是 `current_evidence` 的投影,而 M7 的失败门禁规定 writer 失败产物不进审批流、不钉证据。读端对 `patch_complete` 的处理已经就位(视图、下载头、验证报告三处),将来若决定把被击杀的差量也钉成候选,这一棒不必再动执行面。
+
+#### 7.2.2 抢救读面 `GET /api/tasks/:id/rescue`(c13)
+
+c12 只走通了执行面那一半:差量导出来了、自称不完整了,但它躺在 R2 里,**人在 BLOCKED 任务上仍然取不到** —— 因为 `session.ts` 的 writer 终态处理里 `if (await this.routeFailure(...)) return;` 排在 `pinWriterEvidence(...)` 之前(M7 失败门禁),被击杀那一轮从不钉证据,于是 `/candidate` 对 BLOCKED 恒 404 `no_candidate_yet`,而 `patch_complete` 那批字段在 BLOCKED 路径上**没有读者**。prod 实测同形:`dbcc8fc0` / `5489dc8a` 取候选都是 404。
+
+修法是**新增读面,不是放宽审批通道**。三条边界:
+
+| 边界 | 落实 |
+| --- | --- |
+| `current_evidence` 仍是唯一证据口径 | `getRescueRefs()` **只读不写** DO 状态;`/rescue` 读完后 `task.current_evidence` 仍为 `null`,`/candidate` 与 `/evidence` 仍各自 404 |
+| `binding_digest` 语义不变 | 组成仍是钉住的 `[writer, verifier?, 裁决者?]`;rescue 视图刻意返回 `binding_digest: null` —— 没有钉住就没有可核对的绑定,给一个按空组成算出的 digest 等于造假日 |
+| verified/approved 门禁不变 | `assembleRescueView` 强制 `safe_to_apply: false`,并固定 `rescued: true` / `pinned: false` + 首条告警说明「不是可交付候选」。视图的开放条件是 `state === "BLOCKED"`(否则 404 `not_blocked`),抢救对象判据是「最近一个非成功终态且回报过 manifest 的 writer attempt」—— 与钉住的证据天然互斥 |
+
+`patch_complete` 的判读口径与 `/candidate` 完全一致(present ⇔ incomplete),文案复用 `assembleCandidate`,两个读面共用同一套诚实性判据。下载走 `?format=patch`,同样逐字节重算 sha256,不一致 → 500 `integrity_error`;响应头在 `/candidate` 那套之外多 `x-rescued: true` / `x-pinned: false`。
+
+**为什么不是「把 `current_evidence` 提前 pin 上」**:那会让一份 writer 被击杀时的半成品进入审批绑定 —— 人一旦 approve,绑定的就是那份从未经独立验证的在途差量,而 `binding_digest` 无法表达这个差别。那比「取不到」更坏的失效形状。
+
+> **落地端同批补的门**:`scripts/land-gate.mjs` 的 candidate 门现在读 `evidence.manifest.patch_complete`,显式 `false` 即 `digest_ok=false` → 退出码 2,且在取补丁本体**之前**就拒,`fetchPatch`/git 一次都不碰。理由:落地是唯一不可逆的动作,而「不完整」这句话此前只存在于读端展示,消费方漏看头就能把在途差量 commit 进 main。
 
 取证日志三条,都带退出码,可 grep:`budget_abort_no_diff`(到期且无差量)、`budget_abort_patch_export_failed`(到期且导出失败/超限)、`patch too large:`(容器内预检的超限原文,§13.17 那条上限的既有出口)。
 
@@ -1082,6 +1102,8 @@ red。**Supervisor 是第②层的消费者,不是第①层的新读者。**
 | GET | `/api/tasks/:id/evidence` | `Bearer $WORKER_API_TOKEN` | 返回钉住的 writer manifest JSON + `binding_digest`(approve 应提交的组合证据) |
 | GET | `/api/tasks/:id/candidate` | `Bearer $WORKER_API_TOKEN` | 候选交付视图(只读投影,不新增状态对象):`{ status, verified, safe_to_apply, base, patch, writer_attempt_id, verifier_attempt_id, decision, binding_digest, warnings }`。`status ∈ unverified \| verified \| verification_failed \| approved \| rejected \| held_for_human`;`base` 是**这份候选自己的**基线(manifest 血统),与任务当前基线不一致时进 `warnings`。尚未有钉住候选 → 404 `no_candidate_yet` |
 | GET | `/api/tasks/:id/candidate?format=patch` | `Bearer $WORKER_API_TOKEN` | `text/plain` + `Content-Disposition: attachment; filename="task-<id>-<patch digest 前 12 位>.patch"`。**下发前重算补丁字节 sha256 并与 manifest 记录的 digest 比对**,不一致 → 500 `integrity_error`,不把未校验字节交出去。判定进响应头 `x-candidate-status` / `x-verified` / `x-safe-to-apply` / `x-base-sha`,只看头也不会把被否决的候选当成可提交成品 |
+| GET | `/api/tasks/:id/rescue` | `Bearer $WORKER_API_TOKEN` | **BLOCKED 专用抢救读面**(§7.2.2):被击杀 writer 那一轮的差量视图。字段与 `/candidate` 同形 + `rescued: true` / `pinned: false`;`binding_digest` 恒 `null`、`safe_to_apply` 恒 `false`。非 BLOCKED → 404 `not_blocked`;BLOCKED 但执行面未回报 manifest → 404 `no_rescue_yet` |
+| GET | `/api/tasks/:id/rescue?format=patch` | `Bearer $WORKER_API_TOKEN` | 下载抢救差量正文,同样逐字节重算 sha256(不一致 → 500 `integrity_error`);额外响应头 `x-rescued: true` / `x-pinned: false` |
 | GET | `/api/tasks/:id/events` | `Bearer $WORKER_API_TOKEN` | **在途事件流**(§9.5):直接读 R2 的 `obs/` 段文件 journal,**不经 D1 终态归档**,所以任务 `RUNNING` 期间就有内容。返回 `{ task_id, state, events: AgentEventV1[], count, total, next_cursor, unreadable_attempts }`;按 attempt 创建序、attempt 内按 `generation`/`seq` 升序。`?after=`(扁平流上已读的条数,缺省 0)、`?limit=`(缺省 500,上限 2000;非法 → 400 `invalid_after`/`invalid_limit`)。任务不存在 → 404;从未摄取过 → 空列表 |
 | GET | `/api/tasks/:id/events/stream` | `Bearer $WORKER_API_TOKEN` | **在途事件的 SSE 投影**(§9.6):`text/event-stream`,与 `/events` 同一份 journal、同一个位置游标的两种读法(推/拉),互为恢复源。帧 `id` = **该帧之后已读的条数**(扁平序 1-based 位置),与 `?after=` 完全同口径 → 断线带 `Last-Event-ID: <id>` 续传不重发也不漏读(header 缺省 = 0 = 从头回放;值为空或畸形 → 400 `invalid_last_event_id`)。每拍 3s 尾读增量,零新增发 `: ping` 注释帧;任务离开 `RUNNING` 且增量推完 → 一帧 `event: end`(id = 总条数,`data` 带 `unreadable_attempts`)后关流。某 attempt 的 journal 读不到只列进 `unreadable_attempts`,**不杀流**。任务不存在 → 404(在建流之前判定)。**只读投影:不写任何权威状态** |
 | GET | `/api/tasks/:id/attempts/:aid/transcript` | `Bearer $WORKER_API_TOKEN` | 流式透传 R2 里的 transcript 原文 |
@@ -1592,7 +1614,9 @@ r11 向量自检:`factor=1` → 6,949,711,**恰等于 raw total**(「缓存与 f
 
 **刻意不做**:不改 exit 53/55 的产生侧(qwen 的预算机制不动);不写 env_transient 的 enforce 与 `retry_verifier` 分支(样本未够,不写半截的 retry);不动 evidence / binding / digest / 审批逻辑;不改 writer/verifier 的执行行为本身(只改它们结束后的路由);不做 Supervisor 与外圈告警(下一期,与本 case 正交)。
 
-**后续(M9.5④):分类不变,但 BLOCKED 不再是零信息**。分流把「预算到期」从返工里摘出来,省下的是下一轮的 25 万 token;它治不了另一半 —— 人被转到 BLOCKED 时手里仍然只有一个退出码,writer 跑掉的那 40 分钟整份蒸发。本期补的就是这一半:导出条件放宽到预算类退出码,产物自称不完整(`patch_complete: false` + 原因),读端口径见 §7.2.1 与 §9 的 manifest schema。**分类与处置一字未动** —— 55 仍是 `budget_abort` 仍 BLOCKED,差量不升格成候选、不触发自动返工、`current_evidence` 的钉住规则不变(所以它从事件链取,不在 `/candidate` 上出现)。
+**后续(M9.5④):分类不变,但 BLOCKED 不再是零信息**。分流把「预算到期」从返工里摘出来,省下的是下一轮的 25 万 token;它治不了另一半 —— 人被转到 BLOCKED 时手里仍然只有一个退出码,writer 跑掉的那 40 分钟整份蒸发。本期补的就是这一半:导出条件放宽到预算类退出码,产物自称不完整(`patch_complete: false` + 原因),读端口径见 §7.2.1 与 §9 的 manifest schema。**分类与处置一字未动** —— 55 仍是 `budget_abort` 仍 BLOCKED,差量不升格成候选、不触发自动返工、`current_evidence` 的钉住规则不变。
+
+**再后续(c13):接线接到人手上**。M9.5④ 只走通执行面那一半:被击杀那一轮从不钉证据(`onWriterReport` 里 `routeFailure → return` 在 `pinWriterEvidence` 之前),所以 `/candidate` 对 BLOCKED 恒 404,`patch_complete` 那批字段在 BLOCKED 路径上没有读者。本期补读面(§7.2.2):新增 `GET /api/tasks/:id/rescue`(BLOCKED 专用)与 `getRescueRefs()` / `assembleRescueView()`,落地端 candidate 门同批读 `patch_complete` 拦不可逆动作。**审批口径一字未动** —— `current_evidence` 仍是唯一证据口径、`binding_digest` 组成不变、verified/approved 门禁不变;rescue 视图的 `binding_digest` 恒 `null`、`safe_to_apply` 恒 `false`。测试手法上把 manifest 的材质化从 step 闭包提成 `buildAttemptManifest` 并让 handler 测试直接与它配对,修掉的反模式是「消费者测试配合成 fixture、从不与生产者配对」:c12 的变异验证里 V6/V10/V11 三条因此全绿,现三条均由 `test/rescue-api.test.ts` 钉红(逐条实测过变异,非推断)。V7/V8(`VerifyReport` 的不完整原因与其读端判据)**仍无取证路线**,保持原样未动:被预算击杀的 writer 走不到 verifier,它们是零读者的保险条款,本期既不删也不为它们写测试。
 
 **验证与边界**(2026-09-02 本地):`npm run typecheck` 干净;`npm test` → 21 文件 **354** 条全绿(基线 323 + 新增 31:`test/routing-classify.test.ts` 22 条判据穷举 + `test/routing-do.test.ts` 9 条真 DO 路由)。新增夹具 `test/fixtures/env-transient-report.ts` 保存标本的 `stderr_tail` 形态(四处引文原样保留,其余按 npm 10 的既有输出形态补全,夹具里写明了保真度边界)。DO 侧钉法:`exit 55` → `route_decision{budget_abort,blocked,enforced=true}` + `BLOCKED` + `awaiting_human` + writer attempt 数不变 + 无 `writer.rework_scheduled`;`exit 53` 与 `exit 55` 的 reason 可分辨;shadow 环境签名与同形普通质量失败的**路由行为逐字段等值**(事件种类序列、`verify.rework_scheduled` 的字段集 / reason / attempt_number、attempt 计数、`task.state`),只有分类字段不同;`route_decision` 在链上的位置(`writer.failed` 之后、`task.transition` 之前)、seq 单调、digest 前继,以及 BLOCKED 归档后从 D1 `events` 读回的 canonical 原文与 digest 同值。质量路径一条断言未改即全绿 —— 那就是「语义不变」的回归证据。**变异验证五条**(逐条改坏判据,确认用例真能抓到它声称抓的东西;数字为变红条数,还原后全绿):`EXIT_BUDGET_ABORT` 55→54 → 5 红;删掉环境判据的 `apply.exit_code!==0` 约束 → 1 红(apply 失败被洗成环境问题);`quality_fallback` 模式 enforce→shadow → 4 红(`enforced=true` 断言);删掉 verifier 侧接线 → 3 红(`route_decision` 缺失);预算判据放开到两个角色 → 2 红(role 区分失守 —— verifier 的 53/55 会被当预算到期停成 BLOCKED,把真质量失败洗白)。**prod 未取证**:53/55 分流的可达性由测试证明,真实命中要等下一个撞预算的 attempt;`env_transient` 的 shadow 样本从本版本部署起才开始积累。
 

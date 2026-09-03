@@ -1646,6 +1646,92 @@ export class TaskSession extends DurableObject<Env> {
     };
   }
 
+  /**
+   * GET /rescue 的取数入口:**BLOCKED 专用的抢救读面**。
+   *
+   * 为什么需要第二个读面而不是让 `/candidate` 兼容 BLOCKED:`/candidate` 是
+   * `current_evidence` 的投影,而 M7 的失败门禁规定 writer 失败产物不进审批流。
+   * 把被击杀的差量提前 pin 上 `current_evidence` 会让一份半成品进入 `binding_digest`
+   * 的口径 —— 比「取不到」更坏的失效形状。本方法因此**只读不写**:差量早已躺在
+   * attempt 自己回报的 manifest 里(R2),这里只是把它指给人看。
+   *
+   * 抢救对象的判据:最近一个「非成功终态 + 回报过 manifest(key 与 digest 齐备)」的
+   * writer attempt。成功轮次被排除在外是必要的 —— 它的证据归 `current_evidence` 管,
+   * 两个读面必须互斥,否则同一份 manifest 会有两个口径。
+   *
+   * 刻意不返回 `binding_digest`:审批绑定的组成是钉住的证据,而这里没有钉住任何东西。
+   * 返回一个按空组成算出的 digest 会让人以为拿到了可核对的绑定值。
+   */
+  async getRescueRefs(): Promise<{
+    found: boolean;
+    blocked: boolean;
+    state: TaskState;
+    awaiting_human: boolean;
+    base: BaseRef | null;
+    rescue: CandidateEvidence | null;
+    decision: CandidateDecision | null;
+  }> {
+    const s = await this.loadAll();
+    if (!s.task) {
+      return {
+        found: false,
+        blocked: false,
+        state: "PENDING",
+        awaiting_human: false,
+        base: null,
+        rescue: null,
+        decision: null,
+      };
+    }
+    const last = s.decisions[s.decisions.length - 1];
+    const decider = last?.attempt_id ? s.attempts.find((a) => a.id === last.attempt_id) : undefined;
+    const shape = {
+      found: true,
+      state: s.task.state,
+      awaiting_human: s.task.awaiting_human,
+      base: s.task.base,
+      decision: last
+        ? {
+            decision: last.decision,
+            actor: last.actor,
+            by:
+              decider?.role === "verifier"
+                ? ("verifier" as const)
+                : decider?.role === "reviewer"
+                  ? ("reviewer" as const)
+                  : ("human" as const),
+          }
+        : null,
+    };
+    // 只在 BLOCKED 上开放:其它状态要么有钉住的候选(/candidate 的活),要么尚未定局
+    if (s.task.state !== "BLOCKED") {
+      return { ...shape, blocked: false, rescue: null };
+    }
+    const rescued = [...s.attempts]
+      .reverse()
+      .find(
+        (a) =>
+          a.role === "writer" &&
+          a.state !== "SUCCEEDED" &&
+          a.state !== "RUNNING" &&
+          a.manifest_key &&
+          a.manifest_digest,
+      );
+    return {
+      ...shape,
+      blocked: true,
+      rescue: rescued?.manifest_key && rescued?.manifest_digest
+        ? {
+            writer_attempt_id: rescued.id,
+            writer_manifest_key: rescued.manifest_key,
+            writer_manifest_digest: rescued.manifest_digest,
+            verifier_attempt_id: null,
+            verifier_manifest_digest: null,
+          }
+        : null,
+    };
+  }
+
   /** GET /attempts/:id/transcript:该 attempt 自己的 manifest,不参与证据钉住。 */
   async getAttemptManifestKey(attemptId: string): Promise<{ found: boolean; key: string | null }> {
     const s = await this.loadAll();

@@ -6,6 +6,7 @@ import { TASK_TRANSITIONS } from "./control/statemachine";
 import type { EvidenceManifest } from "./audit/evidence";
 import { sha256Hex } from "./audit/evidence";
 import { assembleCandidate, candidateFileName } from "./audit/candidate";
+import { assembleRescueView } from "./audit/rescue";
 import { isValidSha } from "./exec/base";
 import type { AgentEventV1 } from "./obs/events";
 import { readObsAttemptEvents } from "./obs/journal";
@@ -75,6 +76,8 @@ function landingHtml(env: Env): string {
       <dt>GET /api/tasks/:id/evidence</dt><dd>钉住的候选 manifest + approve 所需 attempt_id / binding_digest(需鉴权)</dd>
       <dt>GET /api/tasks/:id/candidate</dt><dd>候选交付视图:基线 commit、patch 引用、判定标签与诚实性告警(需鉴权)。被预算击杀的差量在此自报:<code>patch_complete=false</code> + <code>patch_incomplete_reason</code>(如 <code>budget_abort(exit=55)</code>),此时 <code>safe_to_apply</code> 恒 <code>false</code></dd>
       <dt>GET /api/tasks/:id/candidate?format=patch</dt><dd>下载补丁正文(<code>curl -o candidate.patch</code> 后本地 <code>git apply</code>);下发前重算 sha256,状态在 <code>x-candidate-status</code> / <code>x-safe-to-apply</code> / <code>x-patch-complete</code> 头里</dd>
+      <dt>GET /api/tasks/:id/rescue</dt><dd><strong>BLOCKED 专用的抢救读面</strong>(需鉴权):被预算击杀的 writer 那一轮的差量视图。失败轮次按 M7 门禁从不钉入 <code>current_evidence</code>,所以它在 <code>/candidate</code> 上恒 404 —— 本端点读的是该 attempt 自己回报的 manifest。字段与 <code>/candidate</code> 同形,另加 <code>rescued: true</code> / <code>pinned: false</code>,且 <code>binding_digest</code> 恒 <code>null</code>、<code>safe_to_apply</code> 恒 <code>false</code>:它只是人接续工作的起点,不进任何审批口径。非 BLOCKED → 404 <code>not_blocked</code>;BLOCKED 但执行面未回报证据 → 404 <code>no_rescue_yet</code></dd>
+      <dt>GET /api/tasks/:id/rescue?format=patch</dt><dd>下载抢救差量正文(同样逐字节重算 sha256,不一致 → 500 <code>integrity_error</code>);响应头额外带 <code>x-rescued: true</code> / <code>x-pinned: false</code>,只看头也不会把它当成可提交成品</dd>
       <dt>GET /api/tasks/:id/events</dt><dd>在途事件流(需鉴权):读 Observation 层的 R2 段文件 journal,<strong>不经 D1 终态归档</strong>,因此任务 <code>RUNNING</code> 期间就有内容 —— 这是它相对 <code>/api/admin/events</code>(只读已归档的 hash chain)的核心增量。数据来自 poll 相每 30s 的 transcript 增量摄取:<strong>模型悬挂表现为「新事件停止而进程 alive」,凭最后一条事件的 <code>ts</code> 与轮询周期对比即可在 5 分钟内发现</strong>。按 attempt 创建序、attempt 内按 <code>generation</code> 与 <code>seq</code> 升序返回 <code>{"task_id",state,"events":[AgentEventV1],"count",total,"next_cursor","unreadable_attempts"}</code>;信封为 <code>{v:1,task_id,attempt_id,generation,seq,ts,kind,payload}</code>,<code>kind</code> ∈ system/assistant/user/tool_use/tool_result/result/error/raw(认不出的行不丢)。payload 已在 ingress 过白名单:只留类型/工具名/token 用量/时长/退出码等枚举字段,自由文本 ≤2048 字符并对平台注入的凭据值精确打码。分页:<code>?after=</code>(扁平有序流上已读的条数,默认 0)、<code>?limit=</code>(默认 500,上限 2000,非数字或越界 → 400);<code>next_cursor</code> 无后续时为 <code>null</code>。任务不存在 → 404;从未摄取过事件 → 空列表而不是 404</dd>
       <dt>GET /api/tasks/:id/attempts/:aid/transcript</dt><dd>attempt 的 transcript 原文(verifier 为 JSON 验证报告,需鉴权)</dd>
       <dt>GET /api/admin/chain-check</dt><dd>校验归档事件 hash chain(需鉴权)。<strong>两种模式</strong>:不带参数 = 全局扫描 D1 <code>events</code> 表,返回 <code>{checked,broken,brokenTasks}</code>,破口标记 <code>&lt;task_id&gt;:&lt;seq&gt;:&lt;kind&gt;</code>,kind ∈ <code>prev</code>/<code>digest</code>(内容被改)、<code>seq</code>(序号不严格递增/重号)、<code>state</code>(状态行已是终态而链尾转换不是)。⚠ 全局模式<strong>看不见未归档的任务</strong>(events 只在归档成功时写)。带 <code>?task_id=</code>(36 字符 UUID,畸形 → 400)= <strong>DO↔D1 对账模式</strong>:同时读 DO 链与 D1 行,返回 <code>{mode:"reconcile",result,do_events,d1_events,do_tail_digest,d1_tail_digest,broken,brokenTasks}</code>,<code>result</code> 三态 = <code>consistent</code> / <code>not_archived</code>(DO 有链而 D1 零行)/ <code>diverged</code>(行数或尾 digest 不等);DO 无该任务记录 → 404 <code>task_not_found</code>。判据边界与运维含义见 <code>docs/architecture.md</code> §6.2</dd>
@@ -274,6 +277,98 @@ async function handleGetCandidate(env: Env, taskId: string, format: string | nul
       "content-type": "text/plain; charset=utf-8",
       "content-disposition": `attachment; filename="${candidateFileName(taskId, digest)}"`,
       "x-candidate-status": view.status,
+      "x-verified": String(view.verified),
+      "x-safe-to-apply": String(view.safe_to_apply),
+      "x-patch-complete": String(view.patch_complete),
+      "x-base-sha": view.base?.sha ?? "unpinned",
+      "x-patch-digest": digest,
+    },
+  });
+}
+
+/**
+ * GET /api/tasks/:id/rescue —— BLOCKED 任务的抢救视图(只读,不写任何外部系统)。
+ *
+ * 与 /candidate 的区别是**口径**而不是格式:`/candidate` 是 `current_evidence` 的投影
+ * (审批绑定读的同一份证据),这里读的是 writer 终态回报里的 manifest —— 被预算击杀的
+ * 那一轮从不钉证据(M7 失败门禁),所以在 /candidate 上恒 404。本端点补的就是那后半截,
+ * 刻意不改钉住规则:让半成品进入绑定口径,比让人取不到差量更坏。
+ *
+ * 补丁下载与 /candidate 同源:**下发前重算 sha256**,只看响应头也不会把抢救产物
+ * 当成可提交成品(`x-safe-to-apply: false` + `x-rescued: true`)。
+ */
+async function handleGetRescue(env: Env, taskId: string, format: string | null): Promise<Response> {
+  if (format !== null && format !== "patch") {
+    return Response.json(
+      { error: { type: "invalid_format", detail: "only ?format=patch is supported" } },
+      { status: 400 },
+    );
+  }
+  const refs = await TaskSession.from(env, taskId).getRescueRefs();
+  if (!refs.found) return Response.json({ error: { type: "not_found" } }, { status: 404 });
+  if (!refs.blocked) {
+    return Response.json(
+      { error: { type: "not_blocked", detail: `task state is ${refs.state}; rescue 只对 BLOCKED 任务开放` } },
+      { status: 404 },
+    );
+  }
+  const rescue = refs.rescue;
+  if (!rescue) {
+    return Response.json(
+      { error: { type: "no_rescue_yet", detail: "BLOCKED 没有带 manifest 的失败 writer attempt:执行面未回报证据" } },
+      { status: 404 },
+    );
+  }
+  const manifestObj = await env.EVIDENCE.get(rescue.writer_manifest_key);
+  if (!manifestObj) {
+    return Response.json(
+      { error: { type: "evidence_missing", detail: rescue.writer_manifest_key } },
+      { status: 404 },
+    );
+  }
+  const manifest = (await manifestObj.json()) as EvidenceManifest;
+  const view = assembleRescueView({
+    task_id: taskId,
+    state: refs.state,
+    awaiting_human: refs.awaiting_human,
+    base: refs.base,
+    candidate_base: manifest.base ?? null,
+    evidence: rescue,
+    patch: manifest.patch ?? null,
+    patch_complete: manifest.patch_complete,
+    patch_incomplete_reason: manifest.patch_incomplete_reason,
+    decision: refs.decision,
+    binding_digest: null,
+  });
+  if (format === null) return Response.json(view);
+
+  if (!view.patch) {
+    return Response.json(
+      { error: { type: "no_patch", detail: "该抢救产物没有补丁文件", status: view.status, warnings: view.warnings } },
+      { status: 404 },
+    );
+  }
+  const patchObj = await env.ARTIFACTS.get(view.patch.key);
+  if (!patchObj) {
+    return Response.json({ error: { type: "artifact_missing", detail: view.patch.key } }, { status: 404 });
+  }
+  const body = await patchObj.arrayBuffer();
+  const digest = await sha256Hex(body);
+  if (digest !== view.patch.digest) {
+    return Response.json(
+      {
+        error: { type: "integrity_error", key: view.patch.key, expected: view.patch.digest, actual: digest },
+      },
+      { status: 500 },
+    );
+  }
+  return new Response(body, {
+    headers: {
+      "content-type": "text/plain; charset=utf-8",
+      "content-disposition": `attachment; filename="${candidateFileName(taskId, digest)}"`,
+      "x-candidate-status": view.status,
+      "x-rescued": "true",
+      "x-pinned": "false",
       "x-verified": String(view.verified),
       "x-safe-to-apply": String(view.safe_to_apply),
       "x-patch-complete": String(view.patch_complete),
@@ -1085,7 +1180,7 @@ export default {
     }
 
     const taskMatch =
-      /^\/api\/tasks\/([0-9a-f-]{36})(\/approve|\/result|\/evidence|\/candidate|\/events\/stream|\/events)?$/.exec(url.pathname);
+      /^\/api\/tasks\/([0-9a-f-]{36})(\/approve|\/result|\/evidence|\/candidate|\/rescue|\/events\/stream|\/events)?$/.exec(url.pathname);
     if (taskMatch) {
       if (req.method === "GET" && !taskMatch[2]) return handleGetTask(env, taskMatch[1]);
       if (req.method === "GET" && taskMatch[2] === "/result") {
@@ -1102,6 +1197,9 @@ export default {
       }
       if (req.method === "GET" && taskMatch[2] === "/candidate") {
         return handleGetCandidate(env, taskMatch[1], url.searchParams.get("format"));
+      }
+      if (req.method === "GET" && taskMatch[2] === "/rescue") {
+        return handleGetRescue(env, taskMatch[1], url.searchParams.get("format"));
       }
       if (req.method === "POST" && taskMatch[2] === "/approve") {
         return handleApprove(req, env, taskMatch[1]);
