@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { AgentEventV1 } from "../src/obs/events";
+import { toAgentEventV1, type AgentEventV1 } from "../src/obs/events";
 import { LIVE_STALL_DANGER_SECONDS, LIVE_STALL_WARN_SECONDS } from "../src/obs/live";
 import {
   detectSupervisor,
@@ -26,6 +26,13 @@ import {
  * - 恰好等于阈值不报:边界语义必须是契约,否则「>」会被顺手改成「>=」;
  * - 归一化生效:不钉住的话,同一动作带个新时间戳就不算重复,判据静默永不触发
  *   (文件头第 2 条)。
+ *
+ * ⚠️ 夹具的形状必须**prod 产得出来**。c10 的教训正是:这里的 `tool_use` 夹具同时塞了
+ * `tool_names` 和 `text`,而 ingress(src/obs/events.ts 的 sanitizePayload)对 `tool_use`
+ * 根本不写 `text` —— 于是判据测试全绿,真实 journal 里 target 却永远取不到文本、
+ * repeat_key 塌成 `read_file @read_file`。判据测试与摄取测试各测各的,中间那道缝没人守。
+ * 现在由两层共同守:夹具只用 `tool_targets`(§9.5 的真实形状),另有一组用例把
+ * `toAgentEventV1` 的产物直接喂进 `detectSupervisor`(见「ingress ↔ 判据的同一条缝」)。
  */
 
 const NOW = Date.parse("2026-09-03T00:10:00.000Z");
@@ -130,19 +137,21 @@ describe("误报防线(没有证据 ≠ 卡住了)", () => {
 });
 
 describe("loop(同一个工具动作在窗内反复出现)", () => {
+  // 形状 = ingress 对 tool_use 真实产出的 payload(§9.5):tool_names + tool_targets
   const toolEvt = (seq: number, name: string, arg: string) =>
-    evt({ seq, payload: { tool_names: [name], text: arg } });
+    evt({ seq, payload: { tool_names: [name], tool_targets: [arg] } });
 
   it("同一工具同一参数出现 loop_repeat_max 次 → 命中", () => {
     const n = SUPERVISOR_THRESHOLDS.loop_repeat_max;
     const events = [
       ...Array.from({ length: n }, (_, i) => toolEvt(i + 1, "run_shell_command", "npm test")),
-      ...healthy(2).map((e, i) => evt({ seq: 100 + i, payload: { tool_names: ["read_file"], text: "src/other.ts" } })),
+      ...healthy(2).map((e, i) => evt({ seq: 100 + i, payload: { tool_names: ["read_file"], tool_targets: ["src/other.ts"] } })),
     ];
     const loop = detectSupervisor({ now_ms: NOW, events }).find((f) => f.kind === "loop");
     expect(loop?.rule).toBe(RULE_LOOP_TOOL_REPEAT);
     expect(loop?.evidence.repeat_count).toBe(n);
     expect(loop?.evidence.repeat_key).toContain("run_shell_command");
+    expect(loop?.evidence.repeat_key).toContain("npm test");
   });
 
   it("不重复(每轮换目标)→ 不命中", () => {
@@ -190,7 +199,7 @@ describe("loop(同一个工具动作在窗内反复出现)", () => {
 describe("no_progress(反复碰同一个目标)", () => {
   const n = SUPERVISOR_THRESHOLDS.no_progress_repeat_max;
   const touch = (seq: number, name: string, target: string) =>
-    evt({ seq, payload: { tool_names: [name], text: target } });
+    evt({ seq, payload: { tool_names: [name], tool_targets: [target] } });
 
   it("工具名交替但目标同一个 → 命中 no_progress(loop 抓不到)", () => {
     const events = Array.from({ length: n }, (_, i) =>
@@ -222,14 +231,154 @@ describe("多判据并存", () => {
     const n = SUPERVISOR_THRESHOLDS.loop_repeat_max;
     const events = [
       ...Array.from({ length: n }, (_, i) =>
-        evt({ seq: i + 1, payload: { tool_names: ["run_shell_command"], text: "npm test" } }),
+        evt({ seq: i + 1, payload: { tool_names: ["run_shell_command"], tool_targets: ["npm test"] } }),
       ),
       // 最后一次动作停在 30 分钟前:stall red
-      evt({ seq: 99, ts: new Date(NOW - 30 * 60_000).toISOString(), payload: { tool_names: ["run_shell_command"], text: "npm test" } }),
+      evt({ seq: 99, ts: new Date(NOW - 30 * 60_000).toISOString(), payload: { tool_names: ["run_shell_command"], tool_targets: ["npm test"] } }),
     ];
     const findings = detectSupervisor({ now_ms: NOW, events });
     expect(findings.map((f) => f.kind).sort()).toEqual(["loop", "stall"]);
     expect(stallOf(findings)?.severity).toBe("red");
+  });
+});
+
+/**
+ * target 的三级取值。第二、三级**不是**过渡兜底,是长期现实:
+ * c10a 部署前落的 journal 段没有 tool_targets;`raw` / `assistant` 事件根本没有工具形状。
+ */
+describe("target 取值优先级(tool_targets → payload.text → 工具名)", () => {
+  const n = SUPERVISOR_THRESHOLDS.loop_repeat_max;
+  const keyOf = (events: AgentEventV1[]) =>
+    detectSupervisor({ now_ms: NOW, events }).find((f) => f.kind === "loop")?.evidence.repeat_key;
+  const five = (payload: Record<string, unknown>) =>
+    Array.from({ length: n }, (_, i) => evt({ seq: i + 1, payload }));
+
+  it("有 tool_targets 时按它成形(text 同时存在也不看 text)", () => {
+    expect(keyOf(five({ tool_names: ["read_file"], tool_targets: ["src/real.ts"], text: "顺手说的一句" }))).toBe(
+      "read_file@src/real.ts",
+    );
+  });
+
+  it("无 tool_targets → 退回 payload.text(老段文件照常工作,不抛)", () => {
+    expect(keyOf(five({ tool_names: ["read_file"], text: "src/old.ts" }))).toBe("read_file@src/old.ts");
+  });
+
+  it("两级都取不到 → 退化为工具名:这是分辨率的地板,同一工具的任意两次调用都会算重复", () => {
+    expect(keyOf(five({ tool_names: ["read_file"] }))).toBe("read_file@read_file");
+  });
+
+  it("下标对齐的 \"\" 占位不算目标:跳过占位取第一个非空条目", () => {
+    expect(
+      keyOf(five({ tool_names: ["mcp_thing", "read_file"], tool_targets: ["", "src/aligned.ts"] })),
+    ).toBe("mcp_thing,read_file@src/aligned.ts");
+  });
+
+  it("脏 payload 不抛:tool_targets 不是数组、项不是字符串、全为空串", () => {
+    const noThrow = (payload: Record<string, unknown>) =>
+      expect(() => detectSupervisor({ now_ms: NOW, events: five(payload) })).not.toThrow();
+    noThrow({ tool_names: ["read_file"], tool_targets: "src/a.ts" });
+    noThrow({ tool_names: ["read_file"], tool_targets: [7, null] });
+    noThrow({ tool_names: ["read_file"], tool_targets: ["", "  "] });
+    noThrow({ tool_targets: ["src/a.ts"] });
+    // 全空串时按地板降级(而不是把 "" 当成一个目标)
+    expect(keyOf(five({ tool_names: ["read_file"], tool_targets: [""] }))).toBe("read_file@read_file");
+  });
+});
+
+/**
+ * 完整 sanitize 路径 —— c10 技术债的正向证据。
+ *
+ * 这组用例把 transcript 行喂给 `toAgentEventV1`(= ingress 写进 journal 的同一条路径),
+ * 产物原样喂给 `detectSupervisor`。判据单测可以自己造一个 prod 产不出的 payload,
+ * 摄取单测只断言 payload 的键;两道测试之间那道缝正是 c10 翻车的地方,这里由同一条
+ * 断言两头钉住:ingress 少留一个字段,判据就会在这里从「不命中」变成「命中」。
+ */
+describe("ingress ↔ 判据的同一条缝(transcript 行 → sanitize → detect)", () => {
+  const n = SUPERVISOR_THRESHOLDS.loop_repeat_max;
+  const TS_FRESH = new Date(NOW - 10_000).toISOString();
+
+  const ingest = (lines: Array<Record<string, unknown>>): AgentEventV1[] =>
+    lines.map((line, i) =>
+      toAgentEventV1({
+        taskId: TASK,
+        attemptId: ATTEMPT,
+        generation: 1,
+        seq: i + 1,
+        ts: TS_FRESH,
+        line: JSON.stringify(line),
+      }),
+    );
+  const toolLine = (name: string, input: Record<string, unknown>) => ({
+    type: "assistant",
+    content: [{ type: "tool_use", id: `t-${name}`, name, input }],
+  });
+  const loopOf = (events: AgentEventV1[]) =>
+    detectSupervisor({ now_ms: NOW, events }).find((f) => f.kind === "loop");
+
+  it("prod 形状自检:tool_use 的 payload 只有 tool_names/tool_targets,没有 text", () => {
+    const [e] = ingest([toolLine("read_file", { file_path: "src/a.ts" })]);
+    expect(e.kind).toBe("tool_use");
+    expect(e.payload).toEqual({ tool_names: ["read_file"], tool_targets: ["src/a.ts"] });
+  });
+
+  it("关掉误报面:连续 5 次读 5 个**不同**文件(= c10 里会误报的形态)→ 不命中 loop", () => {
+    const events = ingest(
+      Array.from({ length: n }, (_, i) => toolLine("read_file", { file_path: `src/f${i}.ts` })),
+    );
+    const findings = detectSupervisor({ now_ms: NOW, events });
+    expect(loopOf(events)).toBeUndefined();
+    expect(findings.find((f) => f.kind === "no_progress")).toBeUndefined();
+  });
+
+  it("判据没被改哑:同一文件反复读 5 次 → 命中 loop,repeat_key 带真实路径", () => {
+    const events = ingest(
+      Array.from({ length: n }, () => toolLine("read_file", { file_path: "src/a.ts" })),
+    );
+    const loop = loopOf(events);
+    expect(loop?.evidence.repeat_key).toBe("read_file@src/a.ts");
+    expect(loop?.evidence.repeat_count).toBe(n);
+  });
+
+  it("同一文件反复读满 no_progress_repeat_max 次 → loop 与 no_progress 同时命中", () => {
+    const events = ingest(
+      Array.from({ length: SUPERVISOR_THRESHOLDS.no_progress_repeat_max }, () =>
+        toolLine("read_file", { file_path: "src/a.ts" }),
+      ),
+    );
+    expect(detectSupervisor({ now_ms: NOW, events }).map((f) => f.kind).sort()).toEqual([
+      "loop",
+      "no_progress",
+    ]);
+  });
+
+  it("命令类工具走 command 成形:反复跑同一句 → 命中;换目标 → 不命中", () => {
+    const same = ingest(
+      Array.from({ length: n }, () =>
+        toolLine("run_shell_command", { command: "npm test -- --reporter=v1" }),
+      ),
+    );
+    expect(loopOf(same)?.evidence.repeat_key).toBe("run_shell_command@npm test");
+    const mixed = ingest([
+      ...Array.from({ length: n - 1 }, () => toolLine("run_shell_command", { command: "npm test" })),
+      toolLine("run_shell_command", { command: "npm run build" }),
+    ]);
+    expect(loopOf(mixed)).toBeUndefined();
+  });
+
+  it("白名单取不到形状的工具(input 里没有可取键)→ 如实退化到地板,不抛", () => {
+    const events = ingest(
+      Array.from({ length: n }, () => toolLine("mcp_search", { query: "how do I do it" })),
+    );
+    expect(events[0].payload).not.toHaveProperty("tool_targets");
+    expect(loopOf(events)?.evidence.repeat_key).toBe("mcp_search@mcp_search");
+  });
+
+  it("真实 transcript 里 loop 与 stall 可以并存(悬挂前在转圈)", () => {
+    const events = ingest(
+      Array.from({ length: n }, () => toolLine("edit", { file_path: "src/a.ts" })),
+    ).map((e, i) => ({ ...e, ts: new Date(NOW - (n - i + 2) * 60_000).toISOString() }));
+    const findings = detectSupervisor({ now_ms: NOW, events });
+    expect(findings.map((f) => f.kind).sort()).toEqual(["loop", "stall"]);
   });
 });
 

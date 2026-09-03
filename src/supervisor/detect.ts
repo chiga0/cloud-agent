@@ -28,10 +28,13 @@
  *    代价是判据分辨率下降:两个只在时间戳上不同的动作会被算作同一个。这是有意的取舍
  *    —— 宁可为「反复做同一件事」付出一处误报面,也不接受一条永不触发的判据。
  *
- * 分辨率的天花板由 Observation 层的白名单决定(src/obs/events.ts 刻意丢掉 tool_use 的
- * input 参数,因为 input 是自由文本 = 凭据外流面)。所以这里的 target 只能取 payload
- * 里**已经过 ingress 脱敏**的可见文本,取不到时退化为工具名本身。这不是可以先凑一下的
- * 细节:它决定了 no_progress 与 loop 的区分度,必须写明白而不是让人以为能看见工具入参。
+ * 分辨率的天花板在哪里,由 Observation 层的白名单决定:input 参数整体**仍然**不进 journal
+ * (input 是自由文本 = 凭据外流面),但 §9.5 从 c10 的技术债起多留了一个受限出口
+ * `payload.tool_targets` —— 按键白名单(file_path / path / pattern / directory / command)
+ * + 打码 + 截断到 128 的形状摘要。target 的三级取值(入参目标 → 可见文本 → 工具名)见
+ * targetOf 的注释。取到第三级时「反复调同一个工具」与「反复做同一件事」无法区分 ——
+ * 这不是可以先凑一下的细节:它决定了 no_progress 与 loop 的区分度,也决定了 §9.8 为什么
+ * 要求 shadow 样本按 tool_targets 是否存在**分段**统计。
  */
 
 import type { AgentEventV1 } from "../obs/events";
@@ -138,11 +141,22 @@ function asRecord(value: unknown): Record<string, unknown> {
     : {};
 }
 
-/** 工具名:Observation 层只留了 payload.tool_names(白名单),没有入参 —— 见文件头。 */
+/** 工具名:Observation 层的枚举白名单(§9.5),不含入参。 */
 function toolNamesOf(e: AgentEventV1): string[] {
   const names = asRecord(e.payload).tool_names;
   if (!Array.isArray(names)) return [];
   return names.filter((n): n is string => typeof n === "string" && n.length > 0);
+}
+
+/**
+ * 入参目标(§9.5 的 `tool_targets`):已过 ingress 脱敏(按键白名单 + 打码 + ≤128)。
+ * 数组可能缺失(早于该字段上线的段文件)或含 `""` 占位(该工具没有可取形状)—— 两种都
+ * 按「没有这一级」降级处理,不抛。
+ */
+function toolTargetsOf(e: AgentEventV1): string[] {
+  const targets = asRecord(e.payload).tool_targets;
+  if (!Array.isArray(targets)) return [];
+  return targets.filter((t): t is string => typeof t === "string");
 }
 
 function textOf(e: AgentEventV1): string {
@@ -218,10 +232,26 @@ export function normalizeTarget(raw: string): string {
     .slice(0, TARGET_MAX_CHARS);
 }
 
-/** 某条事件的 target:可见文本归一化;看不见就退化为工具名(见文件头的分辨率说明)。 */
+/**
+ * 某条事件的 target。三级降级,一级都取不到时退化为工具名:
+ *
+ * 1. `payload.tool_targets` 首个能归一化成非空串的目标 —— 这就是「它在碰哪个东西」;
+ * 2. `payload.text` 的归一化 —— 老段文件(c10a 部署前落的 journal 段)与 `raw`/`assistant`
+ *    这类没有工具形状的事件走的都是这条,现实里长期存在,不是过渡兜底;
+ * 3. 工具名本身 —— 分辨率的地板。取到这一级时同一工具的任意两次调用都会算作重复,
+ *    所以 loop 的误报面就在这一级上;§9.8 要求 shadow 样本按 `tool_targets` 是否存在分段统计。
+ *
+ * 逐条试而不是只看第 0 条:一条 assistant 行可以带多个 tool_use 块,第 0 个可能恰好没有
+ * 形状(`tool_targets` 用 `""` 占位以对齐下标),那不代表整行看不见目标。
+ */
 function targetOf(e: AgentEventV1): string {
-  const normalized = normalizeTarget(textOf(e));
-  if (normalized.length > 0) return normalized;
+  for (const raw of toolTargetsOf(e)) {
+    if (raw.trim().length === 0) continue;
+    const shaped = normalizeTarget(raw);
+    if (shaped.length > 0) return shaped;
+  }
+  const fromText = normalizeTarget(textOf(e));
+  if (fromText.length > 0) return fromText;
   return toolNamesOf(e).join(",");
 }
 

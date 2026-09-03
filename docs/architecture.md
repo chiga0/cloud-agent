@@ -650,11 +650,28 @@ obs/<task_id>/<attempt_id>/index.json                   每 attempt 一份:段�
 |---|---|
 | 枚举标量 | 只留白名单内的键:`subtype` / `uuid` / `session_id` / `model` / `stop_reason` / `is_error` / `num_turns` / `duration_ms` / `duration_api_ms` / `total_cost_usd` / `exit_code`,且类型对得上才留 |
 | token 用量 | `payload.usage` 只留 `input_tokens` / `cache_read_input_tokens` / `output_tokens` / `total_tokens` 四个**数值**字段(与 §7.3 台账同口径,不重命名) |
-| 工具调用 | 只留 `tool_names`;**参数一律丢弃** —— `write_file` 的 input 里通常是整个文件内容 |
-| 自由文本 | 唯一出口是 `payload.text`:先按已知凭据精确打码,**再**截断到 ≤2048 字符(顺序反了会把凭据截成半个身子仍留在串里) |
+| 工具调用(枚举) | 只留 `tool_names`(去重、≤16 条、每条 ≤128 字符);**`input` 整体仍然丢弃** —— `write_file` 的 input 里通常是整个文件内容 |
+| 工具调用(形状) | `tool_targets: string[]`,与 `tool_names` **同长度、同顺序**(第 i 条 = 第 i 个 tool_use 块),见下表 |
+| 自由文本 | 整段叙述的唯一出口是 `payload.text`:先按已知凭据精确打码,**再**截断到 ≤2048 字符(顺序反了会把凭据截成半个身子仍留在串里)。`tool_targets` 不走这条通道 —— 它是按键白名单后的**形状摘要**,长度上限低一个量级(见下表) |
 | 凭据值 | `obsSecretValues(env)` = 平台注入沙箱的 `SANDBOX_MODEL_API_KEY` / `DASHSCOPE_API_KEY` 与 `WORKER_API_TOKEN` 的**值**,精确子串替换为 `***REDACTED***`。按值匹配而不是按字段名:transcript 里出现的是 key 的值,而不是 `OPENAI_API_KEY` 这个名字。短于 8 字符的值不参与(那会把正文打成筛子) |
 
 `tool_result` 的输出摘要走的也是「截断 + 打码」通道:它能看出「跑了什么、结果形状如何」,但搬不走一个文件。
+
+### `payload.tool_targets` —— 入参形状摘要的取值规则
+
+加这个键的动机不在观测面本身,而在 §9.8:判据要区分「读 A 文件」与「读 B 文件」,而
+`detect.ts` 能看见的只有这里写下的字节 —— 到了读端再想分辨已经太晚。它**不是**把 `input`
+放回来:只有下表列出的键会被读,读到的值还要过打码与 128 字符限长。
+
+| 项 | 规则 |
+|---|---|
+| 可取的参数键 | `file_path` / `path` / `pattern` / `directory` 原样取字符串值;`command` 只取「**首词 + 首个不以 `-` 开头的实参**」,其余 token(含所有 flag)一律丢弃。一个 input 里同时命中多个键时按此顺序取第一个 |
+| 键名匹配 | **大小写不敏感、去分隔符**后比对:`file_path` / `filePath` / `FilePath` / `file-path` 算同一个键(不同工具把同一个东西叫不同名字,按字面比对会让判据在换工具时静默失灵)。认不出的键(`notebook_path` / `cmd` / `query`)一律不取 |
+| 值类型 | 只取 `string`。结构化值(对象/数组)不递归 —— 一递归就等于把整个 input 又收回来了 |
+| 打码与长度 | 每条先按已知凭据打码、**再**截断到 ≤128 字符(与 `payload.text` 同一顺序理由) |
+| 下标对齐 | 与 `tool_names` 同长度同顺序;某个工具调用取不到形状时该位写 `""` 占位。占位比稀疏好检查:读端点可以断言两个数组等长,而不必处理「第 i 个名字对应第几个目标」 |
+| 整键缺省 | 一个形状都没取到时**不写** `tool_targets`(而不是写 `[]` 或 `[""]`)。缺省能把「这段 journal 早于本字段上线」与「新段里的工具全都没有可取形状」分开 —— §9.8 的分段统计依赖这个区别 |
+| 与 `text` 的分工 | `tool_targets` 是形状摘要、`payload.text` 是可见叙述,两条口径不混:`tool_use` 的 `text` 行为**没有**任何变化(仍然不写) |
 
 ### 读端点
 
@@ -676,6 +693,19 @@ obs/<task_id>/<attempt_id>/index.json                   每 attempt 一份:段�
 | `obs_ingest_failed` | 本轮摄取失败已跳过(带 `action=skip_round_retry_next`) |
 | `obs_index_malformed` / `obs_index_inconsistent` / `obs_commit_seq_discontinuity` / `obs_segment_count_drift` | 游标自洽性被破坏 → 整轮拒写 |
 | `obs_read_attempt_failed` | 读端点遇到坏 journal,降级为「列出该 attempt 但不返回其事件」 |
+
+### 为什么加 `tool_targets` 不递增 `OBS_EVENT_V`
+
+`OBS_EVENT_V` 钉的是**信封**(`v` / `task_id` / `attempt_id` / `generation` / `seq` / `ts` /
+`kind` / `payload` 这八个键的存在与语义),本棒一个都没动 —— 变的只是 `payload` 白名单里多
+了一个**可选**键。递增版本要付的代价是让所有读端为「v1 与 v2 并存」写分支,而这里没有需要
+它们分辨的差异:§9.6 的 SSE 帧、§9.7 的 Live UI、§9.8 的 Supervisor 全部按「有则用、无则
+降级」读同一个字段名,老段文件与新段文件走同一条解析路径。反过来说,真正需要递增版本的
+改动是「同一个键的含义变了」或「旧键被删了」—— 那会让老段被按新语义误读,而这正是本棒
+刻意避开的形状(所以 `tool_use` 的 `text` 行为保持原样,新信息用新键带)。
+
+判断纪律:**加可选 payload 键不递增,改既有键的语义或删除键才递增**。将来再问一遍时,先看
+这条,再看上一条(整键缺省的写法)—— 两者合起来才使「不递增」是安全的。
 
 ---
 
@@ -962,8 +992,18 @@ red。**Supervisor 是第②层的消费者,不是第①层的新读者。**
 | kind | rule | 判据(缺省阈值) | severity | 边界纪律 |
 | --- | --- | --- | --- | --- |
 | `stall` 心跳 | `stall.last_event_gap` | `gap = now_ms - Date.parse(最后一条事件.ts)`;`> 90_000` → yellow,`> 300_000` → red | yellow / red | **严格大于**。恰好 =90s 不报;恰好 =300s 落 yellow(它确实已过 90s 线)。90/300 与 §9.7 的人眼阈值 `LIVE_STALL_WARN/DANGER_SECONDS` **同一口径**,由测试钉住相等 |
-| `loop` 循环嫌疑 | `loop.tool_repeat` | 末尾 `loop_window=20` 条事件的滑窗内,同一 `repeat_key = 工具名 @ 归一化参数摘要` 出现 `>= loop_repeat_max=5` 次 | yellow;`>= 2×` → red | 只有带 `tool_names` 的事件参与计数(否则一串无文本的 `assistant`/`system` 心跳会塌成同一个键 → 误报) |
-| `no_progress` 空转 | `no_progress.target_repeat` | 末尾 `no_progress_window=30` 条里 `tool_use` 的**目标**(文件路径 / 命令首词 + 首个非 flag 实参)重复 `>= no_progress_repeat_max=8` 次 | yellow;`>= 2×` → red | 与 loop 的分工:loop 看「动作全等」,本条只看「目标」—— `read A → edit A → read A …` 这种工具名交替、loop 抓不到的形态由它抓 |
+| `loop` 循环嫌疑 | `loop.tool_repeat` | 末尾 `loop_window=20` 条事件的滑窗内,同一 `repeat_key = 工具名 @ target` 出现 `>= loop_repeat_max=5` 次 | yellow;`>= 2×` → red | 只有带 `tool_names` 的事件参与计数(否则一串无文本的 `assistant`/`system` 心跳会塌成同一个键 → 误报)。target 见下方三级取值 |
+| `no_progress` 空转 | `no_progress.target_repeat` | 末尾 `no_progress_window=30` 条里 `tool_use` 的**目标**重复 `>= no_progress_repeat_max=8` 次 | yellow;`>= 2×` → red | 与 loop 的分工:loop 看「动作全等(工具名 + 目标)」,本条只看「目标」—— `read A → edit A → read A …` 这种工具名交替、loop 抓不到的形态由它抓 |
+
+**target 的三级取值**(实现在 `targetOf`,顺序即优先级,每一级都过 `normalizeTarget`):
+
+| 级 | 来源 | 什么时候走这一级 |
+| --- | --- | --- |
+| ① | `payload.tool_targets` 首个非空条目(§9.5) | 现在的 `tool_use`:入参里含 `file_path` / `path` / `pattern` / `directory` / `command` 之一。这就是「它在碰哪个东西」 |
+| ② | `payload.text` 归一化 | c10a 部署前落的段文件(没有 `tool_targets`),以及 `raw` / `assistant` 这类有文本无工具形状的事件 —— 长期现实,不是过渡兜底 |
+| ③ | 工具名本身 | 两级都取不到(例如 MCP 工具的 input 只有 `query`)。此时 `repeat_key` 塌成 `read_file @read_file`,**「反复调同一个工具」与「反复做同一件事」不可区分** —— 地板上的这一处误报面是已知且被接受的 |
+
+取第 ① 级时逐条扫而不是只看第 0 条:一行可以带多个 tool_use 块,第 0 块可能恰好是 `""` 占位。
 
 多条判据**可并存**(`detectSupervisor` 返回数组):悬挂前的循环痕迹与当前 stall 同时上报
 才是有用的诊断,只给一个信号时人还得自己判断。
@@ -979,10 +1019,23 @@ red。**Supervisor 是第②层的消费者,不是第①层的新读者。**
    `normalizeTarget` 把 ISO 时间戳 / epoch / uuid / 长 hex / 纯数字段折成占位符,把 `tmp`、
    `worktrees`、`.cache` 等临时目录以下整枝砍成 `<...>`,再把路径与命令行分别成形。
 
-分辨率的天花板要说清楚:Observation 层的白名单(§9.5)**刻意丢掉 `tool_use` 的 input 参数**
-(input 是自由文本 = 凭据外流面)。所以 target 只能取 `payload` 里已经过 ingress 脱敏的可见
-文本,取不到时退化为工具名本身。这不是可以先凑一下的细节:它决定了 loop 与 no_progress 的
-区分度。要更细的分辨率,得先解 §9.5 的脱敏口径,不是在这里加字段。
+分辨率的天花板由 Observation 层的白名单决定,而且**修也只能修在那一层**:c10 落地时
+`tool_use` 的 target 永远取不到文本(input 参数不进 journal,而 `text` 对 `tool_use` 不写),
+于是 `repeat_key` 塌成 `read_file @read_file` —— 「连续 5 次读 5 个不同文件」会命中 loop
+yellow,判据把「反复调同一个工具」当成了「反复做同一件事」。`detect.ts` 手里已经没有那个
+信息了,在这里猜没有意义。所以 §9.5 补了 `payload.tool_targets`(按键白名单 + 打码 + ≤128),
+target 因此有了上面的三级取值。仍然要说清楚的是:
+
+- **`stall` 判据与这件事无关**(它只读 `ts`),c10 的验收标本 C2-r6 那类模型悬挂的结论一个字
+  不改;本棒改的是另外两条判据的分辨率。
+- **shadow 样本必须按 `tool_targets` 是否存在分段统计**,不能混算。混在一起等于把 c10a
+  之前那批误报算进之后的判据可信度里 —— 两批样本的判据语义其实不同(旧样本 target 恒为
+  工具名或叙述文本,新样本是真实的入参目标)。分段口径:`tool_targets` 存在且至少一个非空
+  条目 → target 来自入参,这一段的 loop / no_progress 命中率才能用来讨论 enforce;缺失 →
+  要么落在旧段、要么该工具的 input 里没有白名单键(两者在事件字节上不可分辨,所以要再用
+  「摄取时刻是否晚于 c10a 部署点」切一刀)。整键缺省而不是写空数组,正是为了让这一刀切得动。
+- 归一化仍然会吃掉一部分分辨率(同一目标带上不同时间戳/随机 id 会被折成同一个键),这是
+  上面第 2 条立场里明说的取舍,不是本棒引入的。
 
 ### `supervisor_finding` 事件 payload
 

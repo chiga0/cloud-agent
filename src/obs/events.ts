@@ -10,6 +10,11 @@
  * 脱敏刻意放在 **ingress**(而不是读端点):自由文本一旦以明文落进 R2,后面所有
  * 读取方、所有保留期都成了泄露面。黑名单在这里一律不用 —— 白名单漏一个字段只是
  * 少一个观测维度,黑名单漏一个字段就是凭据外流。
+ *
+ * `payload.tool_targets` 是白名单里**新增的一个键**,不是绕开白名单:它是「按键白名单 +
+ * 打码 + 截断到 128 字符」之后的形状摘要(见 TOOL_TARGET_KEYS),不是 `input` 本身 ——
+ * 「input 整体不进 journal」的理由(自由文本 = 凭据外流面)一个字都没变。加它的动机在
+ * §9.8:判据要区分「读 A 文件」与「读 B 文件」,而 detect 只能看见这里写下的字节。
  */
 
 import type { Env } from "../types";
@@ -83,9 +88,36 @@ const USAGE_FIELDS = [
   "total_tokens",
 ] as const;
 
-/** tool_use 块里的工具名:枚举信息,保留;input 参数是自由文本,丢弃。 */
+/** tool_use 块里的工具名:枚举信息,保留;input 参数整体仍然丢弃(见 toolTargetOfBlock)。 */
 const TOOL_NAME_MAX_CHARS = 128;
 const TOOL_NAMES_MAX = 16;
+
+/**
+ * 入参目标的长度上限(字符)。刻意比 payload.text 小一个量级:128 字符足够写下一个
+ * 文件路径或一句 `npm test`,不够搬走一段正文 —— 这个字段是判据的形状摘要,不是正文出口。
+ */
+const TOOL_TARGET_MAX_CHARS = 128;
+
+/**
+ * 允许读取的**参数键**白名单(只有这些键的**值**会被读,其余一律不看)。
+ *
+ * 键名比对前先做一次「小写 + 去分隔符」归一,于是 `file_path` / `filePath` /
+ * `FilePath` / `file-path` 落到同一个键 —— 不同工具把同一个东西叫不同名字(上游命名
+ * 没有统一口径),按字面比对会让判据在换工具时**静默**失灵:字段还在写,下标还对得上,
+ * 只是永远取不到值。归一只作用于键名;取值一律按列出的键,认不出的键(如 `notebook_path`
+ * / `cmd` / `query`)不取。
+ *
+ * 白名单不用启发式(「看着像路径就取」)是刻意的:漏一个键的代价只是少一个观测维度,
+ * 多取一个键的代价是凭据外流 —— 这个不对称决定了只能显式列键。数组顺序即优先级,
+ * 一个 input 里同时出现多个可取键时按此顺序取第一个。
+ */
+const TOOL_TARGET_KEYS = [
+  { key: "file_path", shape: "raw" },
+  { key: "path", shape: "raw" },
+  { key: "pattern", shape: "raw" },
+  { key: "directory", shape: "raw" },
+  { key: "command", shape: "command" },
+] as const;
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value)
@@ -189,24 +221,90 @@ function usageOf(evt: Record<string, unknown>): Record<string, number> | null {
   return Object.keys(out).length > 0 ? out : null;
 }
 
-function toolNames(
+/** 参数键归一:小写 + 去分隔符,让 `filePath` 与 `file_path` 落到同一个键。 */
+function normalizeArgKey(key: string): string {
+  return key.toLowerCase().replace(/[_\-\s]/g, "");
+}
+
+/** 预归一后的白名单:表里写的是可读原名,比对一律用归一名(`file_path` → `filepath`)。 */
+const TOOL_TARGET_ORDER = TOOL_TARGET_KEYS.map((t) => ({
+  canon: normalizeArgKey(t.key),
+  shape: t.shape,
+}));
+
+/**
+ * 命令 → 「首词 + 首个不以 `-` 开头的实参」。
+ *
+ * 只取这两个 token 是为了把泄露面钉在常数级:一条真实命令可能是
+ * `bash -c 'curl -H "Authorization: Bearer …" …'`,整串进 journal 就等于把命令行
+ * 里的一切外送。代价是判据看不见 flag —— 而「同一句命令换了个 flag 反复跑」正是
+ * 空转的典型样子,不该被当成两个不同动作(见 §9.8 与 normalizeTarget)。
+ */
+function commandShape(command: string): string {
+  const tokens = command.trim().split(/\s+/).filter((t) => t.length > 0);
+  if (tokens.length === 0) return "";
+  const head = tokens[0].slice(0, TOOL_TARGET_MAX_CHARS);
+  const arg = tokens.slice(1).find((t) => !t.startsWith("-"));
+  return arg === undefined ? head : `${head} ${arg.slice(0, TOOL_TARGET_MAX_CHARS)}`;
+}
+
+/** 一个 tool_use 块的入参目标;白名单里一个键都没命中时返回 null(而不是空串)。 */
+function toolTargetOfBlock(block: Record<string, unknown>): string | null {
+  const input = asRecord(block.input);
+  if (input === null) return null;
+  // 先把命中白名单的键收进一张归一名 → 原值的表(input 可能有几十个键,其中绝大多数
+  // 一个都不看),再按 TOOL_TARGET_KEYS 的顺序取第一个能成形的。同名重复键取先出现的那个。
+  const hits = new Map<string, string>();
+  for (const [key, value] of Object.entries(input)) {
+    if (typeof value !== "string") continue;
+    const canon = normalizeArgKey(key);
+    if (!TOOL_TARGET_ORDER.some((t) => t.canon === canon)) continue;
+    if (!hits.has(canon)) hits.set(canon, value);
+  }
+  for (const { canon, shape } of TOOL_TARGET_ORDER) {
+    const raw = hits.get(canon);
+    if (raw === undefined) continue;
+    const cut = shape === "command" ? commandShape(raw) : raw.trim();
+    if (cut.length === 0) continue;
+    return cut;
+  }
+  return null;
+}
+
+/**
+ * 一次遍历同时产 `tool_names` 与 `tool_targets`:两个数组**共享同一次 push**,所以
+ * 「同长度同顺序」不是约定而是结构上不可能违反(分成两个函数各扫一遍 blocks,就会在
+ * 某次给其中一个加上过滤条件 → 下标静默错位,而错位比缺失更难查)。
+ */
+function toolNamesAndTargets(
   blocks: Array<Record<string, unknown>>,
   secrets: readonly string[],
-): string[] {
+): { names: string[]; targets: string[] } {
   const names: string[] = [];
+  const targets: string[] = [];
   for (const block of blocks) {
     if (str(block.type) !== "tool_use") continue;
     const name = str(block.name);
     if (name === null) continue;
     const trimmed = maskSecrets(name, secrets).slice(0, TOOL_NAME_MAX_CHARS);
-    if (names.length < TOOL_NAMES_MAX && !names.includes(trimmed)) names.push(trimmed);
+    // 无名块与重名块不产 slot(tool_names 本来就是去重 + 限 16 的):同一行里两次同名
+    // 调用是罕见形状,而为它把两个数组拆成不等长,代价是让每个读端点先做一次交叉检查。
+    if (names.length >= TOOL_NAMES_MAX || names.includes(trimmed)) continue;
+    const target = toolTargetOfBlock(block);
+    names.push(trimmed);
+    // 先打码**再**限长(与 textField 同一顺序理由):切点落在凭据中间时,先截断会把
+    // 半把 key 留在串里。取不到形状写 "" 而不是跳过 —— 下标对齐比数组稀疏好检查。
+    targets.push(
+      target === null ? "" : maskSecrets(target, secrets).slice(0, TOOL_TARGET_MAX_CHARS),
+    );
   }
-  return names;
+  return { names, targets };
 }
 
 /**
  * 行 → 白名单 payload。返回的键集合由本函数决定,与输入行里有什么无关:
- * 未列白的字段(tools 的 input、message 的 id、任意新增的大字段)一律不进 journal。
+ * 未列白的字段(message 的 id、input 里白名单之外的键如 `content`/`query`、任意新增的
+ * 大字段)一律不进 journal。唯一从 input 里取东西的通道是 tool_targets 的按键白名单。
  */
 function sanitizePayload(
   evt: Record<string, unknown>,
@@ -235,8 +333,12 @@ function sanitizePayload(
 
   const blocks = contentBlocks(evt);
   if (kind === "tool_use") {
-    const names = toolNames(blocks, secrets);
+    const { names, targets } = toolNamesAndTargets(blocks, secrets);
     if (names.length > 0) payload.tool_names = names;
+    // 只在**至少有一个 slot 取到了形状**时写这个键。全空时写 `[]`/`[""]` 会抹平两种
+    // 截然不同的情况:「这条段早于 tool_targets 上线」与「新段里的工具全都没有可取形状」。
+    // §9.8 要按 tool_targets 是否存在分段统计 shadow 样本,靠的就是这个区别。
+    if (targets.some((t) => t.length > 0)) payload.tool_targets = targets;
   }
 
   // 自由文本只有一处出口:payload.text(打码 + ≤2048)

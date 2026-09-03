@@ -151,7 +151,7 @@ describe("ingress 白名单与脱敏", () => {
     expect(e.payload.usage).toEqual({ input_tokens: 7 });
   });
 
-  it("tool_use 留工具名、丢参数:参数里通常是整个文件内容", () => {
+  it("tool_use 留工具名 + 白名单参数目标,丢其余参数:参数里通常是整个文件内容", () => {
     const e = build({
       type: "assistant",
       content: [
@@ -161,10 +161,134 @@ describe("ingress 白名单与脱敏", () => {
     });
     expect(e.kind).toBe("tool_use");
     expect(e.payload.tool_names).toEqual(["write_file", "read_file"]);
+    // file_path 在白名单里 → 路径形状留下(判据要靠它区分「读 A」与「读 B」);
+    // content 不在 → 整个文件正文一个字节都不进 journal。
+    expect(e.payload.tool_targets).toEqual(["/x/y.ts", "/x/y.ts"]);
     expect(JSON.stringify(e.payload)).not.toContain("整个文件");
-    expect(JSON.stringify(e.payload)).not.toContain("/x/y.ts");
+  });
+});
+
+/**
+ * tool_targets 的形状契约。这一组用例的存在理由:§9.8 的 loop / no_progress 判据
+ * 分辨率**完全**取决于这里多留的形状,而它同时是 ingress 唯一一处「从 input 里取值」
+ * 的地方 —— 白名单一旦写宽,泄露面就在这儿;写窄(或不留空位),判据就退回工具名。
+ */
+describe("payload.tool_targets(入参形状摘要:按键白名单 + 打码 + ≤128)", () => {
+  const tool = (input: unknown, name = "read_file") => ({
+    type: "tool_use",
+    name,
+    id: "t1",
+    input,
   });
 
+  it("白名单键原样取值,且与 tool_names 同长度同顺序(下标对齐)", () => {
+    const e = build({
+      type: "assistant",
+      content: [
+        tool({ file_path: "/repo/src/a.ts" }, "read_file"),
+        tool({ path: "src/b.ts" }, "edit"),
+        tool({ pattern: "**/*.test.ts" }, "glob"),
+        tool({ directory: "/repo/src" }, "list"),
+      ],
+    });
+    expect(e.payload.tool_names).toEqual(["read_file", "edit", "glob", "list"]);
+    expect(e.payload.tool_targets).toEqual([
+      "/repo/src/a.ts",
+      "src/b.ts",
+      "**/*.test.ts",
+      "/repo/src",
+    ]);
+  });
+
+  it("command 只取首词 + 首个非 flag 实参:flag 与其余 token 一律不留", () => {
+    const e = build({
+      type: "assistant",
+      content: [tool({ command: `npm test -- --reporter=verbose --token=${KEY}` }, "run_shell_command")],
+    });
+    expect(e.payload.tool_targets).toEqual(["npm test"]);
+    expect(JSON.stringify(e.payload)).not.toContain(KEY);
+    expect(JSON.stringify(e.payload)).not.toContain("verbose");
+
+    // 只有首词(没有非 flag 实参)时不补空格,也不会退化成整行
+    const bare = build({ type: "assistant", content: [tool({ command: "git status" }, "run_shell_command")] });
+    expect(bare.payload.tool_targets).toEqual(["git status"]);
+    const only = build({ type: "assistant", content: [tool({ command: "pwd" }, "run_shell_command")] });
+    expect(only.payload.tool_targets).toEqual(["pwd"]);
+  });
+
+  it("键名大小写与分隔符不敏感:同一工具改名换写法仍能取到", () => {
+    const variants = ["filePath", "FILE_PATH", "File-Path", " file path ", "path"];
+    for (const key of variants) {
+      const e = build({ type: "assistant", content: [tool({ [key.trim()]: "src/c.ts" })] });
+      expect(e.payload.tool_targets, key).toEqual(["src/c.ts"]);
+    }
+  });
+
+  it("认不出的键一律不取(宁可少一个观测维度,不可多一个泄露面)", () => {
+    const e = build({
+      type: "assistant",
+      content: [
+        tool({ notebook_path: "/x/y.ipynb", cmd: "ls", query: "SECRET-Q", text: "正文" }, "read_file"),
+      ],
+    });
+    expect(e.payload.tool_names).toEqual(["read_file"]);
+    // 一个形状都没取到 → 整键缺省(不是写 [])
+    expect(e.payload).not.toHaveProperty("tool_targets");
+    expect(JSON.stringify(e.payload)).not.toContain("/x/y.ipynb");
+    expect(JSON.stringify(e.payload)).not.toContain("SECRET-Q");
+  });
+
+  it("取不到形状的 slot 写空串占位,不让数组错位", () => {
+    const e = build({
+      type: "assistant",
+      content: [
+        tool({ unknown_key: "v" }, "mcp_thing"),
+        tool({ file_path: "/repo/src/d.ts" }, "read_file"),
+      ],
+    });
+    expect(e.payload.tool_names).toEqual(["mcp_thing", "read_file"]);
+    expect(e.payload.tool_targets).toEqual(["", "/repo/src/d.ts"]);
+  });
+
+  it("非字符串值与空白值不算形状;input 缺失/非对象也不炸", () => {
+    const nested = build({
+      type: "assistant",
+      content: [
+        tool({ file_path: { path: "/x.ts" } }), // 结构化值不递归
+        tool({ command: "   " }, "b"),
+        { type: "tool_use", name: "c" }, // 没有 input
+        { type: "tool_use", name: "d", input: "not-an-object" },
+      ],
+    });
+    expect(nested.payload.tool_names).toEqual(["read_file", "b", "c", "d"]);
+    expect(nested.payload).not.toHaveProperty("tool_targets");
+  });
+
+  it("目标里的凭据值先打码后截断,长度 ≤128", () => {
+    const e = build(
+      {
+        type: "assistant",
+        content: [tool({ file_path: `/tmp/${KEY}/rest-of-the-path-that-keeps-going-and-going-and-going-${"x".repeat(200)}` })],
+      },
+      { secrets: [KEY] },
+    );
+    const target = (e.payload.tool_targets as string[])[0];
+    expect(target).not.toContain(KEY);
+    expect(target).toContain(OBS_SECRET_MASK);
+    expect(target.length).toBeLessThanOrEqual(128);
+  });
+
+  it("非 tool_use 的 kind 不产这个键(text 通道口径不混)", () => {
+    const e = build({
+      type: "user",
+      message: { content: [{ type: "tool_result", tool_use_id: "t1", content: "a.ts\nb.ts" }] },
+    });
+    expect(e.kind).toBe("tool_result");
+    expect(e.payload).not.toHaveProperty("tool_targets");
+  });
+});
+
+describe("ingress 打码与截断(自由文本 / 标量字段一视同仁)", () => {
   it("已知凭据值精确打码:自由文本、工具结果、白名单字符串字段一视同仁", () => {
     const secrets = [KEY];
     const free = build(
