@@ -16,6 +16,7 @@ import {
   parseObsLastEventId,
   type ObsStreamDeps,
 } from "./obs/stream";
+import { renderLivePage } from "./obs/live";
 
 export { AttemptWorkflow } from "./exec/workflow";
 export { ContainerProxy } from "@cloudflare/sandbox";
@@ -467,6 +468,42 @@ async function handleGetTaskEventStream(req: Request, env: Env, taskId: string):
   return obsStreamResponse(taskId, deps, createObsStreamSession(last.value)).response;
 }
 
+/**
+ * GET /live/:taskId —— 在途事件时间线的**人眼端**(第④层下半)。页面怎么来的、为什么
+ * 全内联、停滞阈值为什么是 90/300,都写在 src/obs/live.ts 顶部;这里只负责鉴权、404
+ * 与响应头。事件内容一律由浏览器的 EventSource 拉,本函数不读 journal 的一个字节。
+ *
+ * **为什么一个「只是给人看」的页面也要鉴权**:事件 payload 已在 ingress 过白名单脱敏,
+ * 所以这里泄露的不是密钥 —— 泄露的是**任务存在性本身**,以及 state、事件条数、agent
+ * 正在动哪个仓库这类元信息。它们对竞争对手或扫描器就是有价值的信号,而本项目的口径从来
+ * 是「凡带任务信息的出口一律同一条 checkApiToken」(§11 全表无例外)。在这个前提下
+ * 404 才能有意义:不鉴权的话,「这个 taskId 存在」会无条件回答出来 —— 未鉴权的 404
+ * 与鉴权后的 404 是两台机器。
+ *
+ * **已知前提(EventSource 带不了 Authorization 头,本期不解决)**:浏览器发起的
+ * EventSource 无法携带自定义头,而 §9.6 那条流只认 `Authorization: Bearer`。所以直连
+ * 会得到 401,页面会显示连接中断的提示。要让它真跑通,二选一都在别的棒里:部署侧用
+ * 注入凭据的反代理解 `/tasks/*`,或者给流端点加一次性短期 token。**刻意不在本期做**
+ * —— 本期硬约束是不改 SSE 端点的任何行为(含它的鉴权),而把 token 塞进 URL 会让凭据
+ * 进浏览器历史、访问日志和 Referer,那是拿观测面换一个泄露面。
+ * 此处需浏览器实测:401 与断连在 EventSource 前端不可区分,页面的提示是否够用只能实测。
+ */
+async function handleLivePage(env: Env, taskId: string): Promise<Response> {
+  // 与 /tasks/:id/events* 完全同源的 404 语义,且必须在生成 HTML **之前**判掉:
+  // 一旦 200 + text/html 发出去,就没法再补一个 404(同 §9.6 建流前判 404 的理由)。
+  const snap = await TaskSession.from(env, taskId).getSnapshot();
+  if (!snap) return Response.json({ error: { type: "not_found" } }, { status: 404 });
+  return new Response(renderLivePage(taskId, { state: snap.task.state }), {
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+      // 不缓存:缓存住的就是一个不会再自增的停滞计时器 —— 这个页面的全部价值在于「现在」。
+      // 不给 frame-ancestors/CSP:内联脚本本页必须有,而加 CSP 头会引出一整套新契约(下一棒的事)。
+      "cache-control": "no-store",
+      "x-content-type-options": "nosniff",
+    },
+  });
+}
+
 async function handleApprove(req: Request, env: Env, taskId: string): Promise<Response> {
   const body = (await req.json()) as {
     decision?: string;
@@ -875,6 +912,14 @@ export default {
 
     if (url.pathname === "/admin/events" && req.method === "GET") {
       return handleAdminEvents(url, env);
+    }
+
+    // Live UI(第④层下半)。id 的正则与下面 /tasks/:id/* **同一条**([0-9a-f-]{36}):
+    // 畸形 id 在这里就 404,不进渲染 —— 但 renderLivePage 仍然自己转义,理由见它上方注释。
+    // 刻意不做 /live 列表页:那需要跨任务枚举,与 /admin/tasks 的归档口径纠缠,是另一棒。
+    const liveMatch = /^\/live\/([0-9a-f-]{36})$/.exec(url.pathname);
+    if (liveMatch && req.method === "GET") {
+      return handleLivePage(env, liveMatch[1]);
     }
 
     const taskMatch =

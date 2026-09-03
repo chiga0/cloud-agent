@@ -77,6 +77,8 @@ git -C <你的仓库> checkout <candidate.base.sha> && git apply task-<task_id>-
 
 curl -N localhost:8787/tasks/<task_id>/events/stream -H "authorization: Bearer $TOKEN"   # GET /tasks/:id/events/stream:SSE 在途事件流(第④层可观测的投影,**非权威**,不写任何状态)—— 帧 id = 该帧之后已读的条数,与 /events 的 `?after=` 完全同口径,断线带 `Last-Event-ID` 续传不重发不漏读;每拍 3s 推增量,任务离开 RUNNING 且增量推完则一帧 `end` 后关流(详见 docs/architecture.md §9.6)
 
+curl -s "localhost:8787/live/<task_id>" -H "authorization: Bearer $TOKEN" -o live.html && $BROWSER live.html   # GET /live/:taskId:上面那条流的人眼端(第④层下半,docs/architecture.md §9.7)—— 全内联、零外部依赖的单页 HTML,页面自己用 `EventSource` 连 /tasks/:id/events/stream。核心价值是**停滞检测**:「最后事件 Ns 前」每秒自增,>90s 黄、>300s 红(C2-r6 那种 24 分钟模型悬挂,5 分钟内肉眼可判,不必再人工 tail)。时间线按到达序渲染 seq/kind 徽章/ts/payload.text 摘要(>200 字符截断标注),`tool_use` 显示 tool_names、`raw` 显示 raw_type,收到 `end` 帧显示「流已结束」并停表;坏帧跳过并计数。**只被动显示:不做任何判定与处置**(Supervisor 是独立消费者层,下一期)。鉴权与 /tasks/:id/events* 同源:无凭据 401、任务不存在 404。⚠️ 已知前提:`EventSource` 不能携带 `Authorization` 头,浏览器直连会得到 401 并显示重连提示 —— 打通需要部署侧注入凭据(§9.7)
+
 # 复盘各 attempt(writer/verifier/reviewer)的终态与 token 消耗 —— `GET /admin/attempts`。
 # 它是 D1 归档的**只读视图**(读投影,不是新的状态权威):attempt 随任务终态才归档,
 # 因此**不含尚未归档的在途 attempt** —— 在跑的任务仍看 `GET /tasks/<task_id>`。
