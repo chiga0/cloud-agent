@@ -1,5 +1,5 @@
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { env } from "cloudflare:test";
+import { env, runInDurableObject } from "cloudflare:test";
 import type { TaskSession } from "../src/control/session";
 import type { ReviewVerdict } from "../src/control/gates";
 import type { TranscriptUsage } from "../src/exec/extract";
@@ -850,12 +850,23 @@ describe("attempt token 台账落库", () => {
 /**
  * c11 主修:一次 DO RPC 被杀不得把权威链写成「重号 + 不可归档」的损坏状态。
  *
- * 三条用例受同一条平台事实约束(workerd 的实测语义,不是本仓的选择):**抛异常的 RPC
+ * (a)(b)(c) 受同一条平台事实约束(workerd 的实测语义,不是本仓的选择):**抛异常的 RPC
  * 会整体丢弃该轮的 storage 写**,并把该 DO 实例的 input gate 打成 broken —— 之后每次
  * 调用都返回同一个错误,且每个这样的调用都会给测试进程留下一条 unhandled rejection
  * (`durableObjectReset`)。所以「链已前进、状态陈旧」的残骸在 miniflare 里既造不出来
  * 也读不到,而任何让 RPC 往外抛的用例都会把整个套件染红。用例因此钉可观测的那一半:
  * 取号与归档看的是链(唯一在被杀后仍前进的结构),而不是 `task.next_seq`。
+ *
+ * (d)(e)(f) 钉这一节的其余三块判别力:
+ * - (d) 封箱簿记本身 —— 追过两个分片边界,核对 `events:arc` 登记、`events:cur` 裁剪、
+ *   分片键编号、计数器镜像与 D1 归档行数五者是否互相自洽;
+ * - (e) 对账告警的噪声面 —— 正常轮次一条 `seq_reconciled` 都不许有(反向半边钉在 (e2):
+ *   镜像真陈旧时必须恰好一条,并以链为准修回来。两半合起来才钉住「对账只在读时做一次」);
+ * - (f) 判重兜底的反推写回 —— 重放命中链上终态事件时,`attempt.state` 由链事件派生,
+ *   而不是停在陈旧值上。
+ *
+ * (f) 需要的「链已前进、状态陈旧」形状无法靠被杀的 RPC 造出来(见上),但可以直接把
+ * `attempts` 这一层拨回陈旧值 —— 被测的是判据读哪一层,不是 storage 会不会半写。
  */
 describe("事件与状态同一次原子写(c11)", () => {
   async function chainOf(stub: Stub) {
@@ -966,6 +977,252 @@ describe("事件与状态同一次原子写(c11)", () => {
       .bind(taskId)
       .first<{ c: number }>();
     expect(rows!.c).toBe(seqs.length);
+  });
+
+  /**
+   * 与 src/control/session.ts 的 `EVENTS_PER_SHARD` 同值。刻意在测试里抄一份常量:
+   * 边界用例的判别力正来自「第 100 条必须封箱」这个具体数字 —— 把阈值改成永不封箱
+   * (或每次追加都封箱)的变异必须把 (d) 打红。改了 src 的阈值就得同步改这一行。
+   */
+  const SHARD = 100;
+
+  /** DO storage 里事件分片的最小读投影(键与形状见 session.ts 的 loadAll/persist)。 */
+  interface StoredEvent {
+    seq: number;
+  }
+
+  /**
+   * 直接读原始分片簿记。`getSnapshot` 给的是这三处拼回来的链,只能看出「链不对」;
+   * 读原始键才分得出是**哪一格**不对(索引没登记 / 分片体没落盘 / 当前分片没裁剪)。
+   */
+  async function readShardState(stub: Stub): Promise<{
+    arcKeys: string[];
+    shards: Record<string, StoredEvent[]>;
+    cur: StoredEvent[];
+  }> {
+    return runInDurableObject(stub, async (_instance, state) => {
+      const arcKeys = (await state.storage.get<string[]>("events:arc")) ?? [];
+      const shards: Record<string, StoredEvent[]> = {};
+      for (const key of arcKeys) shards[key] = (await state.storage.get<StoredEvent[]>(key)) ?? [];
+      const cur = (await state.storage.get<StoredEvent[]>("events:cur")) ?? [];
+      return { arcKeys, shards, cur };
+    });
+  }
+
+  /** 把 `task` 行的计数器镜像拨回陈旧值(链不动)。 */
+  async function staleNextSeqMirror(stub: Stub, value: number): Promise<void> {
+    await runInDurableObject(stub, async (_instance, state) => {
+      const task = await state.storage.get<{ next_seq: number }>("task");
+      if (task) await state.storage.put("task", { ...task, next_seq: value });
+    });
+  }
+
+  /** 把 `attempts` 里那条回报的状态拨回 RUNNING、finished_at 清空(链不动)。 */
+  async function staleAttemptMirror(stub: Stub, attemptId: string): Promise<void> {
+    await runInDurableObject(stub, async (_instance, state) => {
+      const attempts =
+        (await state.storage.get<Array<{ id: string; state: string; finished_at: string | null }>>(
+          "attempts",
+        )) ?? [];
+      await state.storage.put(
+        "attempts",
+        attempts.map((a) =>
+          a.id === attemptId ? { ...a, state: "RUNNING", finished_at: null } : a,
+        ),
+      );
+    });
+  }
+
+  function spyWarns(): string[] {
+    const warns: string[] = [];
+    vi.spyOn(console, "warn").mockImplementation((...a: unknown[]) => {
+      warns.push(a.map(String).join(" "));
+    });
+    return warns;
+  }
+
+  // 只为本块 (e)/(e2) 的 console.warn 探针收口;(a)(b)(c) 不装 mock,restoreAllMocks 是空操作。
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("(d) 追过分片边界:封箱簿记与链、计数器镜像、D1 归档逐格对齐", async () => {
+    const taskId = crypto.randomUUID();
+    const stub = newStub();
+    await stub.createTask({ prompt: "shard boundary" } as never, taskId);
+    await writerOk(stub);
+    const afterWriter = (await chainOf(stub)).events.length;
+
+    // 一轮「起 reviewer attempt + 回报基建失败」恰好往链里追加 5 条:
+    // attempt.created / attempt.exec_finished / result.captured / evidence.manifest /
+    // review.unavailable。reviewer 不改任务状态,推进量因此与轮次严格线性 ——
+    // 跨过封箱边界时才知道第 100 条落在哪一轮。
+    const PER_ROUND = 5;
+    const rounds = Math.ceil((2 * SHARD + 13 - afterWriter) / PER_ROUND);
+    // 纪律:**串行**推进,一次一条 RPC。上一代这里是 112 事件 × 16 并发的 Promise.all
+    // 风暴 —— 几百个 workflow 实例同时起落,正是容器 teardown 噪声把整套测试染红的来源。
+    // 串行只慢不到一秒,换来的是可预测的取号序列与干净的 teardown。
+    for (let i = 0; i < rounds; i++) {
+      const { attempt_id } = await stub.startAttempt({
+        role: "reviewer",
+        idempotency_key: crypto.randomUUID(),
+        ...BUDGET,
+      });
+      expect(
+        (
+          await stub.reportExecution({
+            attempt_id,
+            exit_code: 12,
+            error: "upstream 502 from model gateway",
+          })
+        ).ok,
+      ).toBe(true);
+    }
+
+    // ① 链:1..N 连续无重号,长度等于推进模型。封箱簿记错任何一处 —— 分片体没落盘、
+    //    键没登记进 arcKeys(curShard 清空后那 100 条就此蒸发)、curShard 没裁剪
+    //    (读回来一份重复)、分片键撞车(后一轮盖掉前一轮)—— 在这里都表现为缺段或重号。
+    const snap = await chainOf(stub);
+    const seqs = snap.events.map((e) => e.seq);
+    expect(
+      seqs.length,
+      `链长应为 ${afterWriter} + ${rounds}×${PER_ROUND}`,
+    ).toBe(afterWriter + rounds * PER_ROUND);
+    expect(seqs).toEqual(seqs.map((_, i) => i + 1));
+    const sealed = Math.floor(seqs.length / SHARD);
+    expect(sealed).toBeGreaterThanOrEqual(2);
+
+    // ② 已封箱部分:索引按 `evt:0`、`evt:1` … 升序登记,每片恰好装满分片阈值条。
+    const raw = await readShardState(stub);
+    expect(raw.arcKeys).toEqual(Array.from({ length: sealed }, (_, i) => `evt:${i}`));
+    for (let i = 0; i < sealed; i++) {
+      const key = `evt:${i}`;
+      expect(raw.shards[key], `封箱分片 ${key} 必须真的落盘`).toBeDefined();
+      expect((raw.shards[key] ?? []).map((e) => e.seq)).toEqual(
+        Array.from({ length: SHARD }, (_, k) => i * SHARD + k + 1),
+      );
+    }
+    // ③ 当前分片已裁剪:只剩最后一个边界之后的尾巴,不留封走那份的副本。
+    expect(raw.cur.map((e) => e.seq)).toEqual(
+      Array.from({ length: seqs.length % SHARD }, (_, k) => sealed * SHARD + k + 1),
+    );
+    // ④ 计数器镜像 = 链尾 + 1:同步只发生在 persist(临界区出口)这一次。
+    expect(snap.task.next_seq).toBe(seqs.length + 1);
+
+    // ⑤ 归档写的是拼回来的整条链:分片少一格,D1 行数就对不上链长。
+    const ev = await stub.getEvidenceSummary();
+    expect(
+      (
+        await stub.submitDecision({
+          attempt_id: ev.writer_attempt_id!,
+          evidence_digest: ev.binding_digest!,
+          decision: "approve",
+          actor: "human:test",
+        })
+      ).ok,
+    ).toBe(true);
+
+    const done = await chainOf(stub);
+    expect(done.task.state).toBe("DONE");
+    const doneSeqs = done.events.map((e) => e.seq);
+    expect(doneSeqs).toEqual(doneSeqs.map((_, i) => i + 1));
+    // 终态这一步至少留下 decision.recorded + task.transition 两条
+    expect(doneSeqs.length).toBeGreaterThanOrEqual(seqs.length + 2);
+    const rows = await env.DB.prepare(
+      "SELECT COUNT(*) AS rows_total, COUNT(DISTINCT seq) AS seqs_unique FROM events WHERE task_id = ?",
+    )
+      .bind(taskId)
+      .first<{ rows_total: number; seqs_unique: number }>();
+    // 200+ 条跨分片的链撞的是真实代码路径上的 UNIQUE(task_id, seq):重号会让整批
+    // 归档当场失败(prod 5489dc8a 的次生灾害),行数对不上就是缺段或静默丢事件。
+    expect(rows!.rows_total).toBe(doneSeqs.length);
+    expect(rows!.seqs_unique).toBe(doneSeqs.length);
+    chainIntact(done.events);
+  });
+
+  it("(e) 正常轮次一条 seq_reconciled 都没有:对账不是每次追加的前置断言", async () => {
+    const warns = spyWarns();
+    const stub = newStub();
+    await createTask(stub);
+    await writerOk(stub);
+    await reviewerReport(stub, { exit_code: 0, review: { decision: "approve", reason: "看着可以" } });
+    const snap = await chainOf(stub);
+    expect(snap.task.state).toBe("DONE");
+
+    // 建单→执行→裁决→归档一整轮,每次 loadAll 读到的 stored 与 chain 都该逐字相等。
+    // 把对账搬进 appendEvent(每追加一条就跑一次)、或让 persist 不再同步镜像,都会让
+    // 这里刷出一堆 seq_reconciled:那是「计数器又偷偷变回取号来源」的信号。
+    expect(warns.filter((l) => l.includes("seq_reconciled"))).toEqual([]);
+  });
+
+  it("(e2) 镜像真陈旧时:对账恰好一条,且以链为准修回来", async () => {
+    const taskId = crypto.randomUUID();
+    const stub = newStub();
+    await stub.createTask({ prompt: "reconcile" } as never, taskId);
+    const before = await chainOf(stub);
+    const chain = before.events.length + 1;
+    // 事件已落盘、task 行没跟上 —— 正是 prod 5489dc8a 里那个不再前进的镜像字段。
+    await staleNextSeqMirror(stub, 1);
+
+    const warns = spyWarns();
+    const read = await chainOf(stub);
+    const reconciled = warns.filter((l) => l.includes("seq_reconciled"));
+    // 一次载入最多一条:既不许静默吞掉不一致,也不许每次读都刷。
+    expect(reconciled).toHaveLength(1);
+    expect(reconciled[0]).toContain(`task=${taskId}`);
+    expect(reconciled[0]).toContain("stored=1");
+    expect(reconciled[0]).toContain(`chain=${chain}`);
+    // 以链为准:计数器只是镜像,读的时候被链覆盖。
+    expect(read.task.next_seq).toBe(chain);
+  });
+
+  it("(f) 重放命中链上终态事件:attempt.state 由链反推写回,不留陈旧值", async () => {
+    const cases: Array<{ exit_code: number; derived: string; error?: string }> = [
+      { exit_code: 0, derived: "SUCCEEDED" },
+      { exit_code: 1, derived: "FAILED" },
+      { exit_code: -1, derived: "BLOCKED", error: "internal workflows error" },
+    ];
+
+    for (const c of cases) {
+      const stub = newStub();
+      await createTask(stub);
+      const { attempt_id } = await stub.startAttempt({
+        role: "writer",
+        idempotency_key: crypto.randomUUID(),
+        ...BUDGET,
+      });
+      const report = {
+        attempt_id,
+        exit_code: c.exit_code,
+        error: c.error,
+        result_text: "已按要求完成",
+      };
+      expect((await stub.reportExecution(report)).ok).toBe(true);
+
+      const first = await chainOf(stub);
+      expect(first.attempts.find((a) => a.id === attempt_id)!.state).toBe(c.derived);
+      const seqsFirst = first.events.map((e) => e.seq);
+
+      // 造出判据要处理的那一组合:链已前进、状态镜像陈旧。
+      await staleAttemptMirror(stub, attempt_id);
+      expect((await chainOf(stub)).attempts.find((a) => a.id === attempt_id)!.state).toBe("RUNNING");
+
+      for (let i = 0; i < 4; i++) {
+        const again = await stub.reportExecution(report);
+        expect(again).toMatchObject({ ok: true, ignored: true });
+        // 只有第一次重放走链判重这条兜底(此时状态镜像还是 RUNNING);之后状态已被
+        // 反推写回,前一道 `state !== RUNNING` 守卫就把它挡住了。
+        expect(again.reason).toBe(i === 0 ? "already_in_chain" : undefined);
+      }
+
+      const after = await chainOf(stub);
+      // (b) 钉的是「重放不再推进链」,这里钉的是「重放把状态修回与链一致」。
+      expect(after.events.map((e) => e.seq)).toEqual(seqsFirst);
+      const repaired = after.attempts.find((a) => a.id === attempt_id)!;
+      expect(repaired.state).toBe(c.derived);
+      expect(repaired.finished_at).not.toBeNull();
+      chainIntact(after.events);
+    }
   });
 });
 
