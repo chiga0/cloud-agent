@@ -744,3 +744,273 @@ describe("GET /admin/events", () => {
     });
   });
 });
+
+/**
+ * GET /admin/chain-check(c11b 第 3 条)—— 完整性监控补口径。
+ *
+ * 全局模式的数据源是 `SELECT DISTINCT task_id FROM events`,只看已归档的 D1 行。
+ * prod 事故里它返回 checked=79 / broken=0,而当时正有一条任务每 30 秒空转一次归档失败:
+ * **未归档的任务对它完全不可见**,重号的链它也看不出来(只校验 prev_digest 与 digest)。
+ * 这里钉三条:
+ * - `:seq` —— seq 严格递增且唯一(5489dc8a 的形态:seq 4/5 各重号 5 次);
+ * - `:state` —— D1 状态行已终态,而链尾最后一条可判定的 task.transition 不是它;
+ * - `?task_id=` 对账模式 —— 同时读 DO 链与 D1 行,三态输出。
+ *
+ * 夹具全部复用本文件既有的 seedTask / seedChain(同一份 sha256Hex 口径),不新建 DO fixture。
+ */
+describe("GET /admin/chain-check", () => {
+  beforeEach(async () => {
+    clock = 0;
+    await env.DB.prepare("DELETE FROM decisions").run();
+    await env.DB.prepare("DELETE FROM events").run();
+    await env.DB.prepare("DELETE FROM attempts").run();
+    await env.DB.prepare("DELETE FROM tasks").run();
+  });
+
+  interface CheckBody {
+    checked: number;
+    broken: number;
+    brokenTasks: string[];
+  }
+  interface ReconcileBody {
+    task_id: string;
+    mode: string;
+    result: "consistent" | "not_archived" | "diverged";
+    task_state: string;
+    archived: boolean;
+    do_events: number;
+    d1_events: number;
+    do_tail_digest: string | null;
+    d1_tail_digest: string | null;
+    broken: number;
+    brokenTasks: string[];
+  }
+  interface ErrorBody {
+    error: { type: string; detail?: string };
+  }
+
+  async function globalCheck(): Promise<CheckBody> {
+    const res = await request("/admin/chain-check");
+    expect(res.status).toBe(200);
+    return (await res.json()) as CheckBody;
+  }
+
+  async function reconcile(taskId: string): Promise<{ status: number; body: ReconcileBody | ErrorBody }> {
+    const res = await request(`/admin/chain-check?task_id=${taskId}`);
+    return { status: res.status, body: (await res.json()) as ReconcileBody | ErrorBody };
+  }
+
+  describe(":seq 破口", () => {
+    /**
+     * 重号行在真库里被 migrations/0003 的 `idx_events_task_seq` UNIQUE 挡着,
+     * 所以这条判据要能用例化,必须先摘掉那个索引。**去重与建回留给调用方在用例断言之后
+     * 做**(返回清理函数):索引在有重号行时建不回来,而当场去重等于把被测的那份数据抹掉。
+     * 判据本身防的正是「索引没生效/被绕过/手工改过数据」这几种形态。
+     */
+    async function dupSeq(taskId: string, seq: number, copies: number): Promise<() => Promise<void>> {
+      const row = await env.DB.prepare(
+        "SELECT kind, payload, digest, prev_digest, created_at FROM events WHERE task_id = ? AND seq = ?",
+      )
+        .bind(taskId, seq)
+        .first<{ kind: string; payload: string; digest: string; prev_digest: string | null; created_at: string }>();
+      if (!row) throw new Error(`夹具缺 seq=${seq} 的行`);
+      await env.DB.prepare("DROP INDEX idx_events_task_seq").run();
+      await env.DB.batch(
+        Array.from({ length: copies }, () =>
+          env.DB.prepare(
+            "INSERT INTO events (id, task_id, kind, payload, digest, prev_digest, seq, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+          ).bind(
+            crypto.randomUUID(),
+            taskId,
+            row.kind,
+            row.payload,
+            row.digest,
+            row.prev_digest,
+            seq,
+            row.created_at,
+          ),
+        ),
+      );
+      return async () => {
+        await env.DB
+          .prepare("DELETE FROM events WHERE rowid NOT IN (SELECT MIN(rowid) FROM events GROUP BY task_id, seq)")
+          .run();
+        await env.DB.prepare("CREATE UNIQUE INDEX idx_events_task_seq ON events(task_id, seq)").run();
+      };
+    }
+
+    it("正向:seq 重号 5 次 ⇒ 恰好一条 :seq 破口,且不被 :prev 顶掉", async () => {
+      const taskId = await seedTask({ state: "BLOCKED" });
+      const rows = await seedChain(taskId, [
+        { kind: "task.created", payload: { spec_digest: "a" } },
+        { kind: "attempt.created", payload: { attempt_id: "at-1" } },
+        { kind: "task.transition", payload: { to: "RUNNING", actor: "agent:w" } },
+        { kind: "attempt.blocked", payload: { attempt_id: "at-1" } },
+        { kind: "task.transition", payload: { to: "BLOCKED", actor: "system:alarm" } },
+      ]);
+      const restore = await dupSeq(taskId, 4, 5);
+      try {
+        const body = await globalCheck();
+        expect(body.brokenTasks).toContain(`${taskId}:4:seq`);
+        // 5 份复制 ⇒ 5 次违反,但同一个 (task,seq) 只登记一条:重号不该挤掉别的任务的破口。
+        expect(body.brokenTasks.filter((t) => t.endsWith(":seq"))).toHaveLength(1);
+        expect(body.broken).toBe(1);
+        // 尾行仍然接得上 ⇒ 这两条判据互不遮蔽;链尾的终态转换也没被 :seq 连带误伤。
+        expect(rows[rows.length - 1].seq).toBe(5);
+        expect(body.brokenTasks.some((t) => t.endsWith(":prev") || t.endsWith(":digest"))).toBe(false);
+        expect(body.brokenTasks.some((t) => t.endsWith(":state"))).toBe(false);
+      } finally {
+        await restore();
+      }
+    });
+
+    it("反向:seq 连续无重号的链不报 :seq", async () => {
+      const taskId = await seedTask({ state: "BLOCKED" });
+      await seedChain(taskId, [
+        { kind: "task.created", payload: { spec_digest: "a" } },
+        { kind: "task.transition", payload: { to: "RUNNING", actor: "agent:w" } },
+        { kind: "task.transition", payload: { to: "BLOCKED", actor: "system:alarm" } },
+      ]);
+
+      const body = await globalCheck();
+      expect(body).toEqual({ checked: 1, broken: 0, brokenTasks: [] });
+    });
+  });
+
+  describe(":state 破口", () => {
+    it("正向:D1 状态行是 BLOCKED,链尾最后一条转换停在 RUNNING", async () => {
+      const taskId = await seedTask({ state: "BLOCKED" });
+      const rows = await seedChain(taskId, [
+        { kind: "task.created", payload: { spec_digest: "a" } },
+        { kind: "attempt.created", payload: { attempt_id: "at-1" } },
+        { kind: "task.transition", payload: { to: "RUNNING", actor: "agent:w" } },
+        { kind: "result.captured", payload: { attempt_id: "at-1" } },
+      ]);
+
+      const body = await globalCheck();
+      // 标记格式与 :prev / :digest 同族,seq 取链尾那条。
+      expect(body.brokenTasks).toEqual([`${taskId}:${rows[rows.length - 1].seq}:state`]);
+      expect(body.broken).toBe(1);
+    });
+
+    it("反向:链尾的终态转换与状态行一致 ⇒ 不报", async () => {
+      const taskId = await seedTask({ state: "DONE" });
+      await seedChain(taskId, [
+        { kind: "task.created", payload: { spec_digest: "a" } },
+        { kind: "task.transition", payload: { to: "RUNNING", actor: "agent:w" } },
+        { kind: "decision.recorded", payload: { decision: "approve" } },
+        { kind: "task.transition", payload: { to: "DONE", actor: "human:ops" } },
+      ]);
+
+      expect(await globalCheck()).toEqual({ checked: 1, broken: 0, brokenTasks: [] });
+    });
+
+    it("非终态任务不判(状态机汇点之外没有「链尾该是什么」这回事)", async () => {
+      const taskId = await seedTask({ state: "AWAITING_APPROVAL" });
+      await seedChain(taskId, [
+        { kind: "task.created", payload: { spec_digest: "a" } },
+        { kind: "task.transition", payload: { to: "RUNNING", actor: "agent:w" } },
+      ]);
+
+      expect(await globalCheck()).toEqual({ checked: 1, broken: 0, brokenTasks: [] });
+    });
+  });
+
+  /**
+   * 对账模式。DO 侧用 name-based id 取实例(与 /tasks/:id 同一路径),
+   * 归档走真实写路径(reportExecution → archiveWithRetry),这样两侧的记录
+   * 都是产品代码产出的,不是夹具拼出来的。
+   */
+  describe("对账模式 ?task_id=", () => {
+    async function doTask(taskId: string) {
+      const stub = env.TASK_SESSION.get(env.TASK_SESSION.idFromName(taskId));
+      await stub.createTask({ prompt: "reconcile" }, taskId);
+      return stub;
+    }
+
+    /** createTask + 一次 writer 失败回报 ⇒ 链进终态、archive 真的落到 D1。 */
+    async function archivedDoTask(): Promise<{ taskId: string; doEvents: number }> {
+      const taskId = crypto.randomUUID();
+      const stub = await doTask(taskId);
+      const { attempt_id } = await stub.startAttempt({
+        role: "writer",
+        idempotency_key: `${taskId}:attempt:1`,
+        max_model_tokens: 10_000,
+        max_wall_seconds: 600,
+      });
+      const res = await stub.reportExecution({
+        attempt_id,
+        exit_code: -1,
+        error: "internal workflow error",
+      });
+      expect(res.ok).toBe(true);
+      const snap = await stub.getSnapshot();
+      return { taskId, doEvents: snap!.events.length };
+    }
+
+    it("DO 有链而 D1 零行 ⇒ not_archived;同一条任务在全局模式下完全隐身", async () => {
+      const taskId = crypto.randomUUID();
+      await doTask(taskId);
+
+      const { status, body } = await reconcile(taskId);
+      expect(status).toBe(200);
+      const r = body as ReconcileBody;
+      expect(r.mode).toBe("reconcile");
+      expect(r.result).toBe("not_archived");
+      expect(r.d1_events).toBe(0);
+      expect(r.do_events).toBeGreaterThan(0);
+      expect(r.archived).toBe(false);
+      // 这一行就是「监控为什么当年看不见它」:全局模式连 checked 都不加。
+      expect(await globalCheck()).toEqual({ checked: 0, broken: 0, brokenTasks: [] });
+    });
+
+    it("归档落地后两侧逐条对上 ⇒ consistent", async () => {
+      const { taskId, doEvents } = await archivedDoTask();
+
+      const r = (await reconcile(taskId).then((x) => x.body)) as ReconcileBody;
+      expect(r.result).toBe("consistent");
+      expect(r.d1_events).toBe(doEvents);
+      expect(r.do_tail_digest).not.toBeNull();
+      expect(r.d1_tail_digest).toBe(r.do_tail_digest);
+      expect(r.broken).toBe(0);
+    });
+
+    it("diverged(D1 少一行):行数不等即为分歧,不降级成 not_archived", async () => {
+      const { taskId } = await archivedDoTask();
+      await env.DB.prepare("DELETE FROM events WHERE task_id = ? AND seq = 1").bind(taskId).run();
+
+      const r = (await reconcile(taskId).then((x) => x.body)) as ReconcileBody;
+      expect(r.result).toBe("diverged");
+      expect(r.d1_events).toBe(r.do_events - 1);
+    });
+
+    it("diverged(等长但尾 digest 被改):行数对上挡不住内容分歧", async () => {
+      const { taskId } = await archivedDoTask();
+      await env.DB.prepare(
+        "UPDATE events SET digest = ? WHERE task_id = ? AND seq = (SELECT MAX(seq) FROM events WHERE task_id = ?)",
+      )
+        .bind("0".repeat(64), taskId, taskId)
+        .run();
+
+      const r = (await reconcile(taskId).then((x) => x.body)) as ReconcileBody;
+      expect(r.result).toBe("diverged");
+      expect(r.d1_events).toBe(r.do_events);
+      expect(r.d1_tail_digest).not.toBe(r.do_tail_digest);
+      // 三态说的是「两份记录的关系」,破口口径仍然一并给出。
+      expect(r.brokenTasks.some((t) => t.endsWith(":digest"))).toBe(true);
+    });
+
+    it("旧实现静默忽略的 ?task_id= 现在必须真的回答它:畸形 400、无 DO 记录 404", async () => {
+      const malformed = await request("/admin/chain-check?task_id=nope");
+      expect(malformed.status).toBe(400);
+      expect(((await malformed.json()) as ErrorBody).error.type).toBe("invalid_task_id");
+
+      const unknown = await reconcile(crypto.randomUUID());
+      expect(unknown.status).toBe(404);
+      expect(((unknown.body) as ErrorBody).error.type).toBe("task_not_found");
+
+      // 全局模式不带 task_id 时形状一字不变(不与对账模式共用字段)。
+      expect(Object.keys(await globalCheck()).sort()).toEqual(["broken", "brokenTasks", "checked"]);
+    });
+  });
+});

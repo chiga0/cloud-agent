@@ -82,6 +82,15 @@ interface TaskRecord {
   last_candidate_digest: string | null;
   /** 钉住的当前证据:审批绑定、/evidence、血缘核对的唯一口径 */
   current_evidence: CurrentEvidence | null;
+  /**
+   * 归档重试阶梯的当前档位(下标进 `ARCHIVE_RETRY_LADDER_MS`)。0 = 没有积压的失败。
+   *
+   * 为什么必须是随链同批落盘的持久字段而不是实例属性:一次 alarm 是**独立的一次请求**,
+   * 实例随时可能被淘汰;放在内存里等于没有阶梯 —— 每次醒来都从 30 秒重新开始,
+   * 就退回 prod 那个「每 30.07 秒空转一次、连续 100+ 次」的形态。
+   * 写在 `s.task` 上由临界区出口那次 `persist` 与事件链同批落盘,不需要第二个写出口。
+   */
+  archive_retry_step: number;
 }
 
 interface CurrentEvidence {
@@ -207,6 +216,51 @@ function terminalEventOfChain(events: EventRecord[], attemptId: string): EventRe
 const SUPERVISOR_REPORTED_KEY = "supervisor:reported";
 
 /**
+ * 一次沙箱销毁的时限。
+ *
+ * 为什么必须有:`destroyAttemptSandbox` 挂在 `ctx.waitUntil` 上,而 **DO 的 RPC 生命周期
+ * 包含 waitUntil** —— 销毁不返回,终态回报就不返回。prod 实测一次 destroy 卡 30004ms,
+ * 直接把 `reportExecution` 推成 `exceededWallTime`,而那次超时正是整条事故链的触发因
+ * (见 docs/architecture.md:归档停滞)。
+ *
+ * 为什么是 5 秒:销毁是**清理动作**,不在任何权威路径上;它的价值是别让孤儿 qwen 继续
+ * 烧 token、别让容器内的凭据多活一分钟,而不是「一定成功」。平台侧一次正常 destroy 在
+ * 秒级,5 秒已经放过绝大多数抖动,同时把终态回报的最坏延迟压进「一次 RPC 的零头」。
+ * 超时不等于放弃:销毁仍在跑,容器最终由平台回收;超时只保证**等待方**拿回控制权。
+ */
+export const SANDBOX_DESTROY_BUDGET_MS = 5_000;
+
+/**
+ * 归档重试阶梯(毫秒)。
+ *
+ * 为什么不再是固定 30 秒:归档失败的常见形态是**持续性的**(durableObjectId 6cf8a28c7c65…
+ * 那份损坏记录,seq 4/5 各重号 5 次 —— 新代码也修不好它,重试多少次都不会成功)。
+ * 固定 30 秒等于「每 30 秒白烧一次 DO 请求 + 一条永远不成立的希望」,prod 实测连续空转
+ * 100+ 次。阶梯把同样的关注度分配给时间:头 30 分钟内只醒 4 次,而不是 60 次。
+ *
+ * 为什么是 30s → 2min → 10min → 30min 这四档:
+ * - 30s 保住原口径 —— 绝大多数归档失败是**瞬时的**(D1 抖动、批写冲突),第一次重试就该过;
+ * - 2min 越过一次 D1 的常规维护抖动;
+ * - 10min 对齐运维看一眼的时间尺度;
+ * - 30min 封顶,与告警面板的默认刷新同量级。
+ *
+ * **封顶不是「永不重试」**:归档是档案的唯一来源(DO 会被淘汰,链在 storage 里丢了就是
+ * 丢了),所以最后一档无限重复而不是停止排程。封顶到 30 分钟意味着「一天 48 次机会」,
+ * 足够等到人工介入或依赖恢复,同时不再制造噪声。
+ */
+export const ARCHIVE_RETRY_LADDER_MS = [30_000, 120_000, 600_000, 1_800_000] as const;
+
+/** 第 `step` 档要多久之后再试;超出档位一律落在封顶档。 */
+export function archiveRetryDelayMs(step: number): number {
+  const last = ARCHIVE_RETRY_LADDER_MS.length - 1;
+  const index = Number.isFinite(step) && step > 0 ? Math.min(Math.floor(step), last) : 0;
+  return ARCHIVE_RETRY_LADDER_MS[index];
+}
+
+/** 阶梯的最高档下标:档位在 `s.task.archive_retry_step` 里存到这就封顶,不再往上加。 */
+const ARCHIVE_RETRY_MAX_STEP = ARCHIVE_RETRY_LADDER_MS.length - 1;
+
+/**
  * BLOCKED 的结论原文(进事件链与 D1 归档)。刻意自带「该动哪个旋钮」:转人工之后,
  * 读事件的人不必再反查 exit code 的语义才能决定下一步。
  *
@@ -254,6 +308,8 @@ export class TaskSession extends DurableObject<Env> {
     const task = (await this.ctx.storage.get<TaskRecord>("task")) ?? null;
     // M8 前的老记录没有 base 字段:归一化成 null,其候选一律按「基线未固定」对待
     if (task && task.base === undefined) task.base = null;
+    // c11b 前的老记录没有归档阶梯档位:归一化成 0(= 没有积压失败),行为与字段引入前一致
+    if (task && typeof task.archive_retry_step !== "number") task.archive_retry_step = 0;
     const attempts = (await this.ctx.storage.get<AttemptRecord[]>("attempts")) ?? [];
     const decisions = (await this.ctx.storage.get<DecisionRecord[]>("decisions")) ?? [];
     const events: EventRecord[] = [];
@@ -399,6 +455,7 @@ export class TaskSession extends DurableObject<Env> {
         updated_at: now,
         next_seq: 1,
         archived: false,
+        archive_retry_step: 0,
         pending_review: false,
         pending_verify: false,
         awaiting_human: false,
@@ -526,22 +583,52 @@ export class TaskSession extends DurableObject<Env> {
    *
    * fire-and-forget:权威状态转换在前,销毁失败不得影响终态写入;
    * 失败留 `sandbox_destroy failed` 日志,容器由平台回收兜底。
+   * 「fire-and-forget」在 c11b 之前只是个愿望:挂上 ctx.waitUntil 的那一刻,RPC 的寿命
+   * 就包含了这次销毁(prod 实测 30004ms ⇒ 终态回报 exceededWallTime)。现在由
+   * `SANDBOX_DESTROY_BUDGET_MS` 把它真的变成不等 —— 时限砍掉的是**等待**,不是销毁本身。
    * reviewer 走 LLM 直连、从无沙箱,跳过以免无谓的 DO RPC。
    */
   private destroyAttemptSandbox(attemptId: string, role: AttemptRecord["role"], reason: string): void {
     if (role === "reviewer") return;
-    this.ctx.waitUntil(
-      (async () => {
-        try {
-          await getSandbox(this.env.Sandbox, attemptId).destroy();
-          console.info(`sandbox_destroy ok attempt=${attemptId} reason=${reason}`);
-        } catch (err) {
-          console.warn(
-            `sandbox_destroy failed attempt=${attemptId} reason=${reason} err=${String(err).slice(0, 200)}`,
-          );
-        }
-      })(),
-    );
+    this.ctx.waitUntil(this.destroySandboxWithinBudget(attemptId, reason));
+  }
+
+  /**
+   * 带时限的销毁:结果只有 ok / timeout / failed 三种,三种都留一行可 grep 的日志。
+   *
+   * 时限靠 `Promise.race` 而不是给 destroy 本身加 abort —— `@cloudflare/sandbox` 的
+   * `destroy()` 不接受信号,拿不到中途取消的能力;而这里真正要保护的**不是容器,是
+   * 等待方**(RPC 的 waitUntil 寿命)。race 之后销毁该跑还跑,只是再没人等它。
+   *
+   * 超时后不再 await 那个悬挂的 promise:workerd 对 waitUntil 有 30 秒硬截断,靠 race
+   * 主动收场才不会让平台替我们决定这次回报算不算超时。
+   */
+  private async destroySandboxWithinBudget(attemptId: string, reason: string): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const work = (async () => {
+      await getSandbox(this.env.Sandbox, attemptId).destroy();
+    })();
+    try {
+      const outcome = await Promise.race([
+        work.then(() => "ok" as const),
+        new Promise<"timeout">((resolve) => {
+          timer = setTimeout(() => resolve("timeout"), SANDBOX_DESTROY_BUDGET_MS);
+        }),
+      ]);
+      if (outcome === "ok") {
+        console.info(`sandbox_destroy ok attempt=${attemptId} reason=${reason}`);
+      } else {
+        console.warn(
+          `sandbox_destroy timeout attempt=${attemptId} reason=${reason} budget_ms=${SANDBOX_DESTROY_BUDGET_MS}`,
+        );
+      }
+    } catch (err) {
+      console.warn(
+        `sandbox_destroy failed attempt=${attemptId} reason=${reason} err=${String(err).slice(0, 200)}`,
+      );
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
   }
 
   // ---- RPC: workflow 回报执行结果(幂等:attempt 非 RUNNING 即忽略) ----
@@ -1378,12 +1465,33 @@ export class TaskSession extends DurableObject<Env> {
     await this.archiveWithRetry(s);
   }
 
-  /** 归档失败时挂 30s alarm 重试并抛出,让调用方感知失败(不静默丢终态)。 */
+  /**
+   * 归档失败的**唯一**处置出口:喊出来 + 按阶梯排下一次。
+   *
+   * 三个设计决定,都对着 prod 那次事故(6cf8a28c7c65… 每 30.07 秒空转、零日志、零异常):
+   * - `console.error` 而不是 warn:这是「档案唯一来源没写出去」,不是可以自行恢复的抖动。
+   *   静默 catch 让监控只剩一条路径能看到它,而那条路径(archive 里抛出的异常)恰好被吞了。
+   * - 档位记在 `s.task` 上:见 TaskRecord.archive_retry_step 的注释 —— 记在别处等于没有阶梯。
+   * - 排 alarm 而不是就地重试:归档失败的原因(D1 不可用)不会因为再打一次就消失。
+   */
+  private async onArchiveStalled(s: SessionData, err: unknown): Promise<void> {
+    const task = s.task!;
+    const step = task.archive_retry_step;
+    const delay = archiveRetryDelayMs(step);
+    task.archive_retry_step = Math.min(step + 1, ARCHIVE_RETRY_MAX_STEP);
+    console.error(
+      `archive_stalled task=${task.id} state=${task.state} attempt=${step + 1} ` +
+        `retry_in_ms=${delay} error=${String(err).slice(0, 200)}`,
+    );
+    await this.ctx.storage.setAlarm(Date.now() + delay);
+  }
+
+  /** 归档失败时按阶梯挂 alarm 重试并抛出,让调用方感知失败(不静默丢终态)。 */
   private async archiveWithRetry(s: SessionData): Promise<void> {
     try {
       await this.archive(s);
     } catch (err) {
-      await this.ctx.storage.setAlarm(Date.now() + 30_000);
+      await this.onArchiveStalled(s, err);
       throw new Error(`archive failed, will retry via alarm: ${String(err).slice(0, 200)}`);
     }
   }
@@ -1604,6 +1712,9 @@ export class TaskSession extends DurableObject<Env> {
     }
     await this.env.DB.batch(stmts);
     t.archived = true;
+    // 成功即清零档位:阶梯是「一次持续停滞」的形状,不是「这个任务历史上失败过几次」。
+    // 不清零的话,一次停滞之后的每次新失败都从封顶档起步,该 30 秒回来的反而等 30 分钟。
+    t.archive_retry_step = 0;
   }
 
   // ---- Supervisor:Observation 层的独立消费者(只观察,不裁决) ----
@@ -1735,12 +1846,20 @@ export class TaskSession extends DurableObject<Env> {
         !s.task.archived &&
         (s.task.state === "DONE" || s.task.state === "REJECTED" || s.task.state === "BLOCKED")
       ) {
+        // 失败不再静默、不再固定 30 秒:见 onArchiveStalled。
+        // 注意这里**不 return**:原实现在 watchdog 续期之前 return,于是归档一停滞,
+        // 这条 DO 从此只剩「每 30 秒醒一次什么也不做」—— 连还在 RUNNING 的 attempt
+        // 都没人回收了。往下走的续期对本分支是安全的:能进到这里 task 必是终态,
+        // nextWatchdogAlarm 对 terminal 返回 null,不会把上面刚排的阶梯 alarm 覆盖掉。
         try {
           await this.archive(s);
-        } catch {
-          await this.ctx.storage.setAlarm(Date.now() + 30_000);
+        } catch (err) {
+          await this.onArchiveStalled(s, err);
         }
-        return;
+      } else if (s.task.archive_retry_step !== 0) {
+        // 停滞已解除(人工补了 archived 位,或别的写路径替它归档成功)时清掉档位,
+        // 免得下一次的第一个失败从第 2 档起步 —— 阶梯的语义是「连续失败」。
+        s.task.archive_retry_step = 0;
       }
 
       const nowMs = Date.now();
@@ -1768,8 +1887,8 @@ export class TaskSession extends DurableObject<Env> {
           });
           try {
             await this.archive(s);
-          } catch {
-            await this.ctx.storage.setAlarm(Date.now() + 30_000);
+          } catch (err) {
+            await this.onArchiveStalled(s, err);
           }
         }
         // 回写一律在临界区出口的 persist 里完成:blockConcurrencyWhile 已保证没有并发 RPC

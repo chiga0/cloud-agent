@@ -132,6 +132,18 @@ curl -s "localhost:8787/admin/events?task_id=<task_id>&limit=20" \
 # 游标串起来就是整条链)
 curl -s "localhost:8787/admin/events?task_id=<task_id>" -H "authorization: Bearer $TOKEN" | \
   node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",async()=>{const{events}=JSON.parse(s);const h=async c=>[...new Uint8Array(await crypto.subtle.digest("SHA-256",new TextEncoder().encode(c)))].map(b=>b.toString(16).padStart(2,"0")).join("");let prev=null;for(const e of events){if(e.prev_digest!==prev)throw new Error(`断链 @seq=${e.seq}`);if(await h((prev??"GENESIS")+e.canonical)!==e.digest)throw new Error(`digest 不符 @seq=${e.seq}`);prev=e.digest}console.log(`chain ok: ${events.length} 条`)})'
+
+# 完整性复核 —— `GET /admin/chain-check`。**两种模式,别混着读**:
+# 全局模式(不带参数)只扫「已归档进 D1 的行」,破口标记 `<task_id>:<seq>:<kind>`,
+# kind ∈ prev/digest/seq/state。⚠ 未归档的任务对它完全不可见(events 只在归档成功时才写)。
+curl -s "localhost:8787/admin/chain-check" -H "authorization: Bearer $TOKEN" | jq .
+# `GET /tasks/:id` 有数据但不在 `/admin/tasks` 里 ⇒ 用 `GET /admin/chain-check?task_id=` 查未归档
+# (DO↔D1 对账,三态 `not_archived` / `diverged` / `consistent`;`task_id` 畸形 400、DO 无记录 404)
+curl -s "localhost:8787/admin/chain-check?task_id=<task_id>" -H "authorization: Bearer $TOKEN" | \
+  jq '{result, do_events, d1_events, do_tail_digest, d1_tail_digest, brokenTasks}'
+# 「不归档」为什么看得见:alarm 每次归档失败按阶梯(30s→2min→10min→30min 封顶,封顶≠停表)
+# 重试并打一行 `archive_stalled task=… retry_in_ms=… error=…`;沙箱销毁另有 5s 时限
+# (`sandbox_destroy timeout`),它曾是终态回报 exceededWallTime 的触发因。见 §6.2。
 ```
 
 ## 候选落地(`scripts/land.mjs`)

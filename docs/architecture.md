@@ -263,6 +263,111 @@ prod 任务 `5489dc8a` 的故障形状:`appendEvent` 是写穿的 —— `const 
 那一半 —— 取号连续无重号直到 `idx_events_task_seq` 吃下整批、重放 4 次链只前进一块、异常轮次照样交出
 与链自洽的状态。
 
+### 6.2 卡死必须会喊,且不许空转(c11b)
+
+§6.1 把「链与状态互相损坏」变成结构上不可表示的。本节管的是另一半:**归档仍然失败时,
+让人看得见,并且不烧白工**。失败仍然会发生且不会被新代码修好 —— `5489dc8a` 那份损坏记录里
+seq 4/5 各重号 5 次,归档那一批永远撞 `idx_events_task_seq`,重试多少次都一样。
+
+prod 的现场事实(`durableObjectId=6cf8a28c7c65…` 的 TaskSession alarm):
+
+- tail 实测**每 30.07 秒醒一次**,wallTime 84–132ms,`outcome=ok`,零日志、零异常,从 04:37Z
+  起连续空转 100+ 次。原因:`alarm()` 的归档分支是 `try { archive(s) } catch { setAlarm(now + 30_000) }`
+  —— 异常被吞,不进链、不打日志,于是「唯一能看见它的地方」恰好是被吞掉的那一处。
+- 该分支还在 watchdog 续期与 Supervisor tick **之前** `return` ⇒ 这条 DO 从此只干「空转」这一件事,
+  连还在 `RUNNING` 的 attempt 都没人回收。
+- 监控也看不见它:`handleChainCheck` 的数据源是 `SELECT DISTINCT task_id FROM events`(只看已归档的
+  D1 行),只校验 `prev_digest` 与 `digest` ⇒ 当时返回 `checked=79, broken=0`。
+
+#### 6.2.1 同一个 RPC 里不做分钟级外部工作:销毁时限
+
+`SANDBOX_DESTROY_BUDGET_MS = 5_000`(`src/control/session.ts`)。`destroyAttemptSandbox` 交给
+`ctx.waitUntil` 的那个 promise 现在由 `Promise.race` 了结,结果三选一,每种一行可 grep 的日志:
+`sandbox_destroy ok` / `sandbox_destroy timeout … budget_ms=5000` / `sandbox_destroy failed … err=`。
+
+**为什么必须有**:DO 的 **RPC 生命周期包含 waitUntil** —— 销毁不返回,终态回报就不返回。prod 实测
+一次 destroy 吃 30004ms,直接把 `reportExecution` 推成 `exceededWallTime`,而那正是 §6.1 整条事故链的
+触发因。§6.1 第 4 条说「`waitUntil` 不是 fire-and-forget 的许可证」;时限是把它真正变成不等。
+
+**为什么仍然销毁、不删掉**:销毁的理由一分没变 —— r7 prod 实测任务 BLOCKED 后孤儿 qwen 还对
+token-plan 持续 POST 烧了 2.5 分钟,而容器内的模型凭据会一直留到容器消失。`sleepAfter` 自动休眠是
+分钟级且只停容器 API、不杀内部进程。时限砍的是**等待**,不是动作:超时之后销毁照跑,容器最终由
+平台回收;`@cloudflare/sandbox` 的 `destroy()` 不接受取消信号,所以也谈不上中断它。
+
+**为什么是 5 秒**:清理动作不在任何权威路径上,它的价值是「别多烧一分钟 token / 别多留一分钟凭据」,
+不是「一定成功」。平台侧正常 destroy 在秒级,5 秒放过绝大多数抖动,同时把终态回报的最坏延迟压进
+一次 RPC 的零头(对照:`MAX_WRITER_WALL_MINUTES` 的钳位与 40 分钟量级,见 §12)。
+
+#### 6.2.2 归档阶梯与 `archive_stalled` 的运维含义
+
+归档失败的唯一处置出口是 `onArchiveStalled`,它做两件事:
+
+```
+console.error("archive_stalled task=<id> state=<state> attempt=<N> retry_in_ms=<阶梯值> error=<前 200 字符>")
+ctx.storage.setAlarm(Date.now() + ARCHIVE_RETRY_LADDER_MS[step])
+```
+
+阶梯 `ARCHIVE_RETRY_LADDER_MS = [30s, 2min, 10min, 30min]`,取值理由写在常量的注释里(要点:
+30s 保住原口径,因为多数归档失败是 D1 抖动这一类的瞬时失败,第一次重试就该过;30min 封顶与告警
+面板的默认刷新同量级)。**封顶不是停表**:最后一档无限重复,因为归档是档案的唯一来源(§6.1 第 5 条
+宁可整批失败也不静默丢事件 ⇒ 停滞期间权威链只存在于 DO storage,DO 一旦被淘汰就再无第二次机会)。
+头 30 分钟内醒 4 次,而不是 60 次。
+
+**档位在哪儿 = 这件事的全部难度**。`task.archive_retry_step` 是 `TaskRecord` 的字段,由 §6.1 第 1 条
+那次原子写(临界区出口的 `persist`)与链同批落盘。放实例属性或局部变量等于没有阶梯:一次 alarm 是
+独立的一次请求,实例随时可能被淘汰,内存里的计数器一蒸发,每次醒来都从 30 秒重新开始 —— 就回到
+上面那个 100+ 次的形态。测试 `归档停滞可发现性(c11b) (d)` 直接读 storage 里那一行断言档位增长,
+就是为钉住这一点(只断言「延时变大」抓不到它:同一 isolate 内实例属性也能长大)。
+
+归档成功即 `archive_retry_step = 0`(阶梯的语义是「连续失败」,不是「历史上失败过几次」)。
+alarm 的归档分支**不再提前 `return`**:往下走到 watchdog 对本分支是安全的 —— 能进到这里 task 必是
+终态,`nextWatchdogAlarm` 对 terminal 返回 `null`,不会覆盖刚排的阶梯 alarm;换来的是停滞期间仍然
+回收过期 attempt、仍然把 `attempt.blocked` 记进链。
+
+**运维口径**:`archive_stalled` 是 error 级、按任务每档一行。看到它就意味着「这条任务的档案只在 DO 里,
+D1 里查不到,而且它会一直重试到成功或人工介入」。同一个 task 的 `attempt=` 递增到 4 之后不再变,
+那是封顶而不是修好了 —— 要判断有没有好,用 §6.2.3 的对账模式,不要靠日志停没停。
+
+#### 6.2.3 chain-check 现在能证明什么 / 仍不能证明什么
+
+`GET /admin/chain-check` 补了三条口径(`src/index.ts:chainBreaks`)。破口标记格式统一为
+`<task_id>:<seq>:<kind>`,kind ∈ `prev` / `digest`(原有)、`seq` / `state`(新增)。
+
+**现在能证明**(仅针对 D1 里已有的行):
+
+- `:prev` / `:digest` —— 逐条重算,内容与前后继没被改过、没被替换。
+- `:seq` —— seq **严格递增且唯一**(重号 5 次登记 1 条破口,不去重的话一个任务就能把 20 条的
+  `brokenTasks` 上限占满)。`§6.1` 那个次生灾害的形状正是重号,原来只有 D1 的 UNIQUE 索引会撞、
+  而 chain-check 看不出。
+- `:state` —— 任务在 `tasks` 表里已是**汇点状态**(DONE/REJECTED/BLOCKED,判据取自状态机转换表,
+  不留第二份清单),而链上最后一条可判定的 `task.transition` 的 `to` 不是它。抓的是「状态行被改写、
+  链没跟上」这一类两侧不一致。
+
+**仍然不能证明**(必须连着看,否则会把「没报」读成「没问题」):
+
+1. **看不见未归档的任务。** 数据源仍是 `SELECT DISTINCT task_id FROM events`,而 events 只在归档
+   成功时写。`5489dc8a` 从头到尾对它不可见 —— 这也是当年 `checked=79, broken=0` 的全部原因。
+   **唯一出口有两条**:`?task_id=` 对账模式(下面),和 `archive_stalled` 日志。
+2. 看不见 **seq 空洞**(只判严格递增唯一,不判连续)—— 少一行且恰好不打断前后继时不报。
+3. `:state` 在链里一条 `to` 都解析不出来时**主动不判**(历史行/非当前写路径的产物)。假阳性的代价是
+   淹没真信号,所以这里宁可留盲区并在本节写明。
+4. 不判断归档内容的**外部真实性**(补丁是否真能应用、transcript 是否属实)—— 它只证明这份档案
+   内部自洽、没被事后改动。权威仍是 §9 的证据 digest。
+
+**`?task_id=` 对账模式**(DO↔D1,同时读两边)。旧实现**静默忽略**这个参数、返回与全局检查逐字节
+相同的 200 —— 问它「这条任务对不对」,它答「全体扫了一遍没问题」,那是答非所问,比报错更坏。现在:
+
+| result | 判据 | 运维含义 |
+|---|---|---|
+| `consistent` | 行数相等 **且** 链尾 digest 相等 | 档案与权威链对上 |
+| `not_archived` | DO 有链、D1 零行 | 就是 `5489dc8a` 的形态:去查 `archive_stalled`,别当成干净任务 |
+| `diverged` | 行数不等,或等长而尾 digest 不等 | 归档被改动/漏写,按 `brokenTasks` 逐条看 |
+
+DO 里没有这个任务 ⇒ `404 task_not_found`(三态说的是「两份记录的关系」,一份都没有时不猜结论);
+`task_id` 畸形 ⇒ `400 invalid_task_id`(与 `/admin/events` 同一条 `[0-9a-f-]{36}` 口径)。
+响应额外带 `do_events`/`d1_events`/`do_tail_digest`/`d1_tail_digest` 与同一套 `brokenTasks`,
+这样「差在哪」不需要再连一次库去猜。
+
 ---
 
 ## 7. 执行面 — Workflow + Sandbox + Extract
@@ -1498,3 +1603,73 @@ r11 向量自检:`factor=1` → 6,949,711,**恰等于 raw total**(「缓存与 f
 - [`../research/agent-research/docs/research/cloudflare-ai-infra-overview-2026-08-28.md`](../../../research/agent-research/docs/research/cloudflare-ai-infra-overview-2026-08-28.md) — Cloudflare AI 基础设施调研
 - [`../research/agent-research/docs/research/cloudflare-ai-agent-best-practices-2026-08-28.md`](../../../research/agent-research/docs/research/cloudflare-ai-agent-best-practices-2026-08-28.md) — 工程最佳实践手册
 - `README.md` — 部署与冒烟命令
+
+---
+
+## 15. 落地取证清单(操作员在 prod 上必须跑通)
+
+本节的三条是 §6.2 那批机制的**prod 判据**。本地全绿不算落地:三条都只有真实 D1 + 真实
+tail 能回答,而且每条都对应一个「本地绿而 prod 坏」的历史教训(§13.16:workflow
+orchestration 在本地一行都没跑过)。任何一条不成立,就回到 §6.2 对应的小节读判据边界,
+不要靠加日志碰运气。
+
+```bash
+export API=https://cloud-agent.aflow.workers.dev
+auth=(-H "authorization: Bearer $WORKER_API_TOKEN")
+```
+
+### ① 新任务跑完:`archived=true` 且 D1 events 行数 == DO 链条数
+
+```bash
+# 任取一个刚跑到终态的 task_id(不要挑本节 ② 那个损坏标本)
+curl -s "$API/tasks/$TASK_ID" "${auth[@]}" | jq '{archived: .task.archived, state: .task.state, do_events: (.events|length)}'
+curl -s "$API/admin/chain-check?task_id=$TASK_ID" "${auth[@]}" | jq '{result, do_events, d1_events, broken, brokenTasks}'
+```
+
+**通过标准**:第一个响应的 `archived` 为 `true`;第二个的 `result == "consistent"` 且
+`d1_events == do_events`(同一份 DO 快照的链长,两处必须同一个数)。`state` 已终态而
+`archived=false` ⇒ 归档没落地,立刻走 ③ 与 `archive_stalled`。
+
+顺带复核全局口径:`curl -s "$API/admin/chain-check" "${auth[@]}" | jq .broken` 应为 0,
+且 `brokenTasks` 里没有 `:seq` / `:state` 后缀(§6.2.3 的两条新判据)。
+
+### ② 损坏标本 `5489dc8a` 必须报 `not_archived`
+
+```bash
+curl -s "$API/admin/chain-check?task_id=5489dc8a-… 全长度 id" "${auth[@]}" | jq '{result, do_events, d1_events}'
+```
+
+**通过标准**:`result == "not_archived"`,且 `d1_events == 0` 而 `do_events > 0`。
+这是 prod 里唯一那条损坏样本(§6.1:seq 4/5 各重号 5 次撞 `idx_events_task_seq`),
+**留着就是为了这条取证** —— 它不该被「修好」,也不该被清掉:它是「新代码也不替它归档成功」
+的唯一实物证据,也是对账模式与 `archive_stalled` 这两条出口是否真的通的最小回归样本。
+若哪天它变成 `consistent`,说明有人手工补写过 D1 行 —— 那是数据篡改事件,按 §9 的证据口径处理。
+
+同时确认全局模式仍然看不见它:`GET /admin/chain-check` 的 `checked` 不包含这条任务。
+**这不是 bug,是本节存在的理由**(§6.2.3 第 1 条)。
+
+### ③ 真实终态回报 RPC 的 wallTime 必须显著低于 30 秒
+
+```bash
+# 另一个终端:抓 TaskSession 的 RPC 调用与耗时
+npx wrangler tail --persist-to /tmp/wrangler-tail 2>&1 | grep -Ei 'reportExecution|TASK_SESSION|wallTime|outcome'
+# 同时看两条新日志是否只在真出问题时出现
+npx wrangler tail 2>&1 | grep -E 'sandbox_destroy|archive_stalled'
+```
+
+**通过标准**:一个 attempt 终态时那条 `reportExecution` 的 `wallTime` 在**百毫秒量级**
+(§6.2.1 之前的实测是 30004ms ⇒ `exceededWallTime`,那正是整条事故链的触发因);
+`outcome` 不得再出现 `exceededWallTime`。日志侧:正常路径只应有
+`sandbox_destroy ok attempt=… reason=attempt_finished:exit=N`。
+出现 `sandbox_destroy timeout` 说明 destroy 又在抖 —— 它现在只延迟 5 秒而不是拖死回报,
+但要记进运维台账(容器改由平台回收,孤儿 token 燃烧的窗口 = 平台回收时刻)。
+出现 `archive_stalled` 则按 §6.2.2 的口径处理:看 `attempt=` 爬到第几档,并用 ① 的
+对账请求判断有没有恢复。
+
+### 为什么这三条不能只靠测试
+
+`test/session-do.test.ts` 的 (d)(f) 与 `test/admin-events.test.ts` 的 chain-check 用例钉的是
+**机制**(阶梯值、日志格式、三态判定),它们不知道 prod 上有没有一条正在停滞的任务:
+测试环境没有 Sandbox 绑定(销毁必然走 failed 分支)、D1 是每次新建的空库、alarm 由测试
+本体触发而不是平台排程。上面三条量的恰好是这三件事在真实环境里的样子。
+**被击杀的棒不自动获准进入下一相** —— 同理,没跑通本节的部署不算落地。

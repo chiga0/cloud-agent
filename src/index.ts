@@ -77,7 +77,7 @@ function landingHtml(env: Env): string {
       <dt>GET /tasks/:id/candidate?format=patch</dt><dd>下载补丁正文(<code>curl -o candidate.patch</code> 后本地 <code>git apply</code>);下发前重算 sha256,状态在 <code>x-candidate-status</code> / <code>x-safe-to-apply</code> / <code>x-patch-complete</code> 头里</dd>
       <dt>GET /tasks/:id/events</dt><dd>在途事件流(需鉴权):读 Observation 层的 R2 段文件 journal,<strong>不经 D1 终态归档</strong>,因此任务 <code>RUNNING</code> 期间就有内容 —— 这是它相对 <code>/admin/events</code>(只读已归档的 hash chain)的核心增量。数据来自 poll 相每 30s 的 transcript 增量摄取:<strong>模型悬挂表现为「新事件停止而进程 alive」,凭最后一条事件的 <code>ts</code> 与轮询周期对比即可在 5 分钟内发现</strong>。按 attempt 创建序、attempt 内按 <code>generation</code> 与 <code>seq</code> 升序返回 <code>{"task_id",state,"events":[AgentEventV1],"count",total,"next_cursor","unreadable_attempts"}</code>;信封为 <code>{v:1,task_id,attempt_id,generation,seq,ts,kind,payload}</code>,<code>kind</code> ∈ system/assistant/user/tool_use/tool_result/result/error/raw(认不出的行不丢)。payload 已在 ingress 过白名单:只留类型/工具名/token 用量/时长/退出码等枚举字段,自由文本 ≤2048 字符并对平台注入的凭据值精确打码。分页:<code>?after=</code>(扁平有序流上已读的条数,默认 0)、<code>?limit=</code>(默认 500,上限 2000,非数字或越界 → 400);<code>next_cursor</code> 无后续时为 <code>null</code>。任务不存在 → 404;从未摄取过事件 → 空列表而不是 404</dd>
       <dt>GET /tasks/:id/attempts/:aid/transcript</dt><dd>attempt 的 transcript 原文(verifier 为 JSON 验证报告,需鉴权)</dd>
-      <dt>GET /admin/chain-check</dt><dd>校验 D1 归档的事件 hash chain(需鉴权)</dd>
+      <dt>GET /admin/chain-check</dt><dd>校验归档事件 hash chain(需鉴权)。<strong>两种模式</strong>:不带参数 = 全局扫描 D1 <code>events</code> 表,返回 <code>{checked,broken,brokenTasks}</code>,破口标记 <code>&lt;task_id&gt;:&lt;seq&gt;:&lt;kind&gt;</code>,kind ∈ <code>prev</code>/<code>digest</code>(内容被改)、<code>seq</code>(序号不严格递增/重号)、<code>state</code>(状态行已是终态而链尾转换不是)。⚠ 全局模式<strong>看不见未归档的任务</strong>(events 只在归档成功时写)。带 <code>?task_id=</code>(36 字符 UUID,畸形 → 400)= <strong>DO↔D1 对账模式</strong>:同时读 DO 链与 D1 行,返回 <code>{mode:"reconcile",result,do_events,d1_events,do_tail_digest,d1_tail_digest,broken,brokenTasks}</code>,<code>result</code> 三态 = <code>consistent</code> / <code>not_archived</code>(DO 有链而 D1 零行)/ <code>diverged</code>(行数或尾 digest 不等);DO 无该任务记录 → 404 <code>task_not_found</code>。判据边界与运维含义见 <code>docs/architecture.md</code> §6.2</dd>
       <dt>GET /admin/tasks</dt><dd>归档任务列表(需鉴权):<strong>只读</strong>投影,数据源仅为 D1 归档的 <code>tasks</code> 表 —— 任务到终态才归档,因此<strong>不含仍在 DO 中运行、尚未归档的任务</strong>(实时状态看 <code>GET /tasks/:id</code>)。按 <code>updated_at</code> 降序返回 <code>{"tasks":[{id,state,created_at,updated_at,version}],"count":N}</code>;可选 <code>?state=</code> 精确过滤(合法取值见状态机,非法 → 400)、可选 <code>?limit=</code>(默认 50,上限 200,非数字或越界 → 400)</dd>
       <dt>GET /admin/events</dt><dd>归档事件流(需鉴权):按任务回放审计事件的 hash chain。<strong>只读</strong>投影,数据源仅为 D1 归档的 <code>events</code> 表 —— 事件随任务终态才归档,因此<strong>只含已归档(终态)任务的事件</strong>,<strong>看不到仍在 DO 中运行、尚未归档的在途事件</strong>(实时状态看 <code>GET /tasks/:id</code>)。<code>?task_id=</code>(36 字符 UUID)<strong>必填</strong>:每 task 的 <code>seq</code> 才是分页脊线,跨 task 分页无意义;缺失或畸形 → 400。按 <code>seq</code> 升序(审计回放顺序)返回 <code>{"events":[{seq,kind,digest,prev_digest,created_at,canonical}],"next_cursor":&lt;string|null&gt;}</code>。<code>canonical</code> 是 D1 <code>payload</code> 列<strong>逐字原文</strong>(即 <code>JSON.stringify({task_id,kind,payload})</code>,正是被 hash 的那个串),不解析、不重新序列化 —— 客户端因此能独立重算 <code>digest == sha256Hex((prev_digest ?? "GENESIS") + canonical)</code> 并逐条核对 <code>prev_digest</code>,即在本地重放一遍 <code>/admin/chain-check</code>。安全:审计 journal 按构造<strong>绝不携带</strong>一次性模型代理凭据 <code>proxy_token</code>(它只存在于 <code>attempts</code> 表,从不进事件链)。游标分页:<code>?limit=</code>(默认 50,上限 200,非数字或越界 → 400)、<code>?cursor=</code>(不透明游标,首页省略;畸形 → 400),<code>next_cursor</code> 为下一页起点、无后续时为 <code>null</code>;过滤不命中返回空列表而不是 404</dd>
       <dt>GET /admin/attempts</dt><dd>归档 attempt 列表(需鉴权):按任务复盘各 attempt(writer / verifier / reviewer)的终态与 token 消耗。<strong>只读</strong>投影,数据源仅为 D1 归档的 <code>attempts</code> 表 —— attempt 随任务终态才归档,因此<strong>不含尚未归档的在途 attempt</strong>(实时状态看 <code>GET /tasks/:id</code>)。按 <code>created_at</code> 降序返回 <code>{"attempts":[{id,task_id,role,state,tokens_used,input_tokens,cache_read_tokens,output_tokens,cost_weighted_tokens,max_model_tokens,max_wall_seconds,workflow_instance_id,created_at,finished_at}],"count":N}</code>(<code>count</code> 是本次返回条数,受 limit 截断)。口径:<code>tokens_used</code> 是 raw total(历史可比,<strong>不是成本</strong> —— r11 实测其 96.9% 是最便宜的隐式缓存命中);四元组拆分与 <code>cost_weighted_tokens</code>(缓存命中按 <code>CACHE_READ_COST_FACTOR</code> 折扣加权)才是成本口径,今后看成本看后者。四列与 <code>cost_weighted_tokens</code> 为 <code>null</code> 表示该记录产生时未记过拆分口径(M8 前的历史行),<strong>不等于消耗为 0</strong>。安全投影:<code>proxy_token</code>(一次性模型代理凭据)<strong>绝不下发</strong>,内部去重用的 <code>idempotency_key</code> 同样不进投影。可选过滤器按 AND 组合:<code>?task_id=</code>(36 字符 UUID,畸形 → 400)、<code>?role=</code>(writer/reviewer/verifier)、<code>?state=</code>(RUNNING/SUCCEEDED/FAILED/BLOCKED;合法取值来自权威声明,非法 → 400,不命中返回空列表)、<code>?limit=</code>(默认 50,上限 200,非数字或越界 → 400)</dd>
@@ -545,35 +545,161 @@ async function handleApprove(req: Request, env: Env, taskId: string): Promise<Re
   return Response.json({ ok: true });
 }
 
+/** 归档事件行的投影口径:全局检查与 `?task_id=` 对账共用,不各写一份 SQL。 */
+interface ChainRow {
+  seq: number;
+  kind: string;
+  payload: string;
+  digest: string;
+  prev_digest: string | null;
+}
+
+const CHAIN_ROWS_SQL =
+  "SELECT seq, kind, payload, digest, prev_digest FROM events WHERE task_id = ? ORDER BY seq";
+
+/** 终态 = 状态机转换表的汇点(无出边)。不另列清单,加状态时自动跟上。 */
+const SINK_TASK_STATES: readonly TaskState[] = (Object.keys(TASK_TRANSITIONS) as TaskState[]).filter(
+  (s) => TASK_TRANSITIONS[s].length === 0,
+);
+
+function isSinkState(state: string | null | undefined): state is TaskState {
+  return (SINK_TASK_STATES as readonly string[]).includes(state ?? "");
+}
+
+/**
+ * 单任务 D1 行的完整性判定,返回破口标记列表(`<task_id>:<seq>:<kind>`)。
+ *
+ * 三类判据,对应三个互不重叠的失效面:
+ * - `:seq` —— seq 必须**严格递增**(等价于「严格递增且唯一」,因为行按 seq 升序读)。
+ *   prod 标本 5489dc8a 的形态就是 seq 4/5 各重号 5 次:同一批事件被写了两遍。
+ *   `:prev` 只看得出「链接不上」,而重号行**可能恰好接得上**(两份复制品各自的 prev
+ *   都指向前一条),所以序号唯一性必须是独立判据。
+ * - `:prev` / `:digest` —— 原有口径,一行不改(含「:prev 破口不推进 prev」这个细节)。
+ * - `:state` —— `tasks.state` 已是终态,而链尾最后一条**可判定的** `task.transition`
+ *   不是它。抓的是「状态行被改写、链没跟上」:归档读的是同一份内存快照,两边不一致
+ *   说明有一次写没走完整。
+ *   刻意留的盲区:链里一条 `to` 都解析不出来的任务**不判**(历史行/非当前写路径的产物,
+ *   判了就是假阳性 —— 假阳性的代价是淹没真信号)。
+ *
+ * 破口标记按 (seq, 类型) 去重:重号 5 次是 1 个破口,不是 4 条同样的噪声 —— brokenTasks
+ * 有 20 条的截断上限,一个任务的重复不该把别的任务挤出去。
+ */
+async function chainBreaks(
+  taskId: string,
+  rows: ChainRow[],
+  taskState: string | null,
+): Promise<string[]> {
+  const breaks = new Set<string>();
+  let prev: string | null = null;
+  let prevSeq = 0;
+  let lastTransitionTo: string | null = null;
+  for (const row of rows) {
+    if (row.seq <= prevSeq) {
+      breaks.add(`${taskId}:${row.seq}:seq`);
+      continue;
+    }
+    prevSeq = row.seq;
+    if (row.prev_digest !== prev) {
+      breaks.add(`${taskId}:${row.seq}:prev`);
+      continue;
+    }
+    const expect = await sha256Hex((prev ?? "GENESIS") + row.payload);
+    if (expect !== row.digest) breaks.add(`${taskId}:${row.seq}:digest`);
+    prev = row.digest;
+    if (row.kind === "task.transition") {
+      const to = transitionTarget(row.payload);
+      if (typeof to === "string") lastTransitionTo = to;
+    }
+  }
+  if (isSinkState(taskState) && lastTransitionTo !== null && lastTransitionTo !== taskState) {
+    const tail = rows.length > 0 ? rows[rows.length - 1].seq : 0;
+    breaks.add(`${taskId}:${tail}:state`);
+  }
+  return [...breaks];
+}
+
+/** 从 canonical 串里取 `payload.to`;解析不动就返回 undefined(交判定方决定怎么办)。 */
+function transitionTarget(canonical: string): unknown {
+  try {
+    const parsed = JSON.parse(canonical) as { payload?: { to?: unknown } };
+    return parsed.payload?.to;
+  } catch {
+    return undefined;
+  }
+}
+
 /** 校验 D1 归档的事件 hash chain:重算 digest 对比,断链即 broken。 */
 async function handleChainCheck(env: Env): Promise<Response> {
   const tasks = await env.DB.prepare("SELECT DISTINCT task_id FROM events").all<{ task_id: string }>();
+  const states = await env.DB.prepare("SELECT id, state FROM tasks").all<{ id: string; state: string }>();
+  const stateById = new Map(states.results.map((t) => [t.id, t.state]));
   let checked = 0;
   let broken = 0;
   const brokenTasks: string[] = [];
   for (const t of tasks.results) {
-    const rows = await env.DB.prepare(
-      "SELECT seq, payload, digest, prev_digest FROM events WHERE task_id = ? ORDER BY seq",
-    )
-      .bind(t.task_id)
-      .all<{ seq: number; payload: string; digest: string; prev_digest: string | null }>();
+    const rows = await env.DB.prepare(CHAIN_ROWS_SQL).bind(t.task_id).all<ChainRow>();
     checked++;
-    let prev: string | null = null;
-    for (const row of rows.results) {
-      if (row.prev_digest !== prev) {
-        broken++;
-        brokenTasks.push(`${t.task_id}:${row.seq}:prev`);
-        continue;
-      }
-      const expect = await sha256Hex((prev ?? "GENESIS") + row.payload);
-      if (expect !== row.digest) {
-        broken++;
-        brokenTasks.push(`${t.task_id}:${row.seq}:digest`);
-      }
-      prev = row.digest;
-    }
+    const breaks = await chainBreaks(t.task_id, rows.results, stateById.get(t.task_id) ?? null);
+    broken += breaks.length;
+    brokenTasks.push(...breaks);
   }
   return Response.json({ checked, broken, brokenTasks: brokenTasks.slice(0, 20) });
+}
+
+/**
+ * `GET /admin/chain-check?task_id=` —— DO↔D1 对账模式。
+ *
+ * 为什么必须有这个模式:全局模式的数据源是 `SELECT DISTINCT task_id FROM events`,
+ * 而 events 只在归档成功时才写 —— **未归档的任务对它完全不可见**,连「有事件行但缺了
+ * 终态」都看不见(它按任务分组,不做任何完整性推断)。5489dc8a 当时返回 checked=79,
+ * broken=0,而那条任务正在每 30 秒空转一次。对账模式与 `archive_stalled` 日志是仅有的
+ * 两个出口(docs/architecture.md 同节)。
+ *
+ * 三态判据(按此顺序,第一条命中即结论):
+ * - `not_archived`:DO 有链而 D1 零行。正是 5489dc8a 的形态。
+ * - `diverged`:行数不等,或链尾 digest 不等(等长但内容不同 = 有行被改写/替换)。
+ * - `consistent`:其余(等长且尾 digest 相同)。
+ *
+ * DO 里没有这个任务 ⇒ 404,不猜结论。三态说的是「两份记录的关系」,而这里连一份都没有;
+ * 把它塞进任何一态都是替运维造一个不存在的判断。
+ */
+async function handleChainReconcile(env: Env, taskId: string): Promise<Response> {
+  const snapshot = await TaskSession.from(env, taskId).getSnapshot();
+  if (!snapshot) {
+    return Response.json(
+      {
+        error: {
+          type: "task_not_found",
+          detail: "no TaskSession DO record for this task_id; /admin/chain-check cannot reconcile it",
+        },
+      },
+      { status: 404 },
+    );
+  }
+  const rows = await env.DB.prepare(CHAIN_ROWS_SQL).bind(taskId).all<ChainRow>();
+  const d1 = rows.results;
+  const chainBreaksOfTask = await chainBreaks(taskId, d1, snapshot.task.state);
+  const doEvents = snapshot.events;
+  const result =
+    d1.length === 0 && doEvents.length > 0
+      ? "not_archived"
+      : d1.length !== doEvents.length ||
+          d1[d1.length - 1]?.digest !== doEvents[doEvents.length - 1]?.digest
+        ? "diverged"
+        : "consistent";
+  return Response.json({
+    task_id: taskId,
+    mode: "reconcile",
+    result,
+    task_state: snapshot.task.state,
+    archived: snapshot.task.archived,
+    do_events: doEvents.length,
+    d1_events: d1.length,
+    do_tail_digest: doEvents.length > 0 ? doEvents[doEvents.length - 1].digest : null,
+    d1_tail_digest: d1.length > 0 ? d1[d1.length - 1].digest : null,
+    broken: chainBreaksOfTask.length,
+    brokenTasks: chainBreaksOfTask.slice(0, 20),
+  });
 }
 
 /** 合法 state 取值从权威转换表派生:状态机增删状态时这里自动跟上,不留第二份清单。 */
@@ -912,7 +1038,23 @@ export default {
     if (url.pathname === "/tasks" && req.method === "POST") return handleCreateTask(req, env);
 
     if (url.pathname === "/admin/chain-check" && req.method === "GET") {
-      return handleChainCheck(env);
+      // `?task_id=` 是**对账模式**(DO↔D1),不是全局模式的一个过滤条件。
+      // 旧实现静默忽略它、返回与全局检查逐字节相同的 200 —— 那等于让运维以为
+      // 「查过了,没问题」,而它查的根本不是自己问的那件事。畸形 id 一律 400。
+      const reconcileId = url.searchParams.get("task_id");
+      if (reconcileId === null) return handleChainCheck(env);
+      if (!TASK_ID_RE.test(reconcileId)) {
+        return Response.json(
+          {
+            error: {
+              type: "invalid_task_id",
+              detail: "task_id must be a 36-character task uuid",
+            },
+          },
+          { status: 400 },
+        );
+      }
+      return handleChainReconcile(env, reconcileId);
     }
 
     if (url.pathname === "/admin/tasks" && req.method === "GET") {

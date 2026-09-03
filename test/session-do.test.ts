@@ -1,11 +1,44 @@
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { env, runInDurableObject } from "cloudflare:test";
 import type { TaskSession } from "../src/control/session";
+import {
+  ARCHIVE_RETRY_LADDER_MS,
+  SANDBOX_DESTROY_BUDGET_MS,
+  archiveRetryDelayMs,
+} from "../src/control/session";
 import type { ReviewVerdict } from "../src/control/gates";
 import type { TranscriptUsage } from "../src/exec/extract";
 import { compositeEvidenceDigest } from "../src/audit/evidence";
 import { reportArgsFrom, type ReportMessage } from "../src/exec/queue";
 import { applyMigrations } from "./d1";
+
+/**
+ * 沙箱销毁的假实现入口。
+ *
+ * 缺省 `fake = null` ⇒ getSandbox **抛错**,与「测试环境没有 Sandbox 绑定」时的真实行为
+ * 同形:既有的「销毁失败不阻塞终态写入」用例继续测它本来测的那条路径,不因为本棒
+ * 引入 mock 而换形状;workflow 侧的 sandbox 用法也一律照旧抛。
+ * 只有需要控制销毁耗时的用例临时装一个 fake,afterEach 摘掉。
+ *
+ * vi.hoisted 不是习惯性防卫:工厂在 import 阶段就被调用,那时普通 `let` 还在 TDZ 里。
+ */
+const sandboxHook = vi.hoisted(() => ({
+  fake: null as null | ((attemptId: string) => Promise<void>),
+  calls: [] as string[],
+}));
+
+vi.mock("@cloudflare/sandbox", async (importOriginal) => {
+  const actual = (await importOriginal()) as Record<string, unknown>;
+  return {
+    ...actual,
+    getSandbox: (_ns: unknown, attemptId: string) => {
+      const fake = sandboxHook.fake;
+      if (!fake) throw new Error("Sandbox binding is not configured in the test environment");
+      sandboxHook.calls.push(attemptId);
+      return { destroy: () => fake(attemptId) };
+    },
+  };
+});
 
 /**
  * TaskSession DO 并发测试。
@@ -629,6 +662,8 @@ describe("exec-report 消息映射", () => {
 describe("attempt 终态销毁沙箱", () => {
   afterEach(() => {
     vi.restoreAllMocks();
+    sandboxHook.fake = null;
+    sandboxHook.calls.length = 0;
   });
 
   function spyDestroyLogs() {
@@ -702,6 +737,64 @@ describe("attempt 终态销毁沙箱", () => {
 
     expect(logs.all().some((l) => l.includes("sandbox_destroy"))).toBe(false);
   });
+
+  /**
+   * c11b 第 1 条。prod 那次事故的形状是:destroy 卡 30004ms,而它挂在 ctx.waitUntil 上
+   * ⇒ RPC 跟着一起卡 ⇒ 终态回报 exceededWallTime ⇒ 归档停滞的整条链从这儿开始。
+   *
+   * 时限**砍的是等待,不是销毁**,所以这一条同时钉三头:
+   * - 交给 waitUntil 的那个 promise 在预算内了结(= `sandbox_destroy timeout` 日志在预算
+   *   时刻出现,而不是等假销毁自己返回)。RPC 寿命由它决定;测试基座不替我们延长
+   *   RPC,所以「回报本身花多久」在这里不是判据,**日志时刻**才是。
+   * - 假销毁仍被调用(`sandboxHook.calls`)—— 加时限不等于把销毁删掉:孤儿 qwen 继续烧
+   *   token、容器内凭据残留这两个理由仍然成立。
+   * - 超时的 grep 口径与 ok/failed 同族:`sandbox_destroy timeout ... budget_ms=`。
+   * 假销毁睡 3 倍预算:不睡过预算就无法证明是**时限**了结了等待,而不是销毁碰巧快。
+   */
+  it("销毁超过预算:等待在时限内了结,销毁本身照发并留下超时日志", async () => {
+    const logs = spyDestroyLogs();
+    sandboxHook.fake = () =>
+      new Promise((r) => setTimeout(r, SANDBOX_DESTROY_BUDGET_MS * 3));
+
+    const stub = newStub();
+    await createTask(stub);
+    const { attempt_id } = await stub.startAttempt({
+      role: "writer",
+      idempotency_key: crypto.randomUUID(),
+      ...BUDGET,
+    });
+
+    const startedAt = Date.now();
+    const res = await stub.reportExecution({ attempt_id, exit_code: -1, error: "workflow hung" });
+    expect(res.ok).toBe(true);
+
+    const lineAt = ((): number | null => {
+      const hits = logs.warns.filter((l) => l.includes("sandbox_destroy timeout"));
+      return hits.length > 0 ? Date.now() - startedAt : null;
+    });
+    let observed: number | null = null;
+    for (let i = 0; i < 80; i++) {
+      observed = lineAt();
+      if (observed !== null) break;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+
+    expect(observed, "没有等到 sandbox_destroy timeout 日志").not.toBeNull();
+    // 预算到点即了结:假销毁还要再睡两倍预算,所以这一条只有时限能解释。
+    expect(observed!).toBeLessThan(SANDBOX_DESTROY_BUDGET_MS + 1_500);
+    const timeoutLine = logs.warns.find((l) => l.includes("sandbox_destroy timeout"))!;
+    expect(timeoutLine).toContain(`attempt=${attempt_id}`);
+    expect(timeoutLine).toContain("reason=attempt_blocked:workflow_error");
+    expect(timeoutLine).toContain(`budget_ms=${SANDBOX_DESTROY_BUDGET_MS}`);
+    // 没有被「因为太慢所以删掉」:销毁确实发出去了。
+    expect(sandboxHook.calls).toContain(attempt_id);
+    // 了结只有一次:超时之后不再有第二条销毁日志(等待方已经放手)。
+    expect(logs.all().filter((l) => l.includes("sandbox_destroy"))).toHaveLength(1);
+
+    const snap = await stub.getSnapshot();
+    expect(snap!.task.state).toBe("BLOCKED");
+    chainIntact(snap!.events);
+  }, SANDBOX_DESTROY_BUDGET_MS * 2 + 20_000);
 });
 
 /**
@@ -1222,6 +1315,216 @@ describe("事件与状态同一次原子写(c11)", () => {
       expect(repaired.state).toBe(c.derived);
       expect(repaired.finished_at).not.toBeNull();
       chainIntact(after.events);
+    }
+  });
+});
+
+/**
+ * c11b 第 2 条:归档停滞必须**看得见**且**不空转**。
+ *
+ * prod 事实(durableObjectId 6cf8a28c7c65…):`catch { setAlarm(now + 30_000) }` 把异常吞了,
+ * 于是那条 DO 每 30.07 秒醒一次、wallTime 84–132ms、outcome=ok、零日志、零异常,连续 100+ 次,
+ * 而且该分支在 watchdog 续期之前 return ⇒ 它从此只做空转这一件事。
+ * 这里造的就是那一形态:任务已终态、archived=false、归档**永久**失败(损坏记录新代码也修不好)。
+ *
+ * 断言口径按规格:**排定的时刻值**(读 storage.getAlarm()),不是真的等 30 秒。
+ */
+describe("归档停滞可发现性(c11b)", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  interface StoredTask {
+    id: string;
+    state: string;
+    archived: boolean;
+    archive_retry_step: number;
+  }
+
+  function spyErrors() {
+    const errors: string[] = [];
+    vi.spyOn(console, "error").mockImplementation((...a: unknown[]) => {
+      errors.push(a.map(String).join(" "));
+    });
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "info").mockImplementation(() => {});
+    return errors;
+  }
+
+  /** 档位到底存在哪:直接读 storage 里那一行,不看实例内存 —— 见下面的用例注释。 */
+  function storedTask(stub: Stub): Promise<StoredTask | null> {
+    return runInDurableObject(stub, async (_instance, state) =>
+      (await state.storage.get<StoredTask>("task")) ?? null,
+    );
+  }
+
+  const snapOf = (stub: Stub) => stub.getSnapshot();
+
+  /**
+   * `alarm` 是 DO 的生命周期方法,**不能**经 RPC 调(workerd:'alarm' is a reserved method),
+   * 所以只能拿实例本体调。平台侧由 storage.getAlarm() 到点触发,这里复现同一次进入。
+   */
+  const fireAlarm = (stub: Stub) =>
+    runInDurableObject(stub, async (instance) => instance.alarm());
+
+  function scheduledAlarm(stub: Stub): Promise<number | null> {
+    return runInDurableObject(stub, async (_instance, state) =>
+      (await state.storage.getAlarm()) ?? null,
+    );
+  }
+
+  /** 把任务拨成「已终态但归档没落地」—— 停滞分支的唯一入口条件。 */
+  async function stallArchive(stub: Stub): Promise<void> {
+    await runInDurableObject(stub, async (_instance, state) => {
+      const task = await state.storage.get<StoredTask>("task");
+      if (!task) throw new Error("fixture: task 还没建");
+      await state.storage.put("task", { ...task, state: "BLOCKED", archived: false });
+    });
+  }
+
+  /**
+   * 让 `archive()` 对这个 attempt 的批量写**永久**失败:attempts.id 是 PRIMARY KEY,
+   * 而归档只 `DELETE ... WHERE task_id = ?` 再 INSERT ⇒ 先占住那个 id(挂在另一条任务下),
+   * 这一批就必然撞约束。
+   *
+   * 刻意不 DROP TABLE:那是整库级的破坏,同文件后面的用例会一起红,而本条要测的是
+   * 「一次归档失败」,不是「schema 没了」。返回清理函数,用例结束即恢复。
+   */
+  async function poisonArchive(attemptId: string): Promise<() => Promise<void>> {
+    const otherTaskId = crypto.randomUUID();
+    const stamp = "2026-01-01T00:00:00.000Z";
+    await env.DB.prepare(
+      "INSERT INTO tasks (id, spec, spec_digest, state, version, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+      .bind(otherTaskId, "{}", "0".repeat(64), "DONE", 1, stamp, stamp)
+      .run();
+    await env.DB.prepare(
+      "INSERT INTO attempts (id, task_id, role, state, idempotency_key, tokens_used," +
+        " max_model_tokens, max_wall_seconds, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+      .bind(attemptId, otherTaskId, "writer", "SUCCEEDED", `${attemptId}:poison`, 0, 1, 1, stamp)
+      .run();
+    return async () => {
+      await env.DB.prepare("DELETE FROM attempts WHERE id = ?").bind(attemptId).run();
+      await env.DB.prepare("DELETE FROM tasks WHERE id = ?").bind(otherTaskId).run();
+    };
+  }
+
+  /** 建一条「有链、已终态、归档会永久失败」的任务;返回 stub 与清理函数。 */
+  async function stalledTaskWithChain(): Promise<{
+    stub: Stub;
+    taskId: string;
+    unpoison: () => Promise<void>;
+  }> {
+    const stub = newStub();
+    const taskId = crypto.randomUUID();
+    await stub.createTask({ prompt: "archive stall" } as never, taskId);
+    const { attempt_id } = await stub.startAttempt({
+      role: "writer",
+      idempotency_key: crypto.randomUUID(),
+      ...BUDGET,
+    });
+    const unpoison = await poisonArchive(attempt_id);
+    await stallArchive(stub);
+    return { stub, taskId, unpoison };
+  }
+
+  it("(d) 归档失败喊出 archive_stalled,且重试排程按阶梯变大、封顶不停表", async () => {
+    const errors = spyErrors();
+    const { stub, taskId, unpoison } = await stalledTaskWithChain();
+    try {
+      // 走满一整条阶梯再多一次:证明「封顶」是停在 30min 而不是停表,也不是无限加档。
+      const rounds = ARCHIVE_RETRY_LADDER_MS.length + 1;
+      for (let step = 0; step < rounds; step++) {
+        const before = Date.now();
+        await fireAlarm(stub);
+        const scheduled = await scheduledAlarm(stub);
+        expect(scheduled, `第 ${step + 1} 次失败必须仍然排了 alarm(不许停表)`).not.toBeNull();
+        const delay = scheduled! - before;
+        // 断言的是**排定的时刻值**:±2s 足以区分 30s/2min/10min/30min,又容得下 D1 报错的耗时。
+        expect(Math.abs(delay - archiveRetryDelayMs(step))).toBeLessThan(2_000);
+        // 档位必须是「与链同一次原子写」带走的那个字段:做成实例属性时这一行必红
+        // —— 内存里的计数器不会出现在 storage 的 task 行里。
+        expect((await storedTask(stub))!.archive_retry_step).toBe(
+          Math.min(step + 1, ARCHIVE_RETRY_LADDER_MS.length - 1),
+        );
+      }
+
+      const stalled = errors.filter((l) => l.includes("archive_stalled"));
+      expect(stalled).toHaveLength(rounds);
+      expect(stalled[0]).toContain(`task=${taskId}`);
+      expect(stalled[0]).toContain(`retry_in_ms=${ARCHIVE_RETRY_LADDER_MS[0]}`);
+      expect(stalled[0]).toMatch(/error=\S/);
+      // 阶梯的语义:同一个 reason 出现的次数与醒来的次数一样多 —— 没有一次静默轮空。
+      expect(new Set(stalled.map((l) => l.slice(0, l.indexOf("attempt=")))).size).toBe(1);
+    } finally {
+      await unpoison();
+    }
+  });
+
+  it("(d2) 归档成功即清零档位,且停滞解除后不再排重试", async () => {
+    const errors = spyErrors();
+    const { stub, taskId, unpoison } = await stalledTaskWithChain();
+    try {
+      await fireAlarm(stub);
+      const stepAfterFail = (await storedTask(stub))!.archive_retry_step;
+      expect(stepAfterFail).toBeGreaterThan(0);
+      // 第 1 档那次排程就是「停滞还在」的证据;成功归档之后不许再排一次新的重试。
+      const scheduledAtStall = await scheduledAlarm(stub);
+
+      await unpoison();
+      await fireAlarm(stub);
+
+      const task = (await snapOf(stub))!.task;
+      expect(task.archived).toBe(true);
+      expect((await storedTask(stub))!.archive_retry_step).toBe(0);
+      expect(await scheduledAlarm(stub)).toBe(scheduledAtStall);
+      expect(errors.filter((l) => l.includes(`archive_stalled task=${taskId}`))).toHaveLength(1);
+    } finally {
+      await unpoison();
+    }
+  });
+
+  it("(d3) 归档停滞不再挡住 watchdog:RUNNING attempt 仍被回收,且阶梯排程不被覆盖", async () => {
+    const errors = spyErrors();
+    const stub = newStub();
+    const taskId = crypto.randomUUID();
+    await stub.createTask({ prompt: "stall + watchdog" } as never, taskId);
+    const { attempt_id } = await stub.startAttempt({
+      role: "writer",
+      idempotency_key: crypto.randomUUID(),
+      ...BUDGET,
+    });
+    // 墙钟早已过期(created_at 拨到 1 小时前,max_wall_seconds=60 + 宽限 300s)。
+    await runInDurableObject(stub, async (_instance, state) => {
+      const attempts = await state.storage.get<Array<Record<string, unknown>>>("attempts");
+      await state.storage.put(
+        "attempts",
+        attempts!.map((a) =>
+          a.id === attempt_id
+            ? { ...a, created_at: new Date(Date.now() - 3_600_000).toISOString() }
+            : a,
+        ),
+      );
+      const task = await state.storage.get<StoredTask>("task");
+      await state.storage.put("task", { ...task!, state: "BLOCKED", archived: false });
+    });
+    const unpoison = await poisonArchive(attempt_id);
+    try {
+      const before = Date.now();
+      await fireAlarm(stub);
+
+      // 原实现在这里 return:attempt 永远停在 RUNNING,链上永远少一条 attempt.blocked。
+      const snap = (await snapOf(stub))!;
+      expect(snap.attempts.find((a) => a.id === attempt_id)!.state).toBe("BLOCKED");
+      expect(snap.events.map((e) => e.kind)).toContain("attempt.blocked");
+      // 而续期覆盖不了阶梯:terminal ⇒ nextWatchdogAlarm 返回 null ⇒ 第 1 档仍在。
+      expect(Math.abs((await scheduledAlarm(stub))! - before - ARCHIVE_RETRY_LADDER_MS[0])).toBeLessThan(
+        2_000,
+      );
+      expect(errors.some((l) => l.includes(`archive_stalled task=${taskId}`))).toBe(true);
+    } finally {
+      await unpoison();
     }
   });
 });
