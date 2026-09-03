@@ -48,12 +48,26 @@ export function attemptDeadline(a: { created_at: string; max_wall_seconds: numbe
  * DO alarm 是一次性的:本次 alarm 若没有任何 attempt 过期(归档重试提前触发、
  * 时钟抖动等),不续期就等于把超时兜底永久丢掉 —— 任务会一直挂着。
  * 因此「还有 RUNNING attempt」本身就足以续期,terminal(终态/已归档)才停表。
+ *
+ * `supervisorTickMs` 是本期(Supervisor)加的第二条节奏:**截止驱动不足以发现悬挂**。
+ * 不传(= mode off)时行为与历史逐字段一致 —— 只在截止时刻醒,attempt 不死就不醒。
+ * 传了则取两者更早的那个:模型悬挂 24 分钟(C2-r6)时墙钟还剩十几分钟,截止驱动的
+ * alarm 在悬挂期间根本不会触发,Supervisor 拿不到判断机会;tick 让它每 60s 醒一次。
+ * tick 不早于 WATCHDOG_MIN_INTERVAL_MS:alarm 自旋会白烧 DO 请求,而 60s 已是最细的
+ * 有效观测节拍(摄取本身 30s 一轮,更密的 tick 看不到新事件)。
  */
 export function nextWatchdogAlarm(args: {
   running: Array<{ created_at: string; max_wall_seconds: number }>;
   nowMs: number;
   terminal?: boolean;
+  supervisorTickMs?: number;
 }): number | null {
   if (args.terminal || args.running.length === 0) return null;
-  return Math.max(Math.min(...args.running.map(attemptDeadline)), args.nowMs + WATCHDOG_MIN_INTERVAL_MS);
+  const deadline = Math.max(
+    Math.min(...args.running.map(attemptDeadline)),
+    args.nowMs + WATCHDOG_MIN_INTERVAL_MS,
+  );
+  const tick = args.supervisorTickMs;
+  if (tick === undefined || !Number.isFinite(tick) || tick <= 0) return deadline;
+  return Math.min(deadline, args.nowMs + Math.max(tick, WATCHDOG_MIN_INTERVAL_MS));
 }

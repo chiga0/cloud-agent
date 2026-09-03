@@ -702,12 +702,152 @@ that your Worker's code had hung
 
 ### 这一层刻意不做什么
 
-- **不做任何判定与处置**:不告警、不 cancel、不 approve、不判 no-progress(那是 Supervisor,独立的消费者层,下一期)。
+- **不做任何判定与处置**:不告警、不 cancel、不 approve、不判 no-progress(那是 Supervisor,独立的消费者层,§9.8 —— 它读的正是本层的 journal)。
 - **不服务端渲染事件内容**:把首批事件烤进 HTML 会让页面的一次性快照与流的位置游标(帧 id)混成两套进度,而页面活着的时间远长于那次读的一致性窗口。
 - **不做多任务列表页**:跨任务枚举会纠缠 `/admin/tasks` 的「只读终态归档」口径(§11),是另一棒。
 - **不做事件过滤 / 搜索 / 暂停滚动 / 折叠**,不加任务操作按钮。
 - **不改 §9.6 的一个字节**:帧格式、鉴权、尾读节拍、终止条件全部只读复用。
 - **不引任何 npm 前端依赖、不加构建步骤**。
+
+---
+
+## 9.8 Supervisor —— Observation 层的独立消费者(只观察,不裁决)`src/supervisor/`
+
+四层可观测到本节为止的形态是:①控制面快照粗到看不出停滞,②Observation journal 记下了
+每一步,③SSE / ④Live UI 把停滞时长变成人会看见的颜色。**看的人仍然是人。** 本节把「有人
+盯着」变成「有东西盯着」:平台自己每 60s 判一次「attempt 还挂着但已经不动了」,把结论写成
+权威链上的 `supervisor_finding` 事件。
+
+### 为什么判据必须读 Observation 层,不能读权威层自己的时间戳
+
+prod 活体证据(2026-09-02 11:46Z,C9 任务 `f78b622f-f1bc-49ff-8bc9-12a9d22ff5c3`,写本节
+规格的当场取样):writer 已跑 37 分钟且**健康** —— Observation 层 **362 条**事件、最后一条
+滞后 **31s**;同一时刻 DO 权威链只有 **3 条**事件(`task.created` / `attempt.created` /
+`task.transition`),`task.updated_at` 冻结在创建时刻 **11:09:17.345Z** 一动未动。
+
+这不是 bug,是设计:单写者只在**状态转换**时写权威链,RUNNING 期间权威层按设计零心跳。所以
+权威层回答不了「agent 现在还在动吗」—— 它只知道「上一次确定的事实是什么」。判据一旦拿
+`task.updated_at` 或 `attempt.created_at` 当依据,得到的必然是「37 分钟没有任何事件」= 全员
+red。**Supervisor 是第②层的消费者,不是第①层的新读者。**
+
+### 三条设计立场
+
+| 立场 | 落地 |
+| --- | --- |
+| **观察与裁决分离** | 本层只 `appendEvent('supervisor_finding', …)`。不 cancel、不 kill、不 BLOCKED、不返工、不改路由、不改 C8 分类器判据。处置权仍在既有路由(wall-time 兜底、预算分流)与人工手里。可执行证据:`test/supervisor-do.test.ts` 钉住「tick 跑过之后 `task.state` / `version` / `updated_at` / `pending_review` / `pending_verify` / `awaiting_human` / `archived` 逐字段不变」,唯一允许动的是 `next_seq`(它就是「写了一条事件」的记账)。 |
+| **全部规则默认 shadow** | 代码里 `supervisorModeOf()` 缺省 **`off`**,只有 `wrangler.jsonc` 的 vars 显式写 `"shadow"` 才启用 —— 启用点可审计。理由:三类判据都是启发式(时间阈值 / 重复计数),有误报面;按仓内 M8/M9/C8 的 shadow 惯例先攒样本再谈 enforce(本期**不存在** enforce 代码路径)。 |
+| **寄生在既有 watchdog alarm 路径内** | 不新建 DO、不加 Cron Trigger、不做独立 Worker、零分布式协调。Supervisor 写事件走的就是 TaskSession 自己的 `appendEvent`,**不存在绕过单写者的静默写者**。取舍说明:进程级独立(架构纯洁性)本期不值得先建一套协调机制去换;独立性体现在「只观察不裁决」,不是「另一个进程」。 |
+
+### 判据表(kind × rule × severity)
+
+阈值全部可注入(`detectSupervisor({ now_ms, events, thresholds })`),下表是
+`SUPERVISOR_THRESHOLDS` 的缺省值。三条判据的默认模式一律 `shadow`。
+
+| kind | rule | 判据(缺省阈值) | severity | 边界纪律 |
+| --- | --- | --- | --- | --- |
+| `stall` 心跳 | `stall.last_event_gap` | `gap = now_ms - Date.parse(最后一条事件.ts)`;`> 90_000` → yellow,`> 300_000` → red | yellow / red | **严格大于**。恰好 =90s 不报;恰好 =300s 落 yellow(它确实已过 90s 线)。90/300 与 §9.7 的人眼阈值 `LIVE_STALL_WARN/DANGER_SECONDS` **同一口径**,由测试钉住相等 |
+| `loop` 循环嫌疑 | `loop.tool_repeat` | 末尾 `loop_window=20` 条事件的滑窗内,同一 `repeat_key = 工具名 @ 归一化参数摘要` 出现 `>= loop_repeat_max=5` 次 | yellow;`>= 2×` → red | 只有带 `tool_names` 的事件参与计数(否则一串无文本的 `assistant`/`system` 心跳会塌成同一个键 → 误报) |
+| `no_progress` 空转 | `no_progress.target_repeat` | 末尾 `no_progress_window=30` 条里 `tool_use` 的**目标**(文件路径 / 命令首词 + 首个非 flag 实参)重复 `>= no_progress_repeat_max=8` 次 | yellow;`>= 2×` → red | 与 loop 的分工:loop 看「动作全等」,本条只看「目标」—— `read A → edit A → read A …` 这种工具名交替、loop 抓不到的形态由它抓 |
+
+多条判据**可并存**(`detectSupervisor` 返回数组):悬挂前的循环痕迹与当前 stall 同时上报
+才是有用的诊断,只给一个信号时人还得自己判断。
+
+两条判据可信度的根,写在 `src/supervisor/detect.ts` 顶部注释里(⚠️ 别当 bug 改掉):
+
+1. **空 `events` 不报 stall**。空数组有两种无法区分的成因:attempt 刚起跑(journal 还没写
+   第一行,摄取是 30s 一轮的旁路 poll)、journal 缺失/未提交。「最后一条距今 = 无穷大」这种
+   写法会让**每一个刚起跑的 attempt 立刻吃一条 red**。「没有证据」不等于「卡住了」。
+2. **参数必须归一化才能判重复**。真实 transcript 里同一个动作的两行永远不字节相同:时间戳
+   每行都变、临时目录带随机后缀、uuid/sha 每次不同。不归一化则 `repeat_count` 恒等于 1,
+   两条判据**静默地永远不触发** —— 最坏的失效形态:看起来接了线,其实什么也不检查。
+   `normalizeTarget` 把 ISO 时间戳 / epoch / uuid / 长 hex / 纯数字段折成占位符,把 `tmp`、
+   `worktrees`、`.cache` 等临时目录以下整枝砍成 `<...>`,再把路径与命令行分别成形。
+
+分辨率的天花板要说清楚:Observation 层的白名单(§9.5)**刻意丢掉 `tool_use` 的 input 参数**
+(input 是自由文本 = 凭据外流面)。所以 target 只能取 `payload` 里已经过 ingress 脱敏的可见
+文本,取不到时退化为工具名本身。这不是可以先凑一下的细节:它决定了 loop 与 no_progress 的
+区分度。要更细的分辨率,得先解 §9.5 的脱敏口径,不是在这里加字段。
+
+### `supervisor_finding` 事件 payload
+
+```json
+{
+  "attempt_id": "…",
+  "kind": "stall",
+  "rule": "stall.last_event_gap",
+  "severity": "red",
+  "evidence": {
+    "last_event_ts": "2026-09-02T11:22:31.000Z",
+    "gap_ms": 1440000,
+    "window_size": 362,
+    "repeat_key": "run_shell_command@npm test",
+    "repeat_count": 7
+  },
+  "mode": "shadow",
+  "enforced": false
+}
+```
+
+`kind` ∈ `stall | loop | no_progress`;`rule` 是稳定字符串(进事件、进去重键,不要改);
+`gap_ms` 在时间戳不可解析时为 `null`(不猜);`repeat_key`/`repeat_count` 只有两条重复类判据
+带。`mode`/`enforced` 是**自描述**字段:将来若有 enforce 模式,读事件的人不必查版本就知道
+这条当时有没有杀伤力 —— 链上出现过的 payload 永不改写,所以这两个字段必须现在就写对。
+
+### 幂等:去重键与冷却期
+
+同一 `(attempt_id, kind, rule, severity)` 只在三种情况下产生事件:
+
+1. 首次出现;
+2. **severity 升级**(yellow→red;判据是「低一档已报过且不晚于本档上一次」,所以
+   `red → 短暂恢复 → yellow → red` 的第二次 red 不会被吞);
+3. 距上次上报超过冷却期 `SUPERVISOR_DEDUPE_COOLDOWN_MS = 600_000`(10 分钟,可注入)。
+
+去重表存在 **DO storage 键 `supervisor:reported`**,不存在 alarm 的局部变量里 —— 每次 alarm
+触发是独立的一次请求,局部变量随请求结束消失,等于完全没有去重:一次 38 分钟的悬挂会往权威
+链灌 ~38 条同样的事件。权威链是事实底座,不是日志垃圾桶。
+
+### alarm 节奏修正(不做则 Supervisor 无意义)
+
+| | 修正前 | 修正后(shadow) |
+| --- | --- | --- |
+| 续期时刻 | `max(min(attemptDeadline), now + 60s)` —— **纯截止驱动** | `min(上面的既有结果, now + SUPERVISOR_TICK_MS)` |
+| attempt 不死时 | 不醒 | 每 60s 醒一次 |
+| C2-r6 形态(悬挂 24 分钟、墙钟还剩 ~14 分钟) | 悬挂期间 alarm **一次都不触发** | 悬挂期间醒来 ~14 次,yellow 在 90s 内、red 在 300s 内入链 |
+| `SUPERVISOR_MODE=off` | — | **不传 tick**,逐字段等于修正前(回归证据,`test/statemachine.test.ts` 钉住) |
+
+改动只落在 `statemachine.ts` 的纯函数上(加一个可选参数),`session.ts` 只决定「传还是不
+传」。tick 不早于 `WATCHDOG_MIN_INTERVAL_MS`:alarm 自旋会白烧 DO 请求,而 60s 已是最细的
+有效观测节拍(摄取本身 30s 一轮,更密看不到新事件)。
+
+### 降级与故障纪律
+
+- 某个 attempt 的 journal 读抛错 → 跳过该 attempt,记 `console.warn` 一行
+  (`supervisor_journal_unavailable task=… attempt=…`),**不抛、不影响其他 attempt、不改
+  任务状态**。抛出去等于让 Supervisor 自己成为把任务搞死的新原因(alarm 整轮失败会连带
+  watchdog 续期一起丢掉)。真实坏 index 的用例在 `test/supervisor-do.test.ts`(写一个
+  `v: 99` 的 index,另一个 attempt 照常上报)。
+- 降级**不进权威链**:它不是关于任务的事实,是关于平台的;而且每 60s 一条的故障噪声还得
+  自己再去重一遍。仓内同类观测面降级(§9.5 的坏行)走的也是 `console.warn` 这条通道。
+- 「逐条检查、大声失败」与「对外降级」不矛盾:对内(不可解析的时间戳、坏 index)一律显式
+  跳过并留痕,对外(整条 alarm 路径)绝不外抛。
+
+### 验收标本与本期边界
+
+验收标本仍是 **C2-r6:单次模型调用悬挂 24 分钟**(§13.19),要求 **5 分钟内可发现** —— 按
+60s tick + 300s red 阈值,最迟在悬挂后 300s 后的那一次 tick,`supervisor_finding` / `red`
+入链,不再依赖「恰好有人在看终端」。
+
+本期明确不做:
+
+| 不做 | 为什么 |
+| --- | --- |
+| 任何处置(cancel / kill / BLOCKED / 返工 / 改路由) | 观察与裁决分离;判据是启发式,误报面未量测 |
+| `enforce` 模式 | 同上 —— 先攒 shadow 样本,样本判据达成前不翻 |
+| 外部告警(邮件 / webhook / 钉钉) | finding 已经进权威链,`/admin/events` 与 §9.6 的流都是出口;再加一条出口只多一个凭据管理面 |
+| 新建 DO / Cron Trigger / 独立 Worker | 寄生在既有 alarm 路径里才零协调成本,且**单写者天然保持** |
+| 改 §9.5 的 journal/ingest/事件协议、§9.6/§9.7 的 SSE 与 Live UI | 只读复用。特别是不能为了判据去给 journal 加未脱敏字段 |
+| 多任务聚合视图 | 本期逐 attempt 判据;跨任务全局视图留下一期(它要的是另一个读面,不是另一套判据) |
+| 阈值调优 | 缺省值取「与 Live UI 同一把尺子 + 窗内明显超出常态」;调优是 shadow 样本攒够之后的事 |
 
 ---
 
@@ -819,6 +959,8 @@ git -C /path/to/repo apply task-$TASK-*.patch
 | Var | `EGRESS_MODE` = `enforce` | 沙箱出站策略:`shadow` 只记账放行、`enforce` 白名单拒绝(§13.14)。有否决权的策略,先 shadow 取样再翻 |
 | Var | `EGRESS_GIT_HOSTS` = `github.com` | 出站白名单的代码托管主机(逗号分隔);模型主机从 `MODEL_UPSTREAM_BASE` 推导,不经此变量 |
 | Var | `MAX_PATCH_BYTES`(未设,代码默认 `1048576`) | 候选 patch 字节上限,**可选 + 回落**;超限在容器内 `exit 24`、不回传字节(§13.17) |
+| Var | `SUPERVISOR_MODE` = `shadow` | Supervisor(第②层的独立消费者)启用点:**代码缺省 `off`**,必须显式写 `shadow` 才生效(可审计的启用点)。`shadow` = 只往权威链记 `supervisor_finding` 事件,**不做任何处置**;本期不存在 `enforce` 路径(§9.8) |
+| Var | `SUPERVISOR_TICK_SECONDS` = `60` | shadow 模式下 alarm 的 tick 间隔(秒),**可选**,缺省 60(= `WATCHDOG_MIN_INTERVAL_MS`)。它给截止驱动的 alarm 加一条更早的醒来节奏,使悬挂期间也能判一次(§9.8) |
 
 ### 部署动作顺序
 

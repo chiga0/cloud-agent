@@ -51,6 +51,15 @@ export interface Env {
    * 比较用的估计值,qwen3.8-flash 的真实折扣以百炼控制台为准,不是账单口径。
    */
   CACHE_READ_COST_FACTOR?: string;
+  /**
+   * Supervisor(独立消费者)的启用点:"off"(完全按历史行为跑) | "shadow"(读 journal
+   * 判据、只往权威链记 supervisor_finding 事件、不做任何处置)。可选,**代码缺省 off** ——
+   * 启用一律靠这里的 vars 显式写,这样「什么时候开始有 Supervisor 在看着」是可审计的。
+   * 三类判据都是启发式,先攒样本再谈 enforce(与 M8/M9/C8 的 shadow 惯例同)。
+   */
+  SUPERVISOR_MODE?: string;
+  /** shadow 模式下 alarm 的 tick 间隔(秒)。可选,缺省 60 —— 见 src/supervisor/detect.ts。 */
+  SUPERVISOR_TICK_SECONDS?: string;
 
   /** Worker 侧高权 key:给 reviewer 用;也是沙箱 key 缺配时的回落值 */
   DASHSCOPE_API_KEY: string;

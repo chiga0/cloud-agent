@@ -91,6 +91,51 @@ describe("watchdog 续期(alarm 一次性,不续期就丢兜底)", () => {
   });
 });
 
+/**
+ * Supervisor tick 下的节奏。核心事实:截止驱动的 alarm 在「attempt 还活着但已经不动了」
+ * 期间根本不会醒(C2-r6 悬挂 24 分钟时墙钟还剩十几分钟),所以 shadow 模式必须给一条
+ * 更早的节奏;而 off 模式一个字节都不能变 —— 那是本期的回归证据。
+ */
+describe("watchdog 续期 + Supervisor tick", () => {
+  const nowMs = Date.parse("2026-09-03T00:00:00.000Z");
+  const at = (offsetMs: number, wall: number) => ({
+    created_at: new Date(nowMs + offsetMs).toISOString(),
+    max_wall_seconds: wall,
+  });
+  const MIN = WATCHDOG_MIN_INTERVAL_MS;
+
+  it("不传 tick → 与历史逐字段一致(mode off 的回归证据)", () => {
+    const running = [at(0, 600), at(-10_000, 600)];
+    expect(nextWatchdogAlarm({ running, nowMs, supervisorTickMs: undefined })).toBe(
+      nextWatchdogAlarm({ running, nowMs }),
+    );
+    expect(nextWatchdogAlarm({ running, nowMs })).toBe(attemptDeadline(running[1]));
+  });
+
+  it("tick 早于截止 → 返回 now+tick(悬挂期间会醒)", () => {
+    const running = [at(0, 600)];
+    expect(nextWatchdogAlarm({ running, nowMs, supervisorTickMs: 3 * MIN })).toBe(nowMs + 3 * MIN);
+  });
+
+  it("tick 晚于截止 → 仍返回截止(超时兜底不会被 tick 推迟)", () => {
+    const running = [at(0, 600)];
+    expect(nextWatchdogAlarm({ running, nowMs, supervisorTickMs: 60 * MIN })).toBe(attemptDeadline(running[0]));
+  });
+
+  it("tick 不早于 WATCHDOG_MIN_INTERVAL_MS;非法 tick 当没给", () => {
+    const running = [at(0, 600)];
+    expect(nextWatchdogAlarm({ running, nowMs, supervisorTickMs: 5_000 })).toBe(nowMs + MIN);
+    expect(nextWatchdogAlarm({ running, nowMs, supervisorTickMs: 0 })).toBe(attemptDeadline(running[0]));
+    expect(nextWatchdogAlarm({ running, nowMs, supervisorTickMs: NaN })).toBe(attemptDeadline(running[0]));
+  });
+
+  it("terminal 或没有 RUNNING attempt 时,tick 也不产生下一次 alarm", () => {
+    const running = [at(0, 600)];
+    expect(nextWatchdogAlarm({ running, nowMs, terminal: true, supervisorTickMs: MIN })).toBeNull();
+    expect(nextWatchdogAlarm({ running: [], nowMs, supervisorTickMs: MIN })).toBeNull();
+  });
+});
+
 describe("compositeEvidenceDigest", () => {
   it("确定性:相同输入相同结果", async () => {
     const parts = [

@@ -30,6 +30,17 @@ import {
   type RouteDecision,
   type VerifyReportSignals,
 } from "../routing/classify";
+import { readObsAttemptEvents } from "../obs/journal";
+import {
+  detectSupervisor,
+  selectFindingsToEmit,
+  supervisorFindingPayload,
+  supervisorModeOf,
+  supervisorTickMsOf,
+  SUPERVISOR_DEGRADED_TAG,
+  type SupervisorMode,
+  type SupervisorReported,
+} from "../supervisor/detect";
 
 /**
  * 每任务一个 TaskSession DO:任务状态机、事件 hash chain、决策、重试策略的
@@ -147,6 +158,9 @@ interface SessionData {
 type ReportArgs = Parameters<TaskSession["reportExecution"]>[0];
 
 const EVENTS_PER_SHARD = 100;
+
+/** DO storage 里的 Supervisor 去重表键((attempt,kind,rule,severity) → 上次上报 ms)。 */
+const SUPERVISOR_REPORTED_KEY = "supervisor:reported";
 
 /**
  * BLOCKED 的结论原文(进事件链与 D1 归档)。刻意自带「该动哪个旋钮」:转人工之后,
@@ -1485,6 +1499,125 @@ export class TaskSession extends DurableObject<Env> {
     t.archived = true;
   }
 
+  // ---- Supervisor:Observation 层的独立消费者(只观察,不裁决) ----
+
+  /**
+   * 启用点只有 `env.SUPERVISOR_MODE` 一处,代码缺省 off(判据见 detect.ts 的
+   * supervisorModeOf:写错的值回落「不做事」,而不是就近选一个)。
+   */
+  private supervisorMode(): SupervisorMode {
+    return supervisorModeOf(this.env.SUPERVISOR_MODE);
+  }
+
+  private supervisorTickMs(): number {
+    return supervisorTickMsOf(this.env.SUPERVISOR_TICK_SECONDS);
+  }
+
+  /**
+   * 一轮 tick:对每个 RUNNING attempt 读 journal → 判据 → 幂等去重 → appendEvent。
+   * 返回值 = 是否往权威链里写了事件(调用方据此决定要不要回写快照)。
+   *
+   * 本方法里**不允许出现** setState / attempt 状态改写 / destroyAttemptSandbox / 路由
+   * 决策。这不是风格洁癖:判据全是启发式(时间阈值 + 重复计数),误报面是既成事实;
+   * 观察与裁决分离意味着 Supervisor 最坏的故障模式只是「多记了一条没人理的事件」,
+   * 而不是「把一个健康任务判死」。处置权仍在 watchdog 的墙钟兜底与人工手里。
+   *
+   * 去重表存 DO storage 而不是 alarm 的局部变量:每次 alarm 触发是**独立的一次请求**,
+   * 局部变量随请求结束消失,等于完全没有去重 —— 一次 38 分钟的悬挂会往权威链里灌
+   * ~38 条同样的 supervisor_finding。权威链是事实底座,不是日志垃圾桶。
+   */
+  private async runSupervisorTick(
+    s: SessionData,
+    mode: SupervisorMode,
+    nowMs: number,
+  ): Promise<boolean> {
+    if (mode !== "shadow" || !s.task) return false;
+    const taskId = s.task.id;
+    const running = s.attempts.filter((a) => a.state === "RUNNING");
+    if (running.length === 0) return false;
+
+    const stored =
+      (await this.ctx.storage.get<SupervisorReported>(SUPERVISOR_REPORTED_KEY)) ?? {};
+    let reported: SupervisorReported = { ...stored };
+    let appended = false;
+
+    for (const a of running) {
+      let events;
+      try {
+        ({ events } = await readObsAttemptEvents(this.env.ARTIFACTS, taskId, a.id));
+      } catch (err) {
+        // 降级:journal 读不动是**观测面自己**的故障,不是 agent 卡住了。跳过该 attempt、
+        // 继续下一个、不抛、不碰任务状态。抛出去等于让 Supervisor 成为把任务搞死的新原因
+        // (alarm 整轮失败会连带 watchdog 续期一起丢掉)。
+        // 降级只记 console.warn 而不进权威链:①它不是关于任务的事实,是关于平台的;
+        // ②每 60s 一条的故障噪声还得自己再去重一遍。仓内同类观测面降级
+        // (journal.ts 的坏行)走的也是这条通道。
+        console.warn(
+          `${SUPERVISOR_DEGRADED_TAG} task=${taskId} attempt=${a.id} error=${String(err).slice(0, 200)}`,
+        );
+        continue;
+      }
+      const findings = detectSupervisor({ now_ms: nowMs, events });
+      if (findings.length === 0) continue;
+
+      const picked = selectFindingsToEmit({
+        attempt_id: a.id,
+        findings,
+        reported,
+        now_ms: nowMs,
+      });
+      reported = picked.reported;
+      for (const f of picked.emit) {
+        await this.appendEvent(
+          s,
+          "supervisor_finding",
+          supervisorFindingPayload({ attempt_id: a.id, finding: f, mode: "shadow" }),
+        );
+        appended = true;
+      }
+    }
+
+    // 只在真的报了东西时回写:去重表的唯一用途是抑制重复上报,没有事件就没有状态变化
+    if (appended) await this.ctx.storage.put(SUPERVISOR_REPORTED_KEY, reported);
+    return appended;
+  }
+
+  /**
+   * RPC:立刻跑一轮 Supervisor tick 并返回本轮上报的 finding。
+   *
+   * 存在的理由有两个:①alarm 的时钟在测试里不可控,而「判据 + 去重 + 降级」这三件事
+   * 必须能被钉住(alarm 里那行调用与本方法共享同一实现,所以被测的就是生产走的那条路);
+   * ②排障时不必等 tick —— 「现在就把这个任务判一遍」是运维会想按的按钮。
+   * 返回值只读不写任何裁决:它把本轮写了哪些事件告诉调用方,仅此而已。
+   */
+  async supervisorTick(): Promise<{
+    mode: SupervisorMode;
+    reported: Array<{ attempt_id: string; kind: string; rule: string; severity: string }>;
+  }> {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      const s = await this.loadAll();
+      if (!s.task) return { mode: this.supervisorMode(), reported: [] };
+      const mode = this.supervisorMode();
+      const nowMs = Date.now();
+      const before = s.events.length;
+      const appended = await this.runSupervisorTick(s, mode, nowMs);
+      if (appended) await this.saveAll(s);
+      const written = s.events
+        .slice(before)
+        .filter((e) => e.kind === "supervisor_finding")
+        .map((e) => {
+          const p = e.payload as {
+            attempt_id: string;
+            kind: string;
+            rule: string;
+            severity: string;
+          };
+          return { attempt_id: p.attempt_id, kind: p.kind, rule: p.rule, severity: p.severity };
+        });
+      return { mode, reported: written };
+    });
+  }
+
   // ---- alarm:归档重试 + attempt 超时兜底 ----
 
   async alarm(): Promise<void> {
@@ -1547,10 +1680,24 @@ export class TaskSession extends DurableObject<Env> {
         s.task.state === "DONE" ||
         s.task.state === "REJECTED" ||
         s.task.state === "BLOCKED";
+
+      // Supervisor tick:寄生在本 alarm 里,不新建 DO、不加 Cron Trigger —— 单写者
+      // 因此天然保持(它写事件走的就是这个 DO 自己的 appendEvent,不存在绕过单写者的
+      // 静默写者)。必须在续期之前跑:判据与下一次醒来的时刻共用同一个 nowMs 基准。
+      const mode = this.supervisorMode();
+      if (!terminal && mode !== "off") {
+        const reportedSomething = await this.runSupervisorTick(s, mode, nowMs);
+        // 与上面 changed 同一纪律,但条件不同:这里回写的理由 next_seq 被事件推进过,
+        // 不持久化会让下一次 loadAll 读到旧 next_seq 从而重号 seq。
+        if (reportedSomething) await this.saveAll(s);
+      }
+
       const next = nextWatchdogAlarm({
         running: s.attempts.filter((a) => a.state === "RUNNING"),
         nowMs,
         terminal,
+        // off 模式不传 tick:续期时刻与历史逐字段一致(回归证据)。
+        supervisorTickMs: mode === "off" ? undefined : this.supervisorTickMs(),
       });
       if (next != null) await this.ctx.storage.setAlarm(next);
     });

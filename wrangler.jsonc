@@ -21,7 +21,13 @@
     "REJECT_EVIDENCE_MODE": "shadow",
     "BASE_PIN_MODE": "shadow",
     "EGRESS_MODE": "enforce",
-    "EGRESS_GIT_HOSTS": "github.com,registry.npmjs.org"
+    "EGRESS_GIT_HOSTS": "github.com,registry.npmjs.org",
+    // Supervisor(四层可观测第②层 Observation 的独立消费者)的启用点。代码里缺省 off,
+    // 必须在这里显式写 shadow 才生效 —— 「什么时候开始有东西盯着」是可审计的。
+    // shadow = 只往权威事件链记 supervisor_finding,**不做任何处置**(不 cancel/kill/BLOCKED/改路由)。
+    "SUPERVISOR_MODE": "shadow",
+    // tick 间隔(秒):alarm 在截止驱动之外多出一条更早的节奏,使悬挂期间也能醒来判断。
+    "SUPERVISOR_TICK_SECONDS": "60"
   },
   "d1_databases": [
     {
