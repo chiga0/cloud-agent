@@ -1593,8 +1593,9 @@ describe("归档停滞可发现性(c11b)", () => {
     expect(await countRows("SELECT COUNT(*) AS n FROM attempts WHERE task_id = ?", taskId)).toBe(0);
     expect(await countRows("SELECT COUNT(*) AS n FROM tasks WHERE id = ?", taskId)).toBe(0);
 
-    // ③ 幂等处置(方案 a):阶梯算术一行未改 —— 仍然喊 archive_stalled、仍然排下一次,
+    // ③ 幂等处置(方案 b):阶梯算术一行未改 —— 仍然喊 archive_stalled、仍然排下一次,
     //    只是 error 里带的是**有名字的拒收**,而不是神秘的 D1 UNIQUE 报错。
+    //    判据在构批之前,顺带省下 D1 往返 —— 那是另一条轴,不改变阶梯形状(§6.2.4)。
     const stalled = errors.filter((l) => l.includes("archive_stalled"));
     expect(stalled).toHaveLength(1);
     expect(stalled[0]).toContain("duplicated seq");

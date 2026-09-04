@@ -402,11 +402,14 @@ throw ArchiveRejectedSnapshot
 写入 = 由归档层替审计决定历史上发生过什么,而归档层是读模型,不是权威(§3)。宁可这份档案缺席,
 也不许它说谎。
 
-**幂等处置选的是方案 (a)**:判据放在 `archive()` 构批之前,而不是各调用方各查一遍 —— 归档有三个入口
-(终态 RPC 的 `archiveWithRetry`、alarm 的停滞重试、alarm 里 watchdog 打成 BLOCKED 之后的归档),
-写在写口本身才能保证哪一个入口都不白打 D1。代价是阶梯**逐档爬到 30min 封顶并一直心跳**这件事原样
-保留:`ARCHIVE_RETRY_LADDER_MS` 数值一行未动(`archive_retry_step` 也照旧累加),没有为拒收发明新的
-任务状态机状态。**为什么保留**:终态任务的 `nextWatchdogAlarm` 返回 `null`,所以停滞 alarm 是这条 DO
+**幂等处置选的是规格里的方案 (b)**:阶梯维持现状,拒收日志与暂态 D1 故障日志分级 ——
+`archive_rejected`(机理具名)与 `archive_stalled`(仍在爬坡)各说一件事。规格那两个方案的轴是
+**阶梯动不动**(a = 终止该任务的重试),而「判据放在 `archive()` 构批之前、而不是各调用方各查一遍」
+是另一条独立的轴:归档有三个入口(终态 RPC 的 `archiveWithRetry`、alarm 的停滞重试、alarm 里
+watchdog 打成 BLOCKED 之后的归档),写在写口本身才能保证哪一个入口都不白打 D1 —— 它省下 D1 往返,
+**不改变阶梯的形状**。所以本节的阶梯原样保留:`ARCHIVE_RETRY_LADDER_MS` 数值一行未动
+(`archive_retry_step` 也照旧累加),没有为拒收发明新的任务状态机状态。**为什么保留**:终态任务的
+`nextWatchdogAlarm` 返回 `null`,所以停滞 alarm 是这条 DO
 唯一还剩的观察者,而 Supervisor tick 就寄生在同一个 alarm 里(§9.8)—— 停掉它等于把一条仍然持有权威链
 的 DO 永久静音,比每分钟多看一行日志危险得多;而 30 分钟一次的内存扫描成本可以忽略,换来的是操作员
 真去修快照时不必重新部署就能被捡起。换句话说:拒收省下的是**白打的 D1 批写与误导性的报错文本**,
