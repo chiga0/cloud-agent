@@ -295,25 +295,152 @@ const TOOL_TARGET_ORDER = TOOL_TARGET_KEYS.map((t) => ({
 }));
 
 /**
- * 命令 → 「首词 + 首个不以 `-` 开头的实参」。
+ * shell 分段符 —— **闭合的三成员**。复合命令行里只有这三个把「两件不同的事」分开,
+ * 于是它们该被当成边界而不是实参。
+ *
+ * 单竖线 `|` 刻意**不在**这个集合里,这是操作员在同一批 prod 命令行上实测出来的:
+ * 那 36 条里有 24 条含 `|`,其中 12 条的 `|` 在**引号内**(`grep -rn "a\|b\|c" src/`)。
+ * 按 `|` 切会把正则劈成碎片,选段规则于是选中尾碎片 ⇒ 键变成 `not_archived" src/`
+ * 这类东西。两个后果都不可接受:键随模式文本漂移 ⇒ 真空转反而测不出;grep 模式文本
+ * 被送上观测面 ⇒ 违反 §9.5「input 不进 journal」的既有理由。
+ */
+const COMMAND_SEPARATORS = new Set(["&&", "||", ";"]);
+
+/**
+ * 前缀段:只改工作目录/环境,不碰任何「东西」。`cd X` 区分不出两次调用的差异,
+ * 所以它们不参与选段 —— 这正是 prod 首样本两条误报的成因(见 commandShape)。
+ * 列表刻意小且封闭:多列一项只是多一段被跳过,漏列一项的代价由选段规则(取最具体段)兜住。
+ */
+const COMMAND_PREAMBLE_HEADS = new Set([
+  "cd",
+  "pushd",
+  "popd",
+  "export",
+  "source",
+  ".",
+  "set",
+  "unset",
+  "true",
+  "false",
+  "env",
+]);
+
+/** 文件描述符重定向(`2>&1`、`>/dev/null`、`1>`…):不是「它碰了哪个东西」。 */
+const COMMAND_REDIRECTION_RE = /^\d*[<>]/;
+
+/**
+ * 自由文本的形状证据:以引号 / 反引号 / `$` 开头,或以引号收尾(引号没闭合时按空白
+ * 切出来的中后段就是这个形状)。
+ *
+ * 这类 token 是**正文**而不是标识符 —— grep 的模式、echo 的消息、`$(date)` 全在这里。
+ * 把它选进形状等于把 input 的正文送进 journal,而且键会随正文漂移,同一处反复转圈反而
+ * 测不出。判断只看首尾字符,引号内部一律不解释:与「不做完整 shell 解析」的边界同源。
+ */
+function isFreeTextToken(token: string): boolean {
+  return /^["'`$]/.test(token) || /["']$/.test(token);
+}
+
+/** 一个 token 能不能当「目标实参」。flag 从来不算,正文与重定向也不算。 */
+function isShapeArgument(token: string): boolean {
+  if (token.startsWith("-")) return false;
+  if (isFreeTextToken(token)) return false;
+  if (COMMAND_REDIRECTION_RE.test(token)) return false;
+  return true;
+}
+
+/**
+ * 命令行 → 段数组(每段是一个 token 数组),边界为 `&&` / `||` / `;`。
+ *
+ * 三条刻意的口径:
+ * - **引号内的空白不切**(`"…"` / `'…'` 整块算一个 token)。这是「引号按字符串处理」的
+ *   最小形式:不脱引号、不认转义、不认嵌套,只为挡住 `grep -n "async archive" src/` 里
+ *   的 `archive` —— 它既会被选成目标(正文外漏),又会把装饰段撑长抢走选段。未闭合的引号
+ *   一路吃到行尾:那种命令行本身就不是合法 shell,形状变粗即可,不炸也不外漏。
+ * - **`;` 允许粘在 token 尾**(`tail -20; echo …` 是 agent 的真实写法),引号外的 `;`
+ *   一律就地结束本段。
+ * - `&&` / `||` 只认独立 token。粘连的 `a&&b` 保持一个 token:影响的只是选段粒度,
+ *   不会多出任何字节。
+ */
+function commandSegments(command: string): string[][] {
+  const segments: string[][] = [];
+  let current: string[] = [];
+  let token = "";
+  let quote: string | null = null;
+
+  const closeSegment = () => {
+    if (current.length > 0) segments.push(current);
+    current = [];
+  };
+  const flushToken = () => {
+    if (token.length === 0) return;
+    if (COMMAND_SEPARATORS.has(token)) closeSegment();
+    else current.push(token);
+    token = "";
+  };
+
+  for (const ch of command) {
+    if (quote !== null) {
+      token += ch;
+      if (ch === quote) quote = null;
+    } else if (ch === '"' || ch === "'") {
+      quote = ch;
+      token += ch;
+    } else if (/\s/.test(ch)) {
+      flushToken();
+    } else if (ch === ";") {
+      flushToken();
+      closeSegment();
+    } else {
+      token += ch;
+    }
+  }
+  flushToken();
+  closeSegment();
+  return segments;
+}
+
+/** 一段 → 「首词 + 首个可当目标的实参」。泄露面钉在常数级的原有理由不变。 */
+function segmentShape(tokens: string[]): string {
+  // 首词跳过正文 token:未闭合引号之类会让一段以碎片开头,碎片既不是命令名也不该外漏。
+  const headAt = tokens.findIndex((t) => !isFreeTextToken(t));
+  const from = headAt === -1 ? 0 : headAt;
+  const head = tokens[from].slice(0, TOOL_TARGET_MAX_CHARS);
+  const arg = tokens.slice(from + 1).find(isShapeArgument);
+  return arg === undefined ? head : `${head} ${arg.slice(0, TOOL_TARGET_MAX_CHARS)}`;
+}
+
+/**
+ * 命令 → 一个形状摘要:先按 shell 分段符(`&&` / `||` / `;`,**不含** `|`)拆段,丢掉
+ * 前缀段(`cd X &&`),再取剩下**最具体**的那段 —— 「首词 + 目标实参」。
  *
  * 只取这两个 token 是为了把泄露面钉在常数级:一条真实命令可能是
  * `bash -c 'curl -H "Authorization: Bearer …" …'`,整串进 journal 就等于把命令行
  * 里的一切外送。代价是判据看不见 flag —— 而「同一句命令换了个 flag 反复跑」正是
  * 空转的典型样子,不该被当成两个不同动作(见 §9.8 与 normalizeTarget)。
  *
- * ⚠️ 还有一个已被 prod 样本证实的代价:`&&` / `||` / `;` 在这里只是普通 token 边界,
- * 所以 `cd X && <任何事>` 一律塌缩成 `cd X`。c14 那个**健康** writer 的 36 次 shell 调用
- * 里 35 次是这个形状(sed ×15 / grep ×11 / …全被折成同一个键),于是 loop 与 no_progress
- * 在它启动两分钟内各亮一条黄。修法方向是把 shell 运算符当作**分段边界**、逐段取形状
- * (泄露面仍是常数),而不是把整行塞进判据 —— 未修之前 §9.8 的 enforce 条件 ④ 不可能达成。
+ * 为什么必须分段:c14 那个**健康** writer(任务跑到 DONE、退出码 0)的 36 次 shell 调用里
+ * 35 条是 `cd /workspace/repo && <任何事>`,而旧实现里 `&&` 只是普通 token 边界 ⇒ 35 条
+ * 全塌成 `cd /workspace/repo` 这一个键(sed ×15、grep ×11、tsc、git log、ls、wc 全被折进
+ * 同一形状),loop 与 no_progress 于是在它启动两分钟内各亮一条黄。塌缩发生在摄取侧、
+ * 判据侧无从还原(`detect.ts` 的 `normalizeTarget` 只会做同样的「首词 + 实参」),
+ * 所以修只在这里。
+ *
+ * 选段规则为什么是「token 数最多的一段」(并列取先出现的):按**首段**选会被
+ * `cd X && echo "…" && 真正的动作` 这种带标题行的形状钉在 `echo` 上,按**末段**选会被
+ * `… | tail -20` 这类尾巴钉在收尾噪音上。装饰段总是短段,段越长越像是这件事本身。
+ * 全段都是前缀段时(裸 `cd /workspace/repo`)照旧取它 —— 反复只 `cd` 不干活就是空转,
+ * 这条判据不许因为这次拆段而变哑。
  */
 function commandShape(command: string): string {
-  const tokens = command.trim().split(/\s+/).filter((t) => t.length > 0);
-  if (tokens.length === 0) return "";
-  const head = tokens[0].slice(0, TOOL_TARGET_MAX_CHARS);
-  const arg = tokens.slice(1).find((t) => !t.startsWith("-"));
-  return arg === undefined ? head : `${head} ${arg.slice(0, TOOL_TARGET_MAX_CHARS)}`;
+  const segments = commandSegments(command);
+  if (segments.length === 0) return "";
+  const actions = segments.filter((s) => !COMMAND_PREAMBLE_HEADS.has(s[0]));
+  const pool = actions.length > 0 ? actions : segments;
+  let best = pool[0];
+  for (const segment of pool) {
+    if (segment.length > best.length) best = segment;
+  }
+  return segmentShape(best);
 }
 
 /** 一个 tool_use 块的入参目标;白名单里一个键都没命中时返回 null(而不是空串)。 */

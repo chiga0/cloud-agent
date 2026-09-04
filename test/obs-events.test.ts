@@ -11,6 +11,7 @@ import {
   toHeartbeatEvent,
 } from "../src/obs/events";
 import { LONGRUN_STATUSES, type LongRunStatus, type ProcessSnapshot } from "../src/exec/longrun";
+import { SHELL_FIXTURE, SHELL_FIXTURE_COLLAPSED_KEY } from "./fixtures/shell-command-shapes";
 import type { Env } from "../src/types";
 
 /**
@@ -203,7 +204,7 @@ describe("payload.tool_targets(入参形状摘要:按键白名单 + 打码 + ≤
     ]);
   });
 
-  it("command 只取首词 + 首个非 flag 实参:flag 与其余 token 一律不留", () => {
+  it("command 取选中段的首词 + 首个可当目标的实参:flag 与其余 token 一律不留", () => {
     const e = build({
       type: "assistant",
       content: [tool({ command: `npm test -- --reporter=verbose --token=${KEY}` }, "run_shell_command")],
@@ -212,11 +213,132 @@ describe("payload.tool_targets(入参形状摘要:按键白名单 + 打码 + ≤
     expect(JSON.stringify(e.payload)).not.toContain(KEY);
     expect(JSON.stringify(e.payload)).not.toContain("verbose");
 
-    // 只有首词(没有非 flag 实参)时不补空格,也不会退化成整行
+    // 只有首词(没有可当目标的实参)时不补空格,也不会退化成整行
     const bare = build({ type: "assistant", content: [tool({ command: "git status" }, "run_shell_command")] });
     expect(bare.payload.tool_targets).toEqual(["git status"]);
     const only = build({ type: "assistant", content: [tool({ command: "pwd" }, "run_shell_command")] });
     expect(only.payload.tool_targets).toEqual(["pwd"]);
+  });
+
+  /**
+   * c14 首样本的失效根因:`cd X && <任何事>` 塌成 `cd X`,于是**健康** writer 的 36 次
+   * shell 调用里 35 次共用一个键,loop 与 no_progress 各亮一条黄。下面这组用例钉住修好
+   * 之后的形状:复合命令行逐段取形状,一条 tool_use 仍然只产一个键 —— 所以 window 与
+   * repeat_count 的既有语义一个字都没动,变的只是键的分辨率。
+   */
+  it("复合命令行按 && / || / ; 分段:cd 前缀不再吞掉真正的动作", () => {
+    const cases: Array<[string, string]> = [
+      ["cd /workspace/repo && git log --oneline -3", "git log"],
+      // 动作比 `cd X` 短也照样赢:前缀段不参与选段,否则这条判据永远在 cd 上误报
+      ["cd /workspace/repo && ls", "ls"],
+      ["cd /workspace/repo && npm test 2>&1 | tail -30", "npm test"],
+      // `;` 与 `||` 同样是边界(闭合的三成员)
+      ["cd /workspace/repo && npx tsc --noEmit; echo TSC_DONE", "npx tsc"],
+      ["cd /w && test -f src/a.ts || echo missing", "test src/a.ts"],
+      // 装饰段(标题 echo、收尾短段)抢不过真正的动作:取「最具体」的那一段
+      ['cd /w && echo "=== alarm tail ===" && sed -n "10,20p" src/index.ts', "sed src/index.ts"],
+      // 没有 cd 前缀时同样只留一段
+      ["tail -5 /tmp/install.log 2>/dev/null; ls /w/node_modules 2>/dev/null | wc -l", "ls /w/node_modules"],
+      // 悬空/连续的分隔符不产空段,也不会因为多一个边界就取不到形状
+      ["cd /w && && echo hi", "echo hi"],
+    ];
+    for (const [command, want] of cases) {
+      const e = build({ type: "assistant", content: [tool({ command }, "run_shell_command")] });
+      expect(e.payload.tool_targets, command).toEqual([want]);
+    }
+  });
+
+  it("单竖线 | 不是分段符:引号内的正则或、管道尾巴都不改变形状", () => {
+    // 这一条钉住分段符集合为什么只有三成员(操作员在同一批 36 条上实测:含 `|` 的有 24 条,
+    // 其中 12 条的 `|` 在引号内)。按 `|` 切会把模式劈成碎片,选段规则于是选中尾碎片
+    // ⇒ 键变成 `not_archived" src/` 这类东西:随模式文本漂移(真空转反而测不出),
+    // 而且把 grep 模式送上观测面。
+    const withPipe = build({
+      type: "assistant",
+      content: [
+        tool(
+          { command: `cd /w && grep -rn "chain-check\\|chainCheck\\|brokenTasks\\|not_archived" src/ | head -40` },
+          "run_shell_command",
+        ),
+      ],
+    });
+    expect(withPipe.payload.tool_targets).toEqual(["grep src/"]);
+    const json = JSON.stringify(withPipe.payload);
+    expect(json).not.toContain("not_archived");
+    expect(json).not.toContain("chain-check");
+    expect(json).not.toContain("|");
+
+    // 换了管道尾巴(竖线之后的全部内容)不算换了动作 ⇒ 仍是同一个键。反过来,若 `|` 被
+    // 当成分段符,这两条会得到两个不同的键 —— 那正是「键随模式文本漂移」的形状。
+    const otherTail = build({
+      type: "assistant",
+      content: [tool({ command: `cd /w && sed -n "1,30p" src/index.ts | grep -n "import"` }, "run_shell_command")],
+    });
+    expect(otherTail.payload.tool_targets).toEqual(["sed src/index.ts"]);
+  });
+
+  it("正文不当目标:引号里的模式与消息、命令替换、重定向一律不进 payload", () => {
+    const cases: Array<[string, string]> = [
+      // 模式里带空格 ⇒ 按空白切出的两块都只是正文碎片(后一块只剩右引号),两端都不许留
+      ['cd /w && grep -n "async archive\\|archive(" src/a.ts', "grep src/a.ts"],
+      ['cd /w && sed -n "1470,1560p" src/control/session.ts', "sed src/control/session.ts"],
+      ["cd /w && echo $(date) done", "echo done"],
+      ["cd /w && npm test --silent >/dev/null 2>&1", "npm test"],
+    ];
+    for (const [command, want] of cases) {
+      const e = build({ type: "assistant", content: [tool({ command }, "run_shell_command")] });
+      expect(e.payload.tool_targets, command).toEqual([want]);
+    }
+    // 形状里不许出现引号内的正文:这是「input 不进 journal」在命令通道上的同一口径
+    const patterned = build({
+      type: "assistant",
+      content: [
+        tool(
+          { command: `cd /w && grep -n "async archive\\|ARCHIVE_RETRY_LADDER_MS\\|archive_retry_step" src/a.ts` },
+          "run_shell_command",
+        ),
+      ],
+    });
+    expect(JSON.stringify(patterned.payload)).not.toContain("ARCHIVE_RETRY_LADDER_MS");
+    expect(JSON.stringify(patterned.payload)).not.toContain("archive_retry_step");
+  });
+
+  it("整行都是前缀段时保留 cd:裸 `cd X` 反复跑仍然是空转(判据不许改哑)", () => {
+    // 丢掉前缀段是为了看见真正的动作,不是为了让 `cd` 消失:整行没有别的动作时,
+    // 重复九次的裸 `cd` 就该按 `cd <dir>` 算重复 —— 否则这条修反倒成了「把判据阉掉」。
+    const cases: Array<[string, string]> = [
+      ["cd /workspace/repo", "cd /workspace/repo"],
+      ["cd /w; cd /w/x", "cd /w"],
+      ["cd /w && export FOO=1", "cd /w"],
+    ];
+    for (const [command, want] of cases) {
+      const e = build({ type: "assistant", content: [tool({ command }, "run_shell_command")] });
+      expect(e.payload.tool_targets, command).toEqual([want]);
+    }
+  });
+
+  it("prod 夹具 12 条:主键占比从 11/12 打下来,且逐条形状与判据侧共用同一份表", () => {
+    const commands = SHELL_FIXTURE.map((f) => f.command);
+    // 每个块用不同工具名:tool_names 是去重的,重名块不产 slot(那是另一条契约)
+    const e = build({
+      type: "assistant",
+      content: commands.map((command, i) => tool({ command }, `sh_${i}`)),
+    });
+    const targets = e.payload.tool_targets as string[];
+    // 一条 tool_use 只贡献一个键:数组长度 = 命令行条数,没有哪条被拆成两个
+    expect(targets).toHaveLength(commands.length);
+    expect(targets).toEqual(SHELL_FIXTURE.map((f) => f.shape));
+    const counts = new Map<string, number>();
+    for (const t of targets) counts.set(t, (counts.get(t) ?? 0) + 1);
+    expect(counts.size).toBeGreaterThanOrEqual(10);
+    expect(Math.max(...counts.values())).toBeLessThanOrEqual(Math.ceil(commands.length / 6));
+    // 塌缩的反证:修之前 12 条里 11 条的键都是 SHELL_FIXTURE_COLLAPSED_KEY
+    expect(targets.filter((t) => t === SHELL_FIXTURE_COLLAPSED_KEY)).toHaveLength(1);
+    // 泄露面钉在常数级:模式文本一个字节都不许进 payload
+    const json = JSON.stringify(e.payload);
+    for (const leak of ["ARCHIVE_RETRY_LADDER_MS", "archive_stalled", "chainCheck", "not_archived", "alarm tail"]) {
+      expect(json, leak).not.toContain(leak);
+    }
   });
 
   it("键名大小写与分隔符不敏感:同一工具改名换写法仍能取到", () => {

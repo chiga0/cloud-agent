@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { toAgentEventV1, OBS_HEARTBEAT_KIND, type AgentEventV1 } from "../src/obs/events";
+import { SHELL_FIXTURE, SHELL_FIXTURE_COLLAPSED_KEY } from "./fixtures/shell-command-shapes";
 import { POLL_INTERVAL_MS } from "../src/exec/longrun";
 import { LIVE_STALL_DANGER_SECONDS, LIVE_STALL_WARN_SECONDS } from "../src/obs/live";
 import {
@@ -575,6 +576,125 @@ describe("ingress ↔ 判据的同一条缝(transcript 行 → sanitize → dete
     );
     expect(events[0].payload).not.toHaveProperty("tool_targets");
     expect(loopOf(events)?.evidence.repeat_key).toBe("mcp_search@mcp_search");
+  });
+
+  /**
+   * 双向判据的 **②**(比 ① 重要):把 `cd X && 真正的动作` 拆开后,真空转必须照样命中。
+   * 只做到「健康 writer 不再误报」的实现等于把 loop / no_progress 阉掉 —— 所以这几条
+   * 全部用**复合命令行**构造,并把漂移放在不该影响键的位置(flag、引号内的行号区间)。
+   */
+  it("② 判据没被改哑:同一处反复转圈(复合命令行 + 行号漂移)仍命中 loop", () => {
+    // 真实空转的样子:反复 sed 同一个文件的相邻区间,只有引号里的行号在动。
+    // 行号是正文 token ⇒ 键不随它漂移;`cd` 前缀被丢掉 ⇒ 键就是那个真正的动作。
+    const events = ingest(
+      Array.from({ length: n }, (_, i) =>
+        toolLine("run_shell_command", {
+          command: `cd /workspace/repo && sed -n '${1400 + i * 10},${1500 + i * 10}p' src/control/session.ts`,
+        }),
+      ),
+    );
+    const loop = loopOf(events);
+    expect(loop?.evidence.repeat_key).toBe("run_shell_command@sed src/control/session.ts");
+    expect(loop?.evidence.repeat_count).toBe(n);
+  });
+
+  it("② 判据没被改哑:同一句复合命令跑满 no_progress_repeat_max 次 → loop 与 no_progress 同时命中", () => {
+    const events = ingest(
+      Array.from({ length: SUPERVISOR_THRESHOLDS.no_progress_repeat_max }, () =>
+        toolLine("run_shell_command", { command: "cd /workspace/repo && npm test 2>&1 | tail -30; echo DONE" }),
+      ),
+    );
+    const findings = detectSupervisor({ now_ms: NOW, events });
+    expect(findings.map((f) => f.kind).sort()).toEqual(["loop", "no_progress"]);
+    expect(findings.find((f) => f.kind === "loop")?.evidence.repeat_key).toBe(
+      "run_shell_command@npm test",
+    );
+  });
+
+  it("② 判据没被改哑:裸 `cd` 反复跑仍算空转(丢前缀段不等于丢这条)", () => {
+    const events = ingest(
+      Array.from({ length: SUPERVISOR_THRESHOLDS.no_progress_repeat_max }, () =>
+        toolLine("run_shell_command", { command: "cd /workspace/repo" }),
+      ),
+    );
+    const findings = detectSupervisor({ now_ms: NOW, events });
+    expect(findings.map((f) => f.kind).sort()).toEqual(["loop", "no_progress"]);
+    expect(findings.find((f) => f.kind === "loop")?.evidence.repeat_key).toBe(
+      "run_shell_command@cd /workspace/repo",
+    );
+  });
+
+  it("② 判据没被改哑:12 条各不相同的动作各自重复 5 次 → 仍命中 loop", () => {
+    // 与 ① 的对照:同样的 12 条命令,把「每条一次」换成「每条 5 次」就必须报。
+    // 也就是说 ① 的零误报来自键的分辨率,不是来自把窗或阈值调松。
+    const events = ingest(
+      SHELL_FIXTURE.flatMap((f) =>
+        Array.from({ length: n }, () => toolLine("run_shell_command", { command: f.command })),
+      ),
+    );
+    const loop = loopOf(events);
+    const count = loop?.evidence.repeat_count ?? 0;
+    expect(count).toBeGreaterThanOrEqual(n);
+  });
+
+  /**
+   * 双向判据的 **①**:c14 那个**健康** writer(跑到 DONE、退出码 0)在启动两分钟内落了
+   * 两条黄 —— 36 次 shell 调用里 35 次共用一个键。这里用同一批命令行(见夹具出处)按
+   * prod 的多样性重放两遍,两条行为类判据都必须闭嘴。
+   */
+  it("① 降误报:prod 夹具的多样动作序列(两遍 = 24 条行为事件)不命中 loop / no_progress", () => {
+    const events = ingest(
+      [...SHELL_FIXTURE, ...SHELL_FIXTURE].map((f) =>
+        toolLine("run_shell_command", { command: f.command }),
+      ),
+    );
+    const findings = detectSupervisor({ now_ms: NOW, events });
+    expect(findings.map((f) => f.kind)).toEqual([]);
+  });
+
+  it("① 的反证:同样的 12 条若仍塌成同一个键,两条判据就会各亮一条(c14 的现场)", () => {
+    // 这条测的不是 commandShape,而是「误报确实由塌缩引起」:把 11 条事件的形状手工写成
+    // 塌缩后的键(= 修之前 journal 里真实存在的形状),判据按既有阈值各报一条黄。
+    // 阈值一个字没动 ⇒ 修的是输入,不是判据。
+    const collapsed = (target: string, seq: number): AgentEventV1 =>
+      evt({
+        seq,
+        payload: { tool_names: ["run_shell_command"], tool_targets: [target] },
+      });
+    const events = [
+      ...Array.from({ length: SUPERVISOR_THRESHOLDS.loop_repeat_max }, (_, i) =>
+        collapsed(SHELL_FIXTURE_COLLAPSED_KEY, i + 1),
+      ),
+      ...Array.from({ length: SUPERVISOR_THRESHOLDS.no_progress_repeat_max - n }, (_, i) =>
+        collapsed(SHELL_FIXTURE_COLLAPSED_KEY, n + 1 + i),
+      ),
+    ];
+    const findings = detectSupervisor({ now_ms: NOW, events });
+    expect(findings.map((f) => f.rule).sort()).toEqual([
+      RULE_LOOP_TOOL_REPEAT,
+      RULE_NO_PROGRESS_TARGET_REPEAT,
+    ]);
+    expect(findings.map((f) => f.severity)).toEqual(["yellow", "yellow"]);
+  });
+
+  /**
+   * 双向判据的 **③**:`|` 不是分段符(操作员实测:那批 36 条里含 `|` 的有 24 条,其中
+   * 12 条的 `|` 在引号内)。按 `|` 切会得到 `not_archived" src/` 这类尾碎片 ⇒ 键随模式
+   * 文本漂移,**真空转反而测不出**。这条从判据侧钉住:换管道尾巴与换模式都不算换动作。
+   */
+  it("③ 单竖线不分段:管道尾巴与引号内的正则或都不拆开键 → 反复 grep 同一目录仍命中", () => {
+    const events = ingest(
+      Array.from({ length: n }, (_, i) =>
+        toolLine("run_shell_command", {
+          command: `cd /workspace/repo && grep -rn "patternA\\|patternB${i}" src/ | ${i % 2 === 0 ? "head -40" : "tail -5"}`,
+        }),
+      ),
+    );
+    // 键里的 `src` 是 normalizeTarget 把 `src/` 的尾斜杠折掉的结果(判据侧口径,与本次改动无关)
+    expect(loopOf(events)?.evidence.repeat_key).toBe("run_shell_command@grep src");
+    const json = JSON.stringify(events.map((e) => e.payload));
+    expect(json).not.toContain("patternA");
+    expect(json).not.toContain("patternB");
   });
 
   it("真实 transcript 里 loop 与 stall 可以并存(悬挂前在转圈)", () => {
