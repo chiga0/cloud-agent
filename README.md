@@ -112,6 +112,12 @@ curl -s "localhost:8787/live/<task_id>" -H "authorization: Bearer $TOKEN" -o liv
 # 折扣系数取 `CACHE_READ_COST_FACTOR`(未设/非法回落 0.2;这只是横向比较用的估计值,
 # qwen3.8-flash 的真实隐式缓存折扣以百炼控制台为准)。四列为 null = 该记录产生时未记过
 # 拆分口径(M8 前的历史行)或没拿到 usage,**不等于消耗为 0**。
+# ⚠️ 「量」的口径:四元组与 raw total 都由**逐事件累加**该 attempt 全部 assistant 调用得到
+# (完成态额外与 result 事件的会话累计值对账,对不上就大声失败、两个候选值都不取)。所以
+# 完成态与被墙钟击杀的 BLOCKED 用同一把尺,可直接横比 —— 旧实现在被杀时回落到「最后一次
+# 调用」的用量,r2 任务 76464e22 实测 input 漏 48.4×、加权漏 54.5×,漏的恰好是最贵的那批。
+# `tokens_used` 与快照事件 `result.captured.total_tokens` 同源(都由同一个累加产物派生,
+# 不是两处各算一遍)。
 # 过滤按 AND 组合:?task_id=(36 字符 UUID) ?role= ?state= ?limit=(默认 50,上限 200);
 # 畸形值 → 400,过滤不命中 → 空列表(count 是本次返回条数,受 limit 截断,不是总匹配数)
 curl -s "localhost:8787/api/admin/attempts?task_id=<task_id>&role=writer" \

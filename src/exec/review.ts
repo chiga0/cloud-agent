@@ -1,5 +1,5 @@
 import type { Env } from "../types";
-import type { TranscriptUsage } from "./extract";
+import { totalFromUsage, type TranscriptUsage } from "./extract";
 import { putArtifact, type ArtifactRef } from "../audit/evidence";
 
 export interface ReviewLLMResult {
@@ -112,12 +112,16 @@ export async function runReviewLLM(
   }
   const text = parsed.choices?.[0]?.message?.content ?? "";
   const stderr = await putArtifact(env.ARTIFACTS, "", `attempts/${args.attemptId}`);
+  // 单次 chat 调用 = 一次调用的全部用量,累加在这个退化情形下就是它本身。
+  // tokens 从同一个 usage 对象派生(不重抄一遍 total 的推导):raw total 与四元组
+  // 必须是同一个量的两种写法,否则 reviewer 与 writer 的台账又是两套口径。
+  const usage = normalizeChatUsage(parsed.usage);
   return {
     exitCode: 0,
     transcript,
     transcriptRaw: text,
     stderr,
-    tokens: parsed.usage?.total_tokens ?? 0,
-    usage: normalizeChatUsage(parsed.usage),
+    tokens: usage === null ? 0 : totalFromUsage(usage),
+    usage,
   };
 }

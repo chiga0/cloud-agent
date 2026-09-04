@@ -547,11 +547,14 @@ c12 只走通了执行面那一半:差量导出来了、自称不完整了,但�
 - 退化:拼接所有 `type === "assistant"` 事件里的 `content[].type === "text"` 块
 - 都拿不到返回 null,workflow 会照样推进(result_text 只是空),不会阻断 attempt
 
-`extractTokensFromTranscript(transcript: string): number`
+`accumulateUsageFromTranscript(transcript: string): AttemptUsageLedger` —— **用量提取的唯一路径**
 
-- 扫描 NDJSON 各事件的 `usage` 字段(`total_tokens`,缺失时按 input+output 相加)
-- 取最大值(最后一条 `type=result` 的 usage 是累计值)
-- 返回值写入 `attempts.tokens_used`(见 workflow extract step),供成本归因与后续 attempt 预算决策
+- **逐事件累加**:遍历该 attempt 的全部 `type === "assistant"` 事件,把每次调用的 `usage` 按字段相加(input / cache_read / output / total)。`total_tokens` 缺失时由 `input + output` 推出(上游恒等式,不是猜)。
+- **完成态与被杀态走同一条路径**。旧实现是「有 result 用 result、没 result 取有效 total 最大的一条 assistant」—— 被墙钟击杀的任务没有 result,于是记成单次调用的量级(r2 实测 input 漏 48.4×、加权漏 54.5×,见 §13.22)。**「最后一次调用」不是合法回落**:它与「会话累计量」是两个不同的量,补过去的误差由「还剩多少调用没被读到」决定,也就是由被杀位置决定。
+- **`type === "result"` 只做对账基准,绝不参与累加**(它已经是累计值,加进去就是双计)。完成态若累加值 ≠ result 累计值 → 抛 `TranscriptLedgerMismatchError`,消息里给出两侧数值、逐字段差值与差异来源候选(不带 usage 的 assistant 条数、部分调用漏报的字段、多条 result、未知类型带 usage 的事件)。**两个候选值都不取**:格式正常时这两个量本该相等,不等说明我们对 transcript 的理解错了(重复/缺失的 usage 事件),取任一侧都是编一个来源不明的数。
+- 字段只在**每次调用都上报**时才进累加结果;部分上报的字段整体留空(部分和是伪装成总量的欠计)。一个 usage 事件都没有 → `usage: null`(=「未记录」,与 0 严格区分)。
+- 产出 `AttemptUsageLedger`:`usage`(累加的四元组)与 `total`(raw total,恒 = `totalFromUsage(usage)`)。**`totalFromUsage()` 是 raw total 的唯一推导处** —— 台账两处消费它(DO 快照 `result.captured.total_tokens`、D1 `attempts.tokens_used`),两处各算一遍就是两套口径(§13.22 第 4 条)。
+- 写入链:workflow extract step 调一次,`tokens` 与 `usage` 都从同一个 ledger 上取 → `REPORT_QUEUE` → DO → `attempts`(成本口径另见 `costWeightedFromUsage`,fresh + output + 0.2×cache,口径不变)。
 
 提取结果写回 `tasks.result_text`(`migrations/0002`),由 `GET /api/tasks/:id/result` 以 `text/plain` 直出。
 
@@ -590,7 +593,7 @@ qwen-code (沙箱内)
 
 ### 记账与审计
 
-- **记账**:workflow 的 extract step 调 `extractTokensFromTranscript` → `recordTokenUsage` → `attempts.tokens_used`;事件 `result.captured` 携带 `total_tokens`
+- **记账**:workflow 的 extract step 调 `accumulateUsageFromTranscript`(逐事件累加,§7.3)→ `recordTokenUsage` → `attempts.tokens_used`;事件 `result.captured` 携带 `total_tokens`(与四元组同源于那次累加)
 - **审计**:完整 stream-json transcript(含每次模型调用的请求/响应)内容寻址落 R2,digest 绑进 evidence manifest;原始模型 I/O 可以从 transcript 还原,不再单独存 `model-io/`
 
 ---
@@ -1802,7 +1805,7 @@ checkout --quiet --detach '<sha>'
 
 **改法(只加不改)**:
 
-- **提取层** `src/exec/extract.ts`:新增 `TranscriptUsage`(字段名与 qwen stream-json 原样对齐,缺的是 `undefined` 不是 0 —— 「上游没说」与「上游说没消耗」是两回事)、`extractUsageFromTranscript()`(在所有携带 usage 的事件里取**有效 total 最大**的一条:type=result 的 usage 是整轮累计值,单次调用不可能超过上下文窗口,故最大值必是累计值)与 `costWeightedFromUsage()`。`extractTokensFromTranscript()` 改为从前者派生,**既有语义逐分支等价**(无 usage → 0;缺 total → input+output;取最大不取最后),既有测试不改一条断言即过。
+- **提取层** `src/exec/extract.ts`:新增 `TranscriptUsage`(字段名与 qwen stream-json 原样对齐,缺的是 `undefined` 不是 0 —— 「上游没说」与「上游说没消耗」是两回事)、用量提取与 `costWeightedFromUsage()`。⚠️ 本节当时落地的提取是「在所有携带 usage 的事件里取**有效 total 最大**的一条」(type=result 是整轮累计值,单次调用超不过上下文窗口,故最大值"必是"累计值)—— 那个推断只对完成态成立,被杀态没有 result,于是悄悄退成「最后一次调用」,漏记 48×。**该启发式已被 §13.22 的逐事件累加取代**,`extractUsageFromTranscript()` / `extractTokensFromTranscript()` 两个函数随之删除。成本口径(`costWeightedFromUsage`,fresh + output + 0.2×cache)未动。
 - **台账层** `AttemptRecord` 与 D1 `attempts` 增加 `input_tokens` / `cache_read_tokens` / `output_tokens` / `cost_weighted_tokens` 四列(`migrations/0004`);`tokens_used` **仍是 raw total**,历史行与既有复盘口径不动。
 - **传递链**:workflow extract step → `REPORT_QUEUE` → DO 全程带 `usage`。reviewer 走 chat completions,把 `prompt_tokens`/`completion_tokens` 规范化成同一形状;上游不下发 `cache_read` → 留空,成本按全 fresh 保守计。verifier 的 transcript 是结构化 JSON 报告(无用量),如实记 null。
 - **读端**:`GET /api/admin/attempts` 透出四列(`proxy_token` / `idempotency_key` 仍绝不进投影);`GET /api/tasks/:id` 的 attempts 投影刻意不动 —— 审计面只改一处。
@@ -1892,6 +1895,34 @@ r11 向量自检:`factor=1` → 6,949,711,**恰等于 raw total**(「缓存与 f
 **再后续(c13):接线接到人手上**。M9.5④ 只走通执行面那一半:被击杀那一轮从不钉证据(`onWriterReport` 里 `routeFailure → return` 在 `pinWriterEvidence` 之前),所以 `/candidate` 对 BLOCKED 恒 404,`patch_complete` 那批字段在 BLOCKED 路径上没有读者。本期补读面(§7.2.2):新增 `GET /api/tasks/:id/rescue`(BLOCKED 专用)与 `getRescueRefs()` / `assembleRescueView()`,落地端 candidate 门同批读 `patch_complete` 拦不可逆动作。**审批口径一字未动** —— `current_evidence` 仍是唯一证据口径、`binding_digest` 组成不变、verified/approved 门禁不变;rescue 视图的 `binding_digest` 恒 `null`、`safe_to_apply` 恒 `false`。测试手法上把 manifest 的材质化从 step 闭包提成 `buildAttemptManifest` 并让 handler 测试直接与它配对,修掉的反模式是「消费者测试配合成 fixture、从不与生产者配对」:c12 的变异验证里 V6/V10/V11 三条因此全绿,现三条均由 `test/rescue-api.test.ts` 钉红(逐条实测过变异,非推断)。V7/V8(`VerifyReport` 的不完整原因与其读端判据)**仍无取证路线**,保持原样未动:被预算击杀的 writer 走不到 verifier,它们是零读者的保险条款,本期既不删也不为它们写测试。
 
 **验证与边界**(2026-09-02 本地):`npm run typecheck` 干净;`npm test` → 21 文件 **354** 条全绿(基线 323 + 新增 31:`test/routing-classify.test.ts` 22 条判据穷举 + `test/routing-do.test.ts` 9 条真 DO 路由)。新增夹具 `test/fixtures/env-transient-report.ts` 保存标本的 `stderr_tail` 形态(四处引文原样保留,其余按 npm 10 的既有输出形态补全,夹具里写明了保真度边界)。DO 侧钉法:`exit 55` → `route_decision{budget_abort,blocked,enforced=true}` + `BLOCKED` + `awaiting_human` + writer attempt 数不变 + 无 `writer.rework_scheduled`;`exit 53` 与 `exit 55` 的 reason 可分辨;shadow 环境签名与同形普通质量失败的**路由行为逐字段等值**(事件种类序列、`verify.rework_scheduled` 的字段集 / reason / attempt_number、attempt 计数、`task.state`),只有分类字段不同;`route_decision` 在链上的位置(`writer.failed` 之后、`task.transition` 之前)、seq 单调、digest 前继,以及 BLOCKED 归档后从 D1 `events` 读回的 canonical 原文与 digest 同值。质量路径一条断言未改即全绿 —— 那就是「语义不变」的回归证据。**变异验证五条**(逐条改坏判据,确认用例真能抓到它声称抓的东西;数字为变红条数,还原后全绿):`EXIT_BUDGET_ABORT` 55→54 → 5 红;删掉环境判据的 `apply.exit_code!==0` 约束 → 1 红(apply 失败被洗成环境问题);`quality_fallback` 模式 enforce→shadow → 4 红(`enforced=true` 断言);删掉 verifier 侧接线 → 3 红(`route_decision` 缺失);预算判据放开到两个角色 → 2 红(role 区分失守 —— verifier 的 53/55 会被当预算到期停成 BLOCKED,把真质量失败洗白)。**prod 未取证**:53/55 分流的可达性由测试证明,真实命中要等下一个撞预算的 attempt;`env_transient` 的 shadow 样本从本版本部署起才开始积累。
+
+---
+
+### 13.22 失败任务的用量必须逐事件累加(M9.5④)— 已实现:累加是唯一提取路径,完成态额外对账
+
+**问题(2026-09-02 prod 取证,任务 `76464e22`)**:§13.20 的提取有两条启发式分支 —— 完成态从 result 事件取会话累计值(实测 C8 writer:input 14,954,778 / cache 14,737,154 / output 75,677 / 加权 3,240,732,与 fresh+output+0.2×cache 精确吻合,完成态确实不漏);被杀任务**没有 result 事件**,于是落到另一条分支:「有效 total 最大的一条 assistant」。单次调用里 total 最大 ≈ 最靠后的那次,记的是**一次调用**的量:
+
+| 口径 | 旧提取归档(= 末次调用) | 按事件流累加的真实会话总量 | 漏 |
+| --- | --- | --- | --- |
+| input | 221,006 | 10,686,994 | **48.4×** |
+| cache_read | 219,186 | (同批事件累加) | — |
+| 成本加权 | 45,818 | 2,495,488 | **54.5×** |
+
+**为什么这不是可以忍的噪声**:漏记只发生在**失败**任务上。被墙钟击杀的 attempt 往往是烧得最久、最贵的那批,而 C8 的路由分类与人工成本审计吃的正是这个数 —— 一个「成功任务准、失败任务低两个数量级」的台账,会把「该收口预算的任务」读成便宜任务。偏差与故障形态相关,就不是误差。
+
+**改法(消灭分支形状,不是换一条更好的启发式)**:
+
+1. **逐事件累加成为唯一提取路径**(`accumulateUsageFromTranscript`,纯函数、不依赖时钟、注入事件数组即可单测):遍历该 attempt 全部 `type === "assistant"` 事件,按字段累加每次调用的 usage。完成态与被杀态**走同一条路径**,不再有任何「有 result 走 A、没 result 走 B」的形状。
+2. **`result` 事件降级为对账基准**,永不参与累加(它已是累计值,加进去即双计)。
+3. **完成态对账(同源测试)**:同一份 transcript 里「逐次调用之和」与「result 的会话累计值」不是两个可互相近似的估计,而是**同一个量的两种记法**。不相等 → 抛 `TranscriptLedgerMismatchError`,消息带上两侧数值、逐字段差值与差异来源候选(不带 usage 的 assistant 条数 / 部分调用漏报的字段 / 多条 result / 未知类型带 usage 的事件),**绝不静默取其一**。判据刻意严格到「字段覆盖不齐以致无法证明相等」也算失败:无法证明相等就不能宣称相等。执行面的处置是**响亮但不越界**:workflow 捕获后把差异原样 `console.error`(`stage=extract-ledger`),台账记 null(=未记录,不是 0),结果文本与补丁照旧回报 —— 一次成功的执行不该被记账分歧毁掉(见 §13.19 的教训:抛在 extract step 会走到 report-blocked,连劳动一起丢)。
+4. **两条口径同源**:DO 快照的 `result.captured.total_tokens` 与 D1 归档四元组由同一个累加产物给出 —— workflow 调一次累加、`tokens` 与 `usage` 都从它身上取;DO 侧用 `totalFromUsage(usage)` 重算而不信消息里那个冗余的 `tokens`,两者不一致时喊 `ledger_total_drift`(不静默改)。这与 p2 的 `resolveBudget` 同一条教训:**两处各算一遍,缺陷就会以新形状复活**。顺带修掉 reviewer 侧同样的形状(`tokens` 不再独立取 `usage.total_tokens`,改从同一规范化对象派生)。
+5. **被杀态钉死在测试里**:r2 向量(3 次调用、无 result、会话合计与取证逐字段相等)断言提取值 = 全部调用之和,且既不等于末次调用也不等于最大一次调用;成本口径仍是 fresh+output+0.2×cache = 2,495,488(旧值 45,818)。C8 向量钉完成态:累加值与 result 累计值同时命中同一组数(14,954,778 / 14,737,154 / 75,677 / 加权 3,240,732)。
+
+**口径澄清**(旧文档靠约定维持、现在由代码保证):单次调用的 `usage.total_tokens = input_tokens + output_tokens`(input 含 cache_read)是**单次值不是累计值**;累加侧的 `total_tokens` 只有在每次调用都可得(直接给或由 input+output 推出)时才进结果,否则留空 —— 部分和不是总量。
+
+**刻意不做**:不改预算/墙钟机制(归 p2)、不改路由分类器判据、不动 Observation 层的 journal/ingest/事件协议(提取的输入是 transcript 与既有事件,只读)、不新增指标/看板/外部告警、不引新依赖。历史行不回填:被杀任务那批旧行的低估留在原地,读端看 §13.20 与本节的取证说明。
+
+验证:`npm run typecheck && npm test` 全绿(30 文件 607 测试;`test/token-ledger.test.ts` 28 条覆盖被杀态/完成态对账/解析卫生/唯一推导处,`test/session-do.test.ts` 新增 2 条钉两口径同源与被击杀 attempt 的台账量级)。
 
 ---
 

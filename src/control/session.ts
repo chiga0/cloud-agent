@@ -10,7 +10,7 @@ import {
   type EvidencePart,
 } from "../audit/evidence";
 import { BASE_ERRORS, isValidSha, isBaseError } from "../exec/base";
-import { costWeightedFromUsage, type TranscriptUsage } from "../exec/extract";
+import { costWeightedFromUsage, totalFromUsage, type TranscriptUsage } from "../exec/extract";
 import type { CandidateDecision, CandidateEvidence } from "../audit/candidate";
 import { assertTransition, attemptDeadline, decideRework, isLegalTransition, nextWatchdogAlarm } from "./statemachine";
 import { BUDGET_CLAMP_EVENT_KIND, budgetClampPayload, resolveBudget } from "./budget";
@@ -733,11 +733,23 @@ export class TaskSession extends DurableObject<Env> {
       }
 
       attempt.finished_at = this.now();
-      attempt.tokens_used = args.tokens ?? 0;
       // 台账同时记「量」与「钱」:tokens_used 保持 raw total 的历史口径,四元组拆分
       // 与成本加权值回答「这些 token 里有多少是缓存命中的」。无 usage 时四列全 null,
       // 与「记录到 0」严格区分 —— 后者是事实,前者是没记过,不能糊成同一个数。
       const usage = args.usage ?? null;
+      // 两口径同源:raw total 恒由执行面**同一个累加函数**吐出的 usage 派生,不在 DO 侧
+      // 重算一遍推导、也不直接信消息里那个冗余的 tokens。reported 与 derived 不一致
+      // 说明 producer 改了口径或漏了字段 —— 当场喊出来,不静默挑一个(两处各算一遍,
+      // 缺陷就会以新形状复活;这与 p2 的 resolveBudget 是同一条教训)。
+      const reported = args.tokens ?? 0;
+      const total = usage === null ? reported : totalFromUsage(usage);
+      if (usage !== null && total !== reported) {
+        console.error(
+          `ledger_total_drift attempt=${args.attempt_id} role=${attempt.role} ` +
+            `reported=${reported} derived_from_usage=${total} usage=${JSON.stringify(usage)}`,
+        );
+      }
+      attempt.tokens_used = total;
       const costWeighted = usage === null ? null : costWeightedFromUsage(usage, this.cacheReadCostFactor());
       attempt.input_tokens = usage?.input_tokens ?? null;
       attempt.cache_read_tokens = usage?.cache_read_input_tokens ?? null;
@@ -796,7 +808,7 @@ export class TaskSession extends DurableObject<Env> {
         attempt_id: args.attempt_id,
         has_text: args.result_text != null,
         length: args.result_text?.length ?? 0,
-        total_tokens: args.tokens ?? 0,
+        total_tokens: total,
         cost_weighted_tokens: costWeighted,
       });
       await this.appendEvent(s, "evidence.manifest", {

@@ -838,6 +838,7 @@ describe("attempt token 台账落库", () => {
   /** writer 回报 → 人工 approve 到 DONE(终态才归档)。usage 原样透传。 */
   async function reportAndArchive(over: {
     usage?: TranscriptUsage | null;
+    tokens?: number;
     exit_code?: number;
     error?: string;
   }): Promise<{ stub: Stub; attempt_id: string }> {
@@ -852,7 +853,7 @@ describe("attempt token 台账落库", () => {
       attempt_id,
       exit_code: over.exit_code ?? 0,
       error: over.error,
-      tokens: R11_USAGE.total_tokens,
+      tokens: over.tokens ?? R11_USAGE.total_tokens,
       usage: over.usage,
       result_text: "已按要求完成",
       manifest_key: `manifests/task/w/${attempt_id}.json`,
@@ -937,6 +938,50 @@ describe("attempt token 台账落库", () => {
     expect(row.state).toBe("BLOCKED");
     expect(row.tokens_used).toBe(6_949_711);
     expect(row.cost_weighted_tokens).toBe(R11_COST);
+  });
+
+  /**
+   * 两口径同源(r2 的 48.4× 漏记就是「两套口径靠约定维持」的代价):
+   * 快照事件里的 total_tokens 与归档四元组必须由**同一个累加产物**给出 ——
+   * DO 侧重算一遍而不是照抄消息里那个冗余的 tokens 字段。
+   */
+  it("reported tokens 与 usage 派生值不一致:两处都取派生值(不各信一遍)", async () => {
+    const { stub, attempt_id } = await reportAndArchive({
+      usage: R11_USAGE,
+      tokens: 221_167, // 旧形状:某一次单调用的 total
+    });
+
+    const row = await ledgerRow(attempt_id);
+    expect(row.tokens_used).toBe(6_949_711);
+    expect(row.cost_weighted_tokens).toBe(R11_COST);
+    const [captured] = payloads((await stub.getSnapshot())!, "result.captured");
+    // 同一个量:快照与归档若来自两次计算,这里就会分叉
+    expect(captured.total_tokens).toBe(row.tokens_used);
+    expect(captured.cost_weighted_tokens).toBe(row.cost_weighted_tokens);
+  });
+
+  it("被击杀 attempt 带逐事件累加的 usage:台账记会话总量而非末次调用", async () => {
+    // r2 任务 76464e22:逐事件累加出的会话总量(旧实现只记到末次调用的量级)
+    const { attempt_id } = await reportAndArchive({
+      usage: {
+        input_tokens: 10_686_994,
+        cache_read_input_tokens: 10_245_632,
+        output_tokens: 5_000,
+        total_tokens: 10_691_994,
+      },
+      tokens: 10_691_994,
+      exit_code: -1,
+      error: "longrun_wall_exceeded",
+    });
+
+    const row = await ledgerRow(attempt_id);
+    expect(row.state).toBe("BLOCKED");
+    expect(row.tokens_used).toBe(10_691_994);
+    expect(row.input_tokens).toBe(10_686_994);
+    expect(row.cache_read_tokens).toBe(10_245_632);
+    // 加权 2,495,488 = fresh 441,362 + output 5,000 + round(10,245,632×0.2);
+    // 旧实现记的是 45,818(漏 54.5×)
+    expect(row.cost_weighted_tokens).toBe(2_495_488);
   });
 });
 

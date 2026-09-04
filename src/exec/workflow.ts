@@ -11,8 +11,8 @@ import { composeAttemptPrompt } from "./prompt";
 import {
   parseReviewVerdict,
   extractResultFromTranscript,
-  extractTokensFromTranscript,
-  extractUsageFromTranscript,
+  accumulateUsageFromTranscript,
+  type AttemptUsageLedger,
   type TranscriptUsage,
 } from "./extract";
 import type { ReviewVerdict } from "../control/gates";
@@ -354,10 +354,31 @@ export class AttemptWorkflow extends WorkflowEntrypoint<Env, AttemptParams> {
           // transcript 已是结构化 JSON 报告,不做 NDJSON 提取
           return { text: raw, tokens: 0, usage: null };
         }
+        // 一次累加,两个口径都从它身上取:分开调用等于允许它们哪天各算各的。
+        // 对账失败(累加值 ≠ result 累计值)时不取任一候选:台账如实记「未记录」,
+        // 把差异原样喊进日志。为什么不整步抛错 —— 一次成功的执行不该被记账分歧毁掉:
+        // 抛在这里会走到 report-blocked,连结果文本和补丁一起丢(r2 的教训是丢劳动,
+        // 不是拿一个可疑的数换回劳动)。丢的是「成本可见性」这一项,且留了响的痕。
+        let ledger: AttemptUsageLedger;
+        try {
+          ledger = accumulateUsageFromTranscript(raw);
+        } catch (err) {
+          console.error(
+            `exec_step_failed stage=extract-ledger task=${p.task_id} attempt=${p.attempt_id} ` +
+              `role=${p.role} err=${String(err).slice(0, 2000)}`,
+          );
+          ledger = {
+            usage: null,
+            total: 0,
+            calls: 0,
+            assistantWithoutUsage: 0,
+            underreportedFields: [],
+          };
+        }
         return {
           text: extractResultFromTranscript(raw),
-          tokens: extractTokensFromTranscript(raw),
-          usage: extractUsageFromTranscript(raw),
+          tokens: ledger.total,
+          usage: ledger.usage,
         };
       });
 
