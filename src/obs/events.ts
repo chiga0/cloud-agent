@@ -301,6 +301,12 @@ const TOOL_TARGET_ORDER = TOOL_TARGET_KEYS.map((t) => ({
  * `bash -c 'curl -H "Authorization: Bearer …" …'`,整串进 journal 就等于把命令行
  * 里的一切外送。代价是判据看不见 flag —— 而「同一句命令换了个 flag 反复跑」正是
  * 空转的典型样子,不该被当成两个不同动作(见 §9.8 与 normalizeTarget)。
+ *
+ * ⚠️ 还有一个已被 prod 样本证实的代价:`&&` / `||` / `;` 在这里只是普通 token 边界,
+ * 所以 `cd X && <任何事>` 一律塌缩成 `cd X`。c14 那个**健康** writer 的 36 次 shell 调用
+ * 里 35 次是这个形状(sed ×15 / grep ×11 / …全被折成同一个键),于是 loop 与 no_progress
+ * 在它启动两分钟内各亮一条黄。修法方向是把 shell 运算符当作**分段边界**、逐段取形状
+ * (泄露面仍是常数),而不是把整行塞进判据 —— 未修之前 §9.8 的 enforce 条件 ④ 不可能达成。
  */
 function commandShape(command: string): string {
   const tokens = command.trim().split(/\s+/).filter((t) => t.length > 0);

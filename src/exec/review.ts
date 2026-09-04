@@ -35,8 +35,16 @@ function normalizeChatUsage(
 /**
  * reviewer 走纯 LLM 调用(无工具):审查是"判断"不是"执行",
  * qwen-code 这类 coding agent 即使被禁止也会执行查询,输出不可控。
- * 直连百炼 compatible-mode 一次性 chat 调用,秒级返回,
- * 天然只产出文本(要求一行 JSON),token 从 usage 字段记账。
+ * 直连百炼 compatible-mode 一次性 chat 调用,天然只产出文本(要求一行 JSON),
+ * token 从 usage 字段记账。
+ *
+ * ⚠️ 「秒级返回」这个前提是错的,prod 台账实测(56 次带首尾时刻的 reviewer attempt):
+ * 墙钟中位 **27.0s**;记下 token 的 50 次最长排到 64.6s(另有一次 08-31 的 250s 无法拆解,
+ * 不计入),而 **6 次 0 token 的全部落在 67.8–71.1s** —— 60s abort + 约 8~11s 排队/step 开销。
+ * 也就是说下面那个 60_000ms 上限正好压在成功延迟的天花板附近:6/56 ≈ 11% 的审查以
+ * `reviewer_unavailable` 收场,且集中在差量大的候选上。更要紧的是 12 这一个码今天同时代表
+ * 三件事(传输失败/超时、非 2xx、响应体解析不了),三者含义与处置完全不同 ——
+ * 分流与上限都归 c15 处理,这里只记账不改动。
  */
 export async function runReviewLLM(
   env: Env,

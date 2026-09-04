@@ -587,7 +587,7 @@ export function renderLivePage(taskId: string, opts: RenderLivePageOptions = {})
 <main>
   <div class="notice">
     停滞判据(<strong>与 Supervisor 共用同一份常量</strong>,推导与实测来源见 §9.8):<strong>红 = 心跳停止超过 ${LIVE_STALL_DANGER_SECONDS}s</strong>(runner 自己停了,高置信);<strong>黄 = 心跳在而模型静默超过 ${LIVE_STALL_WARN_SECONDS}s</strong>(可能只是不产字的长活,所以这一条永不判红)。
-    数据落地节奏由每条心跳自带的 <code>gap_ms</code> 说明(实测中位轮次 33s、22% 的轮次被跳过),不要再假设「每 30s 一次」。
+    数据落地节奏由每条心跳自带的 <code>gap_ms</code> 说明(不要再假设「每 30s 一次」;轮次分布与两个阈值的推导只有一份权威口径:<code>docs/architecture.md</code> §9.8)。
     本页只被动显示,不做判定也不做任何处置 —— 它是投影,权威仍是 TaskSession DO(GET /api/tasks/${displayId})。
   </div>
   <ol id="tl"></ol>
