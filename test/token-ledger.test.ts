@@ -118,6 +118,27 @@ describe("accumulateUsageFromTranscript —— 被杀态(r2:没有 result 也记
     const reversed = accumulateUsageFromTranscript(ndjson(...[...R2_CALLS].reverse())).usage;
     expect(reversed).toEqual(forward);
   });
+
+  // 操作员补用例(审查 M1 变异存活暴露的缺口):被杀态没有对账兜底,部分和若混进
+  // 累加结果就会以「总量」的形状直接进台账。值级断言钉住:部分上报的字段整体留空,
+  // 绝不让 2/3 调用的部分和顶替总量。
+  it("被杀态 + 部分字段:部分和整体留空(值级断言),成本按全 fresh 保守计", () => {
+    const t = ndjson(
+      call(4_985_271, 4_901_330, 20_114),
+      { type: "assistant", message: { usage: { input_tokens: 4_985_271, output_tokens: 20_114, total_tokens: 5_005_385 } } },
+      call(4_984_236, 4_934_494, 35_449),
+    );
+    const ledger = accumulateUsageFromTranscript(t);
+    expect(ledger.calls).toBe(3);
+    expect(ledger.usage).toEqual({
+      input_tokens: 14_954_778,
+      output_tokens: 75_677,
+      total_tokens: 15_030_455,
+    });
+    expect(ledger.usage!.cache_read_input_tokens).toBeUndefined();
+    expect(ledger.underreportedFields).toEqual(["cache_read_input_tokens"]);
+    expect(costWeightedFromUsage(ledger.usage!, 0.2)).toBe(15_030_455);
+  });
 });
 
 describe("accumulateUsageFromTranscript —— 完成态对账(r2 的同源测试)", () => {
