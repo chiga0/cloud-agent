@@ -570,7 +570,23 @@ export class TaskSession extends DurableObject<Env> {
     const instance = await this.env.ATTEMPT_WORKFLOW.create({ id, params });
     record.workflow_instance_id = instance.id;
 
-    await this.ctx.storage.setAlarm(attemptDeadline(record));
+    // c12 排程接线:这一次唤醒**必须**同时是 Supervisor 的一次 tick。
+    //
+    // 为什么改在这里:prod 从上线到 c10 之间零 tick,根因就是 claim 只排了
+    // `attemptDeadline(record)`(纯截止驱动),而带 tick 的续期只存在于 alarm() 尾部 ——
+    // alarm 不到点就永远不醒,醒不到的时候一切都不存在。单 attempt 任务在悬挂期间根本
+    // 不会到点(墙钟 25min + 宽限 5min),于是「每 60s 判一次」这件事从来没发生过。
+    // 排程一律由 nextWatchdogAlarm 推导,不在这里重算 min():两处各算一次「下一次什么
+    // 时候醒」就是这一类失效的母形。
+    const mode = this.supervisorMode();
+    const nextAlarm = nextWatchdogAlarm({
+      running: [record],
+      nowMs: Date.now(),
+      // off 时与 alarm() 尾部同一写法:不传 tick ⇒ 返回截止驱动的续期,与历史逐字段一致
+      // (新 attempt 的 deadline 必然晚于 now + WATCHDOG_MIN_INTERVAL_MS)。
+      supervisorTickMs: mode === "off" ? undefined : this.supervisorTickMs(),
+    });
+    if (nextAlarm != null) await this.ctx.storage.setAlarm(nextAlarm);
     return { attempt_id: id, workflow_instance_id: instance.id };
   }
 
@@ -1920,9 +1936,41 @@ export class TaskSession extends DurableObject<Env> {
     }));
   }
 
+  /**
+   * RPC:读回当前排定的下一次唤醒时刻(只读,不改任何状态)。
+   *
+   * 为什么需要这个窗口:c12 的接线契约本身就是「下一次什么时候醒」(claim 只排截止时刻
+   * 时 prod 零 tick,而那种失效在 tick 本体里**看不见**)。测试侧两条路都堵着 ——
+   * `alarm` 是 workerd 的保留方法名不能 RPC,`stub.getAlarm()` 在 vitest-pool-workers
+   * 里也没实现(receiver does not implement getAlarm)。所以由 DO 自己开一个只读口,
+   * 让「≤ now + tick」这类断言有可能写出来(理由与 supervisorTick() 同一类)。
+   */
+  async peekScheduledAlarm(): Promise<number | null> {
+    // allowUnconfirmed 是 DO 侧的真实选项(alarm 可能还设在上一笔未确认的事务里),
+    // 但这版 @cloudflare/workers-types 的签名里没写它 ——  narrow 一层断言,而不是
+    // 丢掉它:丢了就会在「刚排上还没确认」的窗口里读到 null,那条断言变成偶发红。
+    const storage = this.ctx.storage as unknown as {
+      getAlarm(options?: { allowUnconfirmed?: boolean }): Promise<number | null>;
+    };
+    return storage.getAlarm({ allowUnconfirmed: true });
+  }
+
   // ---- alarm:归档重试 + attempt 超时兜底 ----
 
+  /**
+   * workerd 把 `alarm` 列为保留方法名:它**不能**被 RPC 调用(测试里也就叫不动它)。
+   * 于是整个周期体放在 alarmCycle() 里,`alarm()` 只做一次委托 —— 这样「由真实 alarm
+   * 驱动的 DO 测试」才有可能存在(见 test/supervisor-do.test.ts 里那两条排程断言)。
+   *
+   * 为什么不干脆测 supervisorTick():c10 的教训正是那条**整批绿而 prod 零 tick** ——
+   * RPC 测的是 tick 本体,而失效在排程与周期体的门(terminal 门、归档分支、续期)。
+   * tick 方法自己永远测不到「有没有人被排醒」这件事。
+   */
   async alarm(): Promise<void> {
+    return this.alarmCycle();
+  }
+
+  async alarmCycle(): Promise<void> {
     // alarm 与 RPC 并发:不复用同一临界区,陈旧快照可能把已裁决的任务改写成
     // BLOCKED,并把陈旧行覆盖回 D1 归档。
     return this.ctx.blockConcurrencyWhile(() => this.inCriticalSection(async (s) => {

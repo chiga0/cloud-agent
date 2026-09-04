@@ -30,15 +30,30 @@ export const LONGRUN_LAUNCH_CMD = `bash ${LONGRUN_SCRIPT}`;
 /** 脚本内 cd 失败的专用退出码:把「工作目录不存在」与命令自身失败区分开 */
 export const SCRIPT_CD_FAILED = 96;
 
-export type LongRunStatus =
-  | "starting"
-  | "running"
-  | "completed"
-  | "failed"
-  | "killed"
-  | "error"
+/**
+ * 进程状态的全部取值。**清单只在这里写一份**:Observation 层的心跳 payload(events.ts
+ * 的 HEARTBEAT_STATUS_VALUES)按引用取枚举,而不是抄一份字面量 —— 抄的那份会在
+ * 这里加状态时静默地不再匹配,于是心跳的 status 键悄悄消失,而判据看起来还在工作。
+ */
+export const LONGRUN_STATUSES = [
+  "starting",
+  "running",
+  "completed",
+  "failed",
+  "killed",
+  "error",
   /** 进程记录不存在:从未启动成功,或容器重启后记录消失 */
-  | "missing";
+  "missing",
+] as const;
+
+export type LongRunStatus = (typeof LONGRUN_STATUSES)[number];
+
+/**
+ * poll 相的节拍(毫秒)。这是**唯一的权威副本**:workflow.ts 用它拼 `step.sleep` 的
+ * 时长字符串,supervisor/detect.ts 用它推导「连续缺席几轮算 runner 停了」。
+ * 曾出现同一个「30 秒轮询」在三个文件里各写一遍字面量,于是改节奏 = 静默错位。
+ */
+export const POLL_INTERVAL_MS = 30_000;
 
 export interface ProcessSnapshot {
   status: LongRunStatus;

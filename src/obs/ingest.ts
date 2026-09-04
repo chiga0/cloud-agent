@@ -1,7 +1,10 @@
 /**
- * Observation 层的写路径:poll 相的 transcript 增量摄取。
+ * Observation 层的写路径:poll 相的 transcript 增量摄取 + 每轮一条 runner 心跳。
  *
- * 每轮只做一件事 —— 从**已存游标**起读 transcript 的新增字节,按行产事件,落 R2 段文件。
+ * 每轮做两件事 —— 从**已存游标**起读 transcript 的新增字节,按行产事件;并把本轮的
+ * 进程快照落成一条 kind=heartbeat 的事件(c12)。心跳与转录同拍正是它的要点:判据
+ * 要问「摄取通道还通不通」,只有一条由 runner 每轮无条件写下的时间源答得了(理由见
+ * events.ts 的 OBS_HEARTBEAT_KIND)。传了 snapshot 时空轮也落盘,不传则与 c12 之前一致。
  * 三条硬约束决定了这里的全部形状:
  *
  * 1. 游标存在 journal 的 index.json 里,不在 workflow 的 step 返回值里。
@@ -14,9 +17,9 @@
  *    跳过本轮,下一轮从已存游标重试。把 attempt 弄成 BLOCKED 是权威层的事。
  */
 
-import { LONGRUN_STDOUT } from "../exec/longrun";
+import { LONGRUN_STDOUT, type ProcessSnapshot } from "../exec/longrun";
 import type { Env } from "../types";
-import { obsSecretValues, toAgentEventV1, type AgentEventV1 } from "./events";
+import { obsSecretValues, toAgentEventV1, toHeartbeatEvent, type AgentEventV1 } from "./events";
 import {
   OBS_HEAD_BYTES,
   commitObsCursor,
@@ -37,7 +40,10 @@ export interface ObsIngestResult {
   /** 已消费的 transcript 字节(完整行) */
   offset_bytes: number;
   max_seq: number;
+  /** 本轮落盘的事件条数(transcript 增量 + 可能的一条心跳) */
   events: number;
+  /** 本轮是否落了心跳(只有传了 snapshot 才可能为 true) */
+  heartbeat: boolean;
   /** 留在原地等下一轮拼齐的尾行字节数 */
   tail_held_bytes: number;
   segments_written: string[];
@@ -149,8 +155,14 @@ export async function ingestTranscript(args: {
   secrets?: readonly string[];
   /** 摄取时刻的提供者,测试钉用 */
   now?: () => string;
+  /**
+   * 本轮 poll 已经拿到的进程快照。给了就每轮落一条心跳(见 toHeartbeatEvent):
+   * 「模型不吐字」与「摄取通道停了」必须能分开,而这件事只有 runner 自己说得了。
+   */
+  snapshot?: ProcessSnapshot | null;
 }): Promise<ObsIngestResult> {
   const path = args.path ?? LONGRUN_STDOUT;
+  const roundStartedAtMs = Date.now();
   const now = args.now?.() ?? new Date().toISOString();
   const prev = await loadObsIndex(args.bucket, args.taskId, args.attemptId);
   const content = (await args.reader.readFile(path)).content;
@@ -159,7 +171,43 @@ export async function ingestTranscript(args: {
   const { cursor, bumped, max_seq } = await resolveObsCursor(prev, bytes);
   const window = takeCompleteLines(bytes, cursor.offset_bytes);
 
-  if (window.lines.length === 0) {
+  const transcriptEvents: AgentEventV1[] = window.lines.map((line, i) =>
+    toAgentEventV1({
+      taskId: args.taskId,
+      attemptId: args.attemptId,
+      generation: cursor.generation,
+      seq: max_seq + i + 1,
+      ts: now,
+      line,
+      secrets: args.secrets,
+    }),
+  );
+
+  // 心跳:每轮**恰好一条**,seq 紧接本轮转录增量之后。
+  // 空轮也写 —— 「这一轮什么新内容都没有」正是心跳要记录的事实,而把它记下来只多
+  // 一条几十字节的事件,省掉它换来的是判据失去唯一的时间源。
+  // 没传 snapshot 的调用方(历史形态、单测)走的路径与本轮改动前逐字段一致。
+  const heartbeat =
+    args.snapshot === undefined || args.snapshot === null
+      ? null
+      : toHeartbeatEvent({
+          taskId: args.taskId,
+          attemptId: args.attemptId,
+          generation: cursor.generation,
+          seq: max_seq + transcriptEvents.length + 1,
+          ts: now,
+          snapshot: args.snapshot,
+          round_ms: Math.max(0, Date.now() - roundStartedAtMs),
+          gap_ms: heartbeatGapMs(prev, now),
+        });
+
+  const events = heartbeat === null ? transcriptEvents : [...transcriptEvents, heartbeat];
+  const nextCursor: ObsRoundCursor = {
+    ...cursor,
+    offset_bytes: cursor.offset_bytes + window.consumed_bytes,
+  };
+
+  if (events.length === 0) {
     // 检测到换代但还没有完整行:游标也得提交,否则下一轮又判成换代
     if (bumped) {
       await commitObsCursor(args.bucket, {
@@ -175,27 +223,13 @@ export async function ingestTranscript(args: {
       offset_bytes: cursor.offset_bytes,
       max_seq,
       events: 0,
+      heartbeat: false,
       tail_held_bytes: window.tail_bytes,
       segments_written: [],
       bumped,
     };
   }
 
-  const events: AgentEventV1[] = window.lines.map((line, i) =>
-    toAgentEventV1({
-      taskId: args.taskId,
-      attemptId: args.attemptId,
-      generation: cursor.generation,
-      seq: max_seq + i + 1,
-      ts: now,
-      line,
-      secrets: args.secrets,
-    }),
-  );
-  const nextCursor: ObsRoundCursor = {
-    ...cursor,
-    offset_bytes: cursor.offset_bytes + window.consumed_bytes,
-  };
   const { index, written } = await commitObsRound(args.bucket, {
     taskId: args.taskId,
     attemptId: args.attemptId,
@@ -213,7 +247,8 @@ export async function ingestTranscript(args: {
   }
   console.info(
     `obs_ingest task=${args.taskId} attempt=${args.attemptId} g=${index.generation} ` +
-      `events=${events.length} seq_to=${index.max_seq} offset=${index.offset_bytes} ` +
+      `events=${events.length} heartbeat=${heartbeat === null ? 0 : 1} ` +
+      `seq_to=${index.max_seq} offset=${index.offset_bytes} ` +
       `tail=${window.tail_bytes} segments=${written.length}`,
   );
   return {
@@ -221,10 +256,28 @@ export async function ingestTranscript(args: {
     offset_bytes: index.offset_bytes,
     max_seq: index.max_seq,
     events: events.length,
+    heartbeat: heartbeat !== null,
     tail_held_bytes: window.tail_bytes,
     segments_written: written,
     bumped,
   };
+}
+
+/**
+ * 与上一轮提交的间隔(ms)。心跳每轮一条之后,「上一轮提交」就是「上一条心跳」。
+ *
+ * 为什么取 index.updated_at 而不是给 index.json 新加一个 last_heartbeat_ts 字段:
+ * 同一事实不写第二份 —— commitObsRound/commitObsCursor 本来就把 updated_at 写成本轮
+ * ts;而加字段会让 prod 上已存在的每一份 index 都缺一块,读侧还得兼容两种形状。
+ * 代价是「本轮之前那一轮没落盘」时 gap 会跨两轮 —— 那**正是**要看见的跳过形态,
+ * 不是缺陷。首条心跳或时间戳不可解析 → null(不猜一个值)。
+ */
+function heartbeatGapMs(prev: ObsIndexV1 | null, now: string): number | null {
+  if (!prev) return null;
+  const since = Date.parse(prev.updated_at);
+  const at = Date.parse(now);
+  if (!Number.isFinite(since) || !Number.isFinite(at)) return null;
+  return Math.max(0, at - since);
 }
 
 /**
@@ -236,7 +289,13 @@ export async function ingestTranscript(args: {
  */
 export async function ingestObsBestEffort(
   env: Env,
-  args: { taskId: string; attemptId: string; reader: ObsTranscriptReader },
+  args: {
+    taskId: string;
+    attemptId: string;
+    reader: ObsTranscriptReader;
+    /** 本轮 poll 的进程快照;给了就顺带落一条心跳(见 ingestTranscript 的 snapshot) */
+    snapshot?: ProcessSnapshot | null;
+  },
 ): Promise<ObsIngestResult | null> {
   try {
     return await ingestTranscript({
@@ -244,6 +303,7 @@ export async function ingestObsBestEffort(
       reader: args.reader,
       taskId: args.taskId,
       attemptId: args.attemptId,
+      snapshot: args.snapshot,
       secrets: obsSecretValues(env),
     });
   } catch (err) {

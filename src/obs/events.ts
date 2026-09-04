@@ -17,9 +17,22 @@
  * §9.8:判据要区分「读 A 文件」与「读 B 文件」,而 detect 只能看见这里写下的字节。
  */
 
+import { LONGRUN_STATUSES, type ProcessSnapshot } from "../exec/longrun";
 import type { Env } from "../types";
 
-/** 信封版本。加字段递增此值前必须先想清楚读端点如何兼容旧段文件。 */
+/** 信封版本。加字段递增此值前必须先想清楚读端点如何兼容旧段文件。
+ *
+ * **c12 新增心跳 kind 时刻意不递增**,理由与 c10a(只加可选 payload 键不递增)不同类,
+ * 所以要写清:心跳加的是**kind 取值**而不是信封字段。`v` 管的是「这行 JSON 的信封与
+ * payload 通道长什么样」—— 加/改一个键的意义在于「所有读端点都要按新形状重解析」。
+ * 而 kind 从设计上就是**开放集合**:读端点对不认识的 kind 必须照常返回(否则悬挂前
+ * 最后写出的半结构化输出正好会被丢掉,见 toAgentEventV1),`raw` 的存在就是这条的
+ * 极端形式。递增 v 的代价才是真问题:段文件的 `v` 一旦分裂,所有按 v 分支的读路径
+ * (readObsAttemptEvents 的 decodeJsonl、GET /events、Live 页)都要么拒绝新段、要么
+ * 各写两份解码 —— 用一次版本分裂换「多一个 kind」这条本就被容忍的变化,不划算。
+ * 兼容面:老读端点看到 kind="heartbeat" 会当成一个不认识的可读 kind 原样透出,
+ * 判据侧(c12 的 detect)显式按 kind 排除心跳,不依赖 v。
+ */
 export const OBS_EVENT_V = 1;
 
 /** 自由文本字段截断上限(字符)。2048:够看出 agent 在做什么,不够搬走一个文件。 */
@@ -32,7 +45,28 @@ export const OBS_SECRET_MASK = "***REDACTED***";
 const MIN_MASKABLE_SECRET_CHARS = 8;
 
 /**
- * 事件 kind 的唯一权威清单。取值直接来自 transcript 行类型,`raw` 是「认不出的也留下」。
+ * runner 心跳的 kind 名。操作员文档 §9.5 的字段表用的就是这个名字,两边只有一份。
+ *
+ * **为什么心跳必须由 runner 自己发,而不是拿转录静默当心跳**:transcript 的有无说的是
+ * 「模型这 30 秒有没有吐字」,而判据要问的是「外圈的摄取通道还通不通」。两者在生产里
+ * 会分叉:一个健康 writer 实测出现过 576 秒零新转录条目(c10 取证),那期间 poll 相
+ * 一直在跑、沙箱一直活着 —— 拿静默当心跳会把这段判成「runner 停了」。反过来,poll 循环
+ * 自己卡死(SDK 挂起、isolate 驱逐)时转录也可能是静的,但那**才是** runner 停了。
+ * 只有一条由 runner 每轮无条件写下的时间源,才能把这两种形状分开:心跳断 = 高置信
+ * 「观测通道自己停了」(red);心跳在而转录静 = 低置信「模型没说话」(只 yellow)。
+ */
+export const OBS_HEARTBEAT_KIND = "heartbeat";
+
+/**
+ * 心跳 payload 的 `status` 合法取值 —— 直接引用 longrun.ts 的状态清单,不在此重列。
+ */
+const HEARTBEAT_STATUS_VALUES: readonly string[] = LONGRUN_STATUSES;
+
+/** 心跳 payload 里除 status 外的全部键:一律数值,缺省(null)即不写。 */
+const HEARTBEAT_NUMBER_FIELDS = ["exit_code", "started_at_ms", "round_ms", "gap_ms"] as const;
+
+/**
+ * 事件 kind 的唯一权威清单。前八个取值直接来自 transcript 行类型,`raw` 是「认不出的也留下」。
  * 加一个 kind 只需要改这里 + KIND_OF 的映射,读端点不另立清单。
  */
 export const OBS_EVENT_KINDS = [
@@ -44,6 +78,11 @@ export const OBS_EVENT_KINDS = [
   "result",
   "error",
   "raw",
+  // 心跳不是 transcript 行:obsKindOfLine 永远不会返回它,它由摄取侧每轮显式产一条
+  // (见 toHeartbeatEvent)。它仍然进这一份清单,因为这份清单是 kind 的**唯一权威**
+  // —— 读端点、Live UI 徽章、判据过滤全部派生自它。另立一份「runner 侧 kind」清单
+  // 迟早与这份漂移,而漂移的表现是「新 kind 在某个读面上静默消失」。
+  OBS_HEARTBEAT_KIND,
 ] as const;
 export type ObsEventKind = (typeof OBS_EVENT_KINDS)[number];
 
@@ -60,6 +99,29 @@ export interface AgentEventV1 {
   ts: string;
   kind: ObsEventKind;
   payload: Record<string, unknown>;
+}
+
+/**
+ * 心跳 payload:只允许**枚举与数值**,没有任何自由文本通道。
+ *
+ * 为什么钉得比 transcript 通道还死(那条至少还有 payload.text):心跳每轮一条、由
+ * runner 无条件写、且是判据的时间源 —— 一旦它能带文本,就成为一条**永不关闭的外流面**:
+ * 每 30 秒一次、无人审阅、内容来自沙箱内部。所以这里连 `textField` 都不调用:
+ * status 认不出即整键丢掉(宁缺一个观测维度),数值只认 `typeof === "number"`。
+ *
+ * `round_ms` / `gap_ms` 是这条事件存在的全部意义:把**摄取节奏本身**写进数据。
+ * 在此之前阈值只能靠猜(90/300 的前提「摄取节拍每 30s 一次」就是猜的,实测被证伪);
+ * 有了 gap,下一次改阈值可以先从 journal 里量出来,而不是再猜一遍。
+ */
+function heartbeatPayload(evt: Record<string, unknown>): Record<string, unknown> {
+  const payload: Record<string, unknown> = {};
+  const status = str(evt.status);
+  if (status !== null && HEARTBEAT_STATUS_VALUES.includes(status)) payload.status = status;
+  for (const field of HEARTBEAT_NUMBER_FIELDS) {
+    const value = evt[field];
+    if (typeof value === "number" && Number.isFinite(value)) payload[field] = value;
+  }
+  return payload;
 }
 
 /**
@@ -311,6 +373,9 @@ function sanitizePayload(
   kind: ObsEventKind,
   secrets: readonly string[],
 ): Record<string, unknown> {
+  // 心跳走独立的、更窄的通道:它不来自 transcript,没有任何文本可脱敏。
+  if (kind === OBS_HEARTBEAT_KIND) return heartbeatPayload(evt);
+
   const payload: Record<string, unknown> = {};
 
   for (const [field, want] of Object.entries(SCALAR_FIELDS)) {
@@ -416,6 +481,49 @@ export function toAgentEventV1(args: {
     seq: args.seq,
     ts: args.ts,
     kind,
+    payload,
+  };
+}
+
+/**
+ * 一条 runner 心跳 → AgentEventV1。与 toAgentEventV1 同规约:信封字段由调用方给,
+ * payload 一律经 sanitizePayload(所以心跳不可能绕过白名单)。
+ *
+ * 输入是 longrun 的 ProcessSnapshot(camelCase),这里翻成 journal 的 snake_case:
+ * 观测面的键名必须与「谁在写它」解耦 —— 否则 SDK 改一次字段名,历史段的读法就变了。
+ */
+export function toHeartbeatEvent(args: {
+  taskId: string;
+  attemptId: string;
+  generation: number;
+  seq: number;
+  ts: string;
+  snapshot: ProcessSnapshot;
+  /** 本轮 ingest 在落盘前测得的耗时(ms) */
+  round_ms: number;
+  /** 与上一条心跳的间隔(ms);本 attempt 的第一条心跳为 null */
+  gap_ms: number | null;
+}): AgentEventV1 {
+  const { snapshot } = args;
+  const payload = sanitizePayload(
+    {
+      status: snapshot.status,
+      exit_code: snapshot.exitCode,
+      started_at_ms: snapshot.startedAtMs,
+      round_ms: args.round_ms,
+      gap_ms: args.gap_ms,
+    },
+    OBS_HEARTBEAT_KIND,
+    [],
+  );
+  return {
+    v: OBS_EVENT_V,
+    task_id: args.taskId,
+    attempt_id: args.attemptId,
+    generation: args.generation,
+    seq: args.seq,
+    ts: args.ts,
+    kind: OBS_HEARTBEAT_KIND,
     payload,
   };
 }

@@ -9,7 +9,8 @@ import {
   type ObsIndexV1,
 } from "../src/obs/journal";
 import { ingestObsBestEffort, ingestTranscript, takeCompleteLines, type ObsTranscriptReader } from "../src/obs/ingest";
-import type { AgentEventV1 } from "../src/obs/events";
+import { OBS_HEARTBEAT_KIND, type AgentEventV1 } from "../src/obs/events";
+import type { ProcessSnapshot } from "../src/exec/longrun";
 
 /**
  * Observation 层的存储与游标:R2 段文件 journal + poll 相增量摄取。
@@ -29,6 +30,9 @@ const TASK = "11111111-1111-4111-8111-111111111111";
 const ATTEMPT = "22222222-2222-4222-8222-222222222222";
 const TS = "2026-09-01T00:00:00.000Z";
 const BUCKET = env.ARTIFACTS;
+
+/** poll 相本轮的进程快照:心跳的输入(还在跑、没退出码、启动时刻没拿到)。 */
+const SNAP: ProcessSnapshot = { status: "running", exitCode: null, startedAtMs: null };
 
 /** 假 transcript:长命令的 stdout 是追加写的文件,这里按同样形状造。 */
 function fakeTranscript() {
@@ -425,5 +429,72 @@ describe("摄取失败不杀 poll 相", () => {
       events: 2,
       generation: 1,
     });
+  });
+
+  it("新入参 snapshot 下契约不变:reader 抛错 → null 且不写 index(慢/抛的 reader 不能把 attempt 拖成 BLOCKED)", async () => {
+    const attemptId = freshAttempt();
+    const boom: ObsTranscriptReader = {
+      async readFile() {
+        throw new Error("Sandbox rpc:readFile exceeded 30s");
+      },
+    };
+    expect(
+      await ingestObsBestEffort(env, { taskId: TASK, attemptId, reader: boom, snapshot: SNAP }),
+    ).toBeNull();
+    expect(await loadObsIndex(BUCKET, TASK, attemptId)).toBeNull();
+  });
+});
+
+/**
+ * runner 心跳(c12)的**写路径**。这里钉形状:每轮恰好一条、空轮也写、payload 只有
+ * 枚举与数值、gap 自描述。判据侧的用例在 test/supervisor-detect.test.ts。
+ */
+describe("runner 心跳(每轮一条,payload 只有枚举与数值)", () => {
+  const T0 = "2026-09-01T00:00:00.000Z";
+  const T1 = "2026-09-01T00:00:33.000Z";
+
+  const beat = (taskId: string, attemptId: string, reader: ObsTranscriptReader, now: string) =>
+    ingestTranscript({ bucket: BUCKET, reader, taskId, attemptId, snapshot: SNAP, now: () => now });
+
+  it("一轮转录 + 一条心跳:心跳排在转录之后,seq 连续,首条不带 gap_ms", async () => {
+    const attemptId = freshAttempt();
+    const t = fakeTranscript();
+    t.set(lines(2));
+    const r = await beat(TASK, attemptId, t.reader, T0);
+    expect(r).toMatchObject({ events: 3, heartbeat: true, generation: 1 });
+    const { events } = await readAll(TASK, attemptId);
+    expect(events.map((e) => e.kind)).toEqual(["assistant", "assistant", OBS_HEARTBEAT_KIND]);
+    expect(events.map((e) => e.seq)).toEqual([1, 2, 3]);
+    const hb = events[2];
+    expect(hb.ts).toBe(T0);
+    // 只允许枚举与数值:一个文本键都不许有 —— 心跳一旦能带文本就成了永不关闭的外流面。
+    expect(Object.keys(hb.payload).sort()).toEqual(["round_ms", "status"]);
+    expect(hb.payload.status).toBe("running");
+    expect(typeof hb.payload.round_ms).toBe("number");
+    // 本 attempt 的第一条心跳没有参照点:不猜一个 gap。
+    expect(hb.payload).not.toHaveProperty("gap_ms");
+  });
+
+  it("空轮(转录一字节没长)也写心跳,gap_ms 自描述实测轮次", async () => {
+    const attemptId = freshAttempt();
+    const t = fakeTranscript();
+    t.set(lines(1));
+    expect((await beat(TASK, attemptId, t.reader, T0)).events).toBe(2);
+    const r = await beat(TASK, attemptId, t.reader, T1);
+    expect(r).toMatchObject({ events: 1, heartbeat: true });
+    const { events } = await readAll(TASK, attemptId);
+    const beats = events.filter((e) => e.kind === OBS_HEARTBEAT_KIND);
+    expect(beats).toHaveLength(2);
+    expect(beats[1].payload.gap_ms).toBe(33_000);
+    // 写心跳不许推进字节游标:offset 只按完整行前进。
+    expect(r.offset_bytes).toBe((new TextEncoder().encode(t.text)).byteLength);
+  });
+
+  it("不传 snapshot 的调用方逐字段不变(空轮仍不落任何写)", async () => {
+    const attemptId = freshAttempt();
+    const t = fakeTranscript();
+    const r = await ingest(TASK, attemptId, t.reader);
+    expect(r).toMatchObject({ events: 0, heartbeat: false });
+    expect(await loadObsIndex(BUCKET, TASK, attemptId)).toBeNull();
   });
 });

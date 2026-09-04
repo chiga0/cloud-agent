@@ -1,9 +1,16 @@
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import { env } from "cloudflare:test";
-import type { TaskSession } from "../src/control/session";
+import { TaskSession } from "../src/control/session";
 import type { AgentEventV1 } from "../src/obs/events";
+import { OBS_HEARTBEAT_KIND } from "../src/obs/events";
 import { commitObsRound, obsIndexPath } from "../src/obs/journal";
-import { RULE_STALL_LAST_EVENT_GAP } from "../src/supervisor/detect";
+import { attemptDeadline, WALL_GRACE_SECONDS } from "../src/control/statemachine";
+import {
+  RULE_STALL_AGENT_SILENT,
+  RULE_STALL_LAST_EVENT_GAP,
+  RULE_STALL_NO_HEARTBEAT,
+  SUPERVISOR_DEFAULT_TICK_SECONDS,
+} from "../src/supervisor/detect";
 import { applyMigrations } from "./d1";
 
 /**
@@ -98,7 +105,9 @@ describe("Supervisor shadow(TaskSession DO 内的独立消费者)", () => {
     const tick = await stub.supervisorTick();
     expect(tick.mode).toBe("shadow");
     expect(tick.reported).toHaveLength(1);
-    expect(tick.reported[0]).toMatchObject({ attempt_id: attemptId, kind: "stall", severity: "red" });
+    // 这份夹具里**没有心跳**(= c12 之前落的历史段),所以走的是 downlevel 那条:
+    // 只有 yellow。想要 red 必须有独立时间源可断 —— 见下面 heartbeatJournal 那两条。
+    expect(tick.reported[0]).toMatchObject({ attempt_id: attemptId, kind: "stall", severity: "yellow" });
 
     const after = await stub.getSnapshot();
     // 观察/裁决分离的可执行证据:Supervisor 跑过之后,**裁决面**的字段一个都没动。
@@ -122,7 +131,7 @@ describe("Supervisor shadow(TaskSession DO 内的独立消费者)", () => {
       attempt_id: attemptId,
       kind: "stall",
       rule: RULE_STALL_LAST_EVENT_GAP,
-      severity: "red",
+      severity: "yellow",
       mode: "shadow",
       enforced: false,
     });
@@ -193,5 +202,158 @@ describe("Supervisor shadow(TaskSession DO 内的独立消费者)", () => {
     const snap = await stub.getSnapshot();
     expect(findingsOf(snap!)).toHaveLength(0);
     expect(snap!.task.state).toBe("RUNNING");
+  });
+});
+
+/**
+ * c12 的排程接线。这一组是**从 alarm 驱动**的,不是从 supervisorTick() RPC 驱动的。
+ *
+ * 为什么必须这样测:c10 那一期判据与 DO 测试全绿,而 prod 从头到尾一次 tick 都没发生
+ * —— 因为 `supervisorTick()` 测的是 tick 本体,而缺陷在排程(claim 只排了截止时刻)与
+ * alarm 周期体里的门。tick 方法自己永远测不到「有没有人被排醒」。
+ *
+ * 为什么走 alarmCycle() 而不是 alarm():workerd 把 `alarm` 列为保留方法名,不能 RPC。
+ * 于是周期体整体搬进 alarmCycle(),`alarm()` 只剩一次委托 —— 本组测的就是 prod alarm
+ * 触发时跑的那段代码(含 terminal 门、tick 门、续期),委托那一行由最后一条用例钉形状。
+ */
+
+const TICK_MS = SUPERVISOR_DEFAULT_TICK_SECONDS * 1000;
+
+/**
+ * 一份**有心跳**的 journal:转录事件停在 lastTranscriptAgoMs 之前,最后一条心跳停在
+ * lastBeatAgoMs 之前。心跳 payload 用 ingress 的真实形状(status/round_ms/gap_ms)。
+ */
+async function heartbeatJournal(
+  taskId: string,
+  attemptId: string,
+  args: { lastBeatAgoMs: number; lastTranscriptAgoMs: number },
+): Promise<void> {
+  const transcriptTs = new Date(Date.now() - args.lastTranscriptAgoMs).toISOString();
+  const beatTs = new Date(Date.now() - args.lastBeatAgoMs).toISOString();
+  const events: AgentEventV1[] = [
+    {
+      v: 1,
+      task_id: taskId,
+      attempt_id: attemptId,
+      generation: 1,
+      seq: 1,
+      ts: transcriptTs,
+      kind: "tool_use",
+      payload: { tool_names: ["read_file"], tool_targets: ["src/stuck.ts"] },
+    },
+    {
+      v: 1,
+      task_id: taskId,
+      attempt_id: attemptId,
+      generation: 1,
+      seq: 2,
+      ts: beatTs,
+      kind: OBS_HEARTBEAT_KIND,
+      payload: { status: "running", round_ms: 3_000, gap_ms: 33_000 },
+    },
+  ];
+  await commitObsRound(env.ARTIFACTS, {
+    taskId,
+    attemptId,
+    events,
+    cursor: { generation: 1, offset_bytes: 0, head_len: 0, head_digest: "0".repeat(64) },
+    prev: null,
+    now: new Date().toISOString(),
+  });
+}
+
+describe("排程接线(c12:让 Supervisor 真的会被叫醒)", () => {
+  it("(a) 真实 alarm 周期体跑完 → 链里出现 supervisor_finding", async () => {
+    setMode("shadow");
+    const { stub, taskId, attemptId } = await runningWriterAttempt();
+    // runner 已停 10 分钟(> 红线 180s)、转录也静默 → 判据必须给出 red。
+    await heartbeatJournal(taskId, attemptId, { lastBeatAgoMs: 600_000, lastTranscriptAgoMs: 600_000 });
+    const before = await stub.getSnapshot();
+    expect(findingsOf(before!)).toHaveLength(0);
+
+    await stub.alarmCycle();
+
+    const after = await stub.getSnapshot();
+    const findings = findingsOf(after!);
+    expect(findings.length).toBeGreaterThan(0);
+    expect(findings.map((f) => f.rule)).toContain(RULE_STALL_NO_HEARTBEAT);
+    expect(findings.find((f) => f.rule === RULE_STALL_NO_HEARTBEAT)).toMatchObject({
+      kind: "stall",
+      severity: "red",
+      mode: "shadow",
+      enforced: false,
+    });
+    // 观察/裁决分离:alarm 周期体跑过之后 attempt 仍然 RUNNING(墙钟远未到期)。
+    expect(after!.attempts.map((a) => a.state)).toEqual(["RUNNING"]);
+    expect(after!.task.state).toBe("RUNNING");
+    chainIntact(after!.events);
+  });
+
+  it("(b) claim 后排定的下一次唤醒 ≤ now + tick(直接钉住「从不 tick」这一类失效)", async () => {
+    setMode("shadow");
+    const { stub } = await runningWriterAttempt();
+    const now = Date.now();
+    const scheduled = await stub.peekScheduledAlarm();
+    expect(scheduled).not.toBeNull();
+    expect(scheduled!).toBeLessThanOrEqual(now + TICK_MS);
+    // 也不许密于 WATCHDOG_MIN_INTERVAL_MS:alarm 自旋会白烧 DO 请求。
+    expect(scheduled!).toBeGreaterThan(now);
+  });
+
+  it("(b2) 一次 alarm 周期之后仍持续续期(不是一次性的)", async () => {
+    setMode("shadow");
+    const { stub, taskId, attemptId } = await runningWriterAttempt();
+    await heartbeatJournal(taskId, attemptId, { lastBeatAgoMs: 10_000, lastTranscriptAgoMs: 10_000 });
+    await stub.alarmCycle();
+    const scheduled = await stub.peekScheduledAlarm();
+    expect(scheduled).not.toBeNull();
+    expect(scheduled!).toBeLessThanOrEqual(Date.now() + TICK_MS);
+  });
+
+  it("(b3) mode=off 时排程与历史逐字段一致 = attemptDeadline(回归证据)", async () => {
+    // 不设 SUPERVISOR_MODE:代码缺省 off。这条断言的是「新接线没有改变 off 的排程」——
+    // off 的续期等价性只能这样钉:值必须**恰好等于**截止时刻,而不是「小于等于什么」。
+    const { stub, attemptId } = await runningWriterAttempt();
+    const snap = await stub.getSnapshot();
+    const record = snap!.attempts.find((a) => a.id === attemptId)!;
+    // getSnapshot 的 attempt 是瘦身后的大小写(没有 max_wall_seconds),所以这里按
+    // 夹具的输入重算同一个式子,而不是去放宽 snapshot —— 放宽读端点不是一条测试的权限。
+    const deadline = Date.parse(record.created_at) + (600 + WALL_GRACE_SECONDS) * 1000;
+    const scheduled = await stub.peekScheduledAlarm();
+    expect(scheduled).toBe(deadline);
+    expect(attemptDeadline({ ...record, max_wall_seconds: 600 })).toBe(deadline);
+    expect(scheduled!).toBeGreaterThan(Date.now() + TICK_MS);
+  });
+
+  it("(c) 双判据各一:心跳断→red、心跳在而转录静→只 yellow", async () => {
+    setMode("shadow");
+    // 反向:心跳新鲜、转录静默很久 → 只有 yellow,不得有 red。
+    const alive = await runningWriterAttempt();
+    await heartbeatJournal(alive.taskId, alive.attemptId, {
+      lastBeatAgoMs: 30_000,
+      lastTranscriptAgoMs: 20 * 60_000,
+    });
+    await alive.stub.alarmCycle();
+    const aliveFindings = findingsOf((await alive.stub.getSnapshot())!);
+    expect(aliveFindings.map((f) => f.rule)).toEqual([RULE_STALL_AGENT_SILENT]);
+    expect(aliveFindings[0]).toMatchObject({ severity: "yellow" });
+
+    // 正向:心跳也断了 → 同一轮里 red(no_heartbeat)与 yellow(agent_silent)并存。
+    const dead = await runningWriterAttempt();
+    await heartbeatJournal(dead.taskId, dead.attemptId, {
+      lastBeatAgoMs: 20 * 60_000,
+      lastTranscriptAgoMs: 20 * 60_000,
+    });
+    await dead.stub.alarmCycle();
+    const deadRules = findingsOf((await dead.stub.getSnapshot())!).map((f) => f.rule).sort();
+    expect(deadRules).toEqual([RULE_STALL_AGENT_SILENT, RULE_STALL_NO_HEARTBEAT].sort());
+  });
+
+  it("alarm() 必须仍然委托给 alarmCycle():workerd 禁止 RPC,委托那一行只能钉形状", async () => {
+    // 这条是「测不到」的补偿:委托如果被删,tick 与续期就都不再发生,而 RPC 叫不动 alarm,
+    // 上面的用例反而全绿。所以直接看方法体:它必须是一次 alarmCycle 调用,不掺别的逻辑。
+    const body = TaskSession.prototype.alarm.toString();
+    expect(body).toContain("alarmCycle");
+    expect(typeof TaskSession.prototype.alarmCycle).toBe("function");
   });
 });

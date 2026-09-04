@@ -36,19 +36,24 @@
  * 这句话必须说实话。本模块不改 SSE 端点的任何行为(本期硬约束),也不引入任何临时凭据出口。
  */
 
-import { OBS_EVENT_KINDS } from "./events";
+import { OBS_EVENT_KINDS, OBS_HEARTBEAT_KIND } from "./events";
+import { AGENT_SILENT_YELLOW_MS, NO_HEARTBEAT_RED_MS } from "../supervisor/detect";
 
 /**
- * 停滞阈值(秒)。为什么是 90 / 300:
- * - 新数据的落地节拍是 poll 相每 30s 一次(§9.5),流的尾读节拍 3s。所以「一个正常
- *   前进的任务」相邻事件的最大间隔就是 30s 量级。
- * - 90s = 3 个摄取周期无新增:超出正常抖动,值得让人抬眼看一次 → 黄。
- * - 300s = 10 个摄取周期无新增:与 C2-r6 那次 24 分钟悬挂的形态一致,而 5 分钟正是
- *   本 UI 的验收标本上限 → 红。
- * 这两个数字是**判据**不是配色参数:改它们等于改「什么算异常」,要连同验收标本一起改。
+ * 停滞阈值(秒)。**这里不再有独立的数字,也不再有独立的理由** —— 一律派生自
+ * src/supervisor/detect.ts 里的那份判据(推导算式与实测来源都在那里)。
+ *
+ * 为什么必须共用一份:这两个数字与 Supervisor 的判据回答的是同一个问题(「什么算异常」)。
+ * 从前它们是一份数字、两处字面量、两段理由,于是「摄取节拍每 30s 一次」这个错误前提被
+ * 抄了两遍 —— 而 prod 实测一个**健康** writer 静默过 576s,也就是说旧页面早就在对健康
+ * 任务准备误报。观测面互相矛盾时,人会不再相信任何一面。
+ *
+ * - danger(红)= `no_heartbeat`:**runner 停了** —— 每轮无条件写的那条心跳也没了。
+ * - warn(黄)= `agent_silent`:**模型沉默但 runner 活着** —— 永远只是黄,页面也不许把
+ *   它说成红(理由见 detect.ts 文件头第 3 条)。
  */
-export const LIVE_STALL_WARN_SECONDS = 90;
-export const LIVE_STALL_DANGER_SECONDS = 300;
+export const LIVE_STALL_WARN_SECONDS = AGENT_SILENT_YELLOW_MS / 1000;
+export const LIVE_STALL_DANGER_SECONDS = NO_HEARTBEAT_RED_MS / 1000;
 
 /**
  * 摘要显示上限(字符)。journal 里 payload.text 最长 2048(OBS_TEXT_MAX_CHARS),
@@ -257,6 +262,9 @@ const CSS = `
   .k-result { border-color:#2a5b3a; color:#0b0f14; background:#7ee787; font-weight:700; }
   .k-error { border-color:#d1242f; color:#ffb3ad; background:#4b0d0d; font-weight:700; }
   .k-raw { border-style:dashed; color:#8b949e; }
+  /* runner 心跳:每轮一条、不是模型行为,所以刻意做成最不起眼的一类(细虚线 + 灰)。
+     时间线上它的作用是「证明这一分钟有人在数」,不是内容。 */
+  .k-heartbeat { border-style:dotted; color:#6e7681; background:#11161d; }
   .ev[data-kind="result"] { background:#0f1d13; }
   .ev[data-kind="error"] { background:#1d0f0f; }
   .ev[data-kind="result"] .body, .ev[data-kind="error"] .body { font-weight:600; }
@@ -276,6 +284,9 @@ const JS = `
   var STREAM_URL = __STREAM_URL__;
   var STALL_WARN_SECONDS = __STALL_WARN__;
   var STALL_DANGER_SECONDS = __STALL_DANGER__;
+  // 心跳 kind 的名字由服务端注入:页面与 journal 用的是同一份权威常量(OBS_HEARTBEAT_KIND),
+  // 在这里再写一遍字面量 "heartbeat" 就等于给「改名」留一个静默失效点。
+  var HEARTBEAT_KIND = __HEARTBEAT_KIND__;
   var TEXT_MAX = __TEXT_MAX__;
   var KINDS = __KINDS__;
   var CONN_RULES = __CONN_RULES__;
@@ -288,6 +299,10 @@ const JS = `
   var emptyEl = document.getElementById("empty");
 
   var lastEventMs = null;   // 最新一条**可解析**事件到达时刻(浏览器本地钟)
+  // 最新一条**行为**(非心跳)事件到达时刻。与上一条分开计时是本模块 c12 起的要点:
+  // 「没有新转录」既可能是 agent 挂了,也可能是它在干一件不产字的长活(实测一个健康
+  // writer 静默 576s),只有心跳这条独立时间源能把两者分开。
+  var lastBehavioralMs = null;
   // 页面打开即计时:「一直没有事件」与「事件停了」是同一个故障的两种形状(C2-r6 若发生
   // 在首轮摄取之前,就是前者),所以缺了一条事件也不能把计时器灰在那儿不动 —— 那正好
   // 把最需要看的时间藏起来。参考点退回到打开页面的时刻,数字照旧自增、阈值照旧变色。
@@ -424,6 +439,9 @@ const JS = `
     }
     seen += 1;
     lastEventMs = Date.now();
+    // 心跳也算「runner 活着」的那条时间源(它本身就是为此存在的),
+    // 但绝不能算进「模型在动」那条 —— 否则静默计时永远归零,agent_silent 形同虚设。
+    if (ev.kind !== HEARTBEAT_KIND) lastBehavioralMs = Date.now();
     renderEvent(ev);
     showCounts();
   }
@@ -437,13 +455,27 @@ const JS = `
 
   function tick() {
     if (ended) return;
-    var secs = Math.floor((Date.now() - (lastEventMs === null ? startMs : lastEventMs)) / 1000);
+    var nowMs = Date.now();
+    // 两条时间源、两个说法 —— 这是 c12 对用户最有用的可见差异:
+    // 红只说「runner 停了」(连每轮无条件写的心跳都没了),
+    // 黄只说「模型沉默但 runner 活着」(心跳还在跳,只是没有新转录)。
+    var beatSecs = Math.floor((nowMs - (lastEventMs === null ? startMs : lastEventMs)) / 1000);
+    var quietSecs = Math.floor((nowMs - (lastBehavioralMs === null ? startMs : lastBehavioralMs)) / 1000);
+    if (beatSecs > STALL_DANGER_SECONDS) {
+      stallEl.textContent = "心跳停止 " + beatSecs + "s(runner 停了)";
+      stallEl.className = "pill stall danger";
+      return;
+    }
+    if (quietSecs > STALL_WARN_SECONDS) {
+      stallEl.textContent = "模型静默 " + quietSecs + "s(runner 活着)";
+      stallEl.className = "pill stall warn";
+      return;
+    }
     // 「最后事件」这个字样必须真的在跟新到的事件说话:还没有事件时说的是「等开了页多久」。
     stallEl.textContent = lastEventMs === null
-      ? "尚未收到事件(已等 " + secs + "s)"
-      : "最后事件 " + secs + "s 前";
-    stallEl.className = "pill stall" +
-      (secs > STALL_DANGER_SECONDS ? " danger" : secs > STALL_WARN_SECONDS ? " warn" : "");
+      ? "尚未收到事件(已等 " + beatSecs + "s)"
+      : "最后事件 " + beatSecs + "s 前";
+    stallEl.className = "pill stall";
   }
 
   // 每秒自增:停滞时长必须是**在跑的钟**,不能只在事件到达时刷新 —— 恰恰在悬挂
@@ -519,6 +551,7 @@ export function renderLivePage(taskId: string, opts: RenderLivePageOptions = {})
   const script = JS.replace("__STREAM_URL__", () => scriptJsonString(liveStreamPath(taskId)))
     .replace("__STALL_WARN__", () => String(LIVE_STALL_WARN_SECONDS))
     .replace("__STALL_DANGER__", () => String(LIVE_STALL_DANGER_SECONDS))
+    .replace("__HEARTBEAT_KIND__", () => scriptJsonString(OBS_HEARTBEAT_KIND))
     .replace("__TEXT_MAX__", () => String(LIVE_TEXT_SUMMARY_MAX_CHARS))
     .replace("__KINDS__", () => kindsLiteral)
     // 连接文案表整体注入:页面与单测读同一份 LIVE_CONN_RULES,不留第二份文案。
@@ -545,8 +578,8 @@ export function renderLivePage(taskId: string, opts: RenderLivePageOptions = {})
 </header>
 <main>
   <div class="notice">
-    停滞判据:<strong>最后事件超过 ${LIVE_STALL_WARN_SECONDS}s → 黄,超过 ${LIVE_STALL_DANGER_SECONDS}s → 红</strong>。
-    新数据的落地节拍是每 30s 一次(poll 相增量摄取),所以红色就等于「十多个摄取周期没有任何新事件」。
+    停滞判据(<strong>与 Supervisor 共用同一份常量</strong>,推导与实测来源见 §9.8):<strong>红 = 心跳停止超过 ${LIVE_STALL_DANGER_SECONDS}s</strong>(runner 自己停了,高置信);<strong>黄 = 心跳在而模型静默超过 ${LIVE_STALL_WARN_SECONDS}s</strong>(可能只是不产字的长活,所以这一条永不判红)。
+    数据落地节奏由每条心跳自带的 <code>gap_ms</code> 说明(实测中位轮次 33s、22% 的轮次被跳过),不要再假设「每 30s 一次」。
     本页只被动显示,不做判定也不做任何处置 —— 它是投影,权威仍是 TaskSession DO(GET /api/tasks/${displayId})。
   </div>
   <ol id="tl"></ol>

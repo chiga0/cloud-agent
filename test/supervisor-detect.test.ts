@@ -1,12 +1,20 @@
 import { describe, expect, it } from "vitest";
-import { toAgentEventV1, type AgentEventV1 } from "../src/obs/events";
+import { toAgentEventV1, OBS_HEARTBEAT_KIND, type AgentEventV1 } from "../src/obs/events";
+import { POLL_INTERVAL_MS } from "../src/exec/longrun";
 import { LIVE_STALL_DANGER_SECONDS, LIVE_STALL_WARN_SECONDS } from "../src/obs/live";
 import {
+  AGENT_SILENT_YELLOW_MS,
   detectSupervisor,
+  HEARTBEAT_ROUND_MS,
+  MEASURED_ROUND_MAX_MS,
+  NO_HEARTBEAT_MISS_ROUNDS,
+  NO_HEARTBEAT_RED_MS,
   normalizeTarget,
   RULE_LOOP_TOOL_REPEAT,
   RULE_NO_PROGRESS_TARGET_REPEAT,
+  RULE_STALL_AGENT_SILENT,
   RULE_STALL_LAST_EVENT_GAP,
+  RULE_STALL_NO_HEARTBEAT,
   selectFindingsToEmit,
   supervisorFindingPayload,
   supervisorModeOf,
@@ -52,6 +60,122 @@ function evt(over: Partial<AgentEventV1> & { seq: number }): AgentEventV1 {
   };
 }
 
+describe("stall · no_heartbeat(心跳这条独立时间源)", () => {
+  /** 一条心跳:ts 可控,payload 用 ingress 的真实形状(见 toHeartbeatEvent)。 */
+  function beat(seq: number, tsMs: number, roundMs = 33_000): AgentEventV1 {
+    return evt({
+      seq,
+      kind: OBS_HEARTBEAT_KIND,
+      ts: new Date(tsMs).toISOString(),
+      payload: { status: "running", exit_code: null as never, round_ms: roundMs },
+    });
+  }
+
+  it("红线由 POLL_INTERVAL 一侧派生:5 轮 × 33s → 取整到 tick = 180s", () => {
+    // 钉住「阈值是派生的」这件事本身:改 POLL_INTERVAL_MS 或轮数,秒数必须跟着动。
+    expect(HEARTBEAT_ROUND_MS).toBeGreaterThanOrEqual(POLL_INTERVAL_MS);
+    expect(NO_HEARTBEAT_RED_MS).toBe(
+      Math.ceil((NO_HEARTBEAT_MISS_ROUNDS * HEARTBEAT_ROUND_MS) / (SUPERVISOR_DEFAULT_TICK_SECONDS * 1000)) *
+        SUPERVISOR_DEFAULT_TICK_SECONDS *
+        1000,
+    );
+    expect(NO_HEARTBEAT_RED_MS).toBe(180_000);
+    // 阈值与实测最坏轮次的比值:必须明显大于 1 次抖动,否则「一次跳过即误红」。
+    expect(NO_HEARTBEAT_RED_MS).toBeGreaterThan(MEASURED_ROUND_MAX_MS * 1.5);
+  });
+
+  it("最后一条心跳滞后超过红线 → red", () => {
+    const events = [
+      evt({ seq: 1, ts: new Date(NOW - 400_000).toISOString() }),
+      beat(2, NOW - (NO_HEARTBEAT_RED_MS + 1)),
+    ];
+    const f = findingsOf(detectSupervisor({ now_ms: NOW, events }), RULE_STALL_NO_HEARTBEAT);
+    expect(f?.severity).toBe("red");
+    expect(f?.evidence.heartbeat_gap_ms).toBe(NO_HEARTBEAT_RED_MS + 1);
+    expect(f?.evidence.has_heartbeat).toBe(true);
+    expect(f?.evidence.last_heartbeat_ts).toBe(events[1].ts);
+  });
+
+  it("心跳在跳(哪怕转录静默)→ 绝不报 no_heartbeat", () => {
+    // 这是本棒的核心取舍:健康 writer 实测静默 576s,期间 runner 一直活着。
+    const events = [
+      evt({ seq: 1, ts: new Date(NOW - 576_000).toISOString() }),
+      beat(2, NOW - 33_000),
+    ];
+    expect(findingsOf(detectSupervisor({ now_ms: NOW, events }), RULE_STALL_NO_HEARTBEAT)).toBeUndefined();
+  });
+
+  it("恰好等于红线不报(严格大于)", () => {
+    const events = [beat(1, NOW - NO_HEARTBEAT_RED_MS)];
+    expect(findingsOf(detectSupervisor({ now_ms: NOW, events }), RULE_STALL_NO_HEARTBEAT)).toBeUndefined();
+  });
+});
+
+describe("stall · agent_silent(心跳在、转录静默)", () => {
+  function beat(seq: number, tsMs: number): AgentEventV1 {
+    return evt({ seq, kind: OBS_HEARTBEAT_KIND, ts: new Date(tsMs).toISOString(), payload: { status: "running", round_ms: 33_000 } });
+  }
+
+  it("超过黄线 → 只 yellow,永不 red", () => {
+    const events = [
+      evt({ seq: 1, ts: new Date(NOW - (AGENT_SILENT_YELLOW_MS + 1_000)).toISOString() }),
+      beat(2, NOW - 30_000),
+    ];
+    const f = findingsOf(detectSupervisor({ now_ms: NOW, events }), RULE_STALL_AGENT_SILENT);
+    expect(f?.severity).toBe("yellow");
+    expect(f?.evidence.transcript_gap_ms).toBe(AGENT_SILENT_YELLOW_MS + 1_000);
+    // 心跳新鲜 ⇒ 同一次判定里不能同时出 no_heartbeat:两个规则各管一条时间源。
+    expect(findingsOf(detectSupervisor({ now_ms: NOW, events }), RULE_STALL_NO_HEARTBEAT)).toBeUndefined();
+  });
+
+  it("健康阈值:实测健康 writer 的 576s 静默不得触发黄", () => {
+    const events = [
+      evt({ seq: 1, ts: new Date(NOW - 576_000).toISOString() }),
+      beat(2, NOW - 30_000),
+    ];
+    expect(findingsOf(detectSupervisor({ now_ms: NOW, events }), RULE_STALL_AGENT_SILENT)).toBeUndefined();
+  });
+
+  it("整段只有心跳(还没有转录)→ 参照点是首条心跳,不是「无穷大滞后」", () => {
+    // 误报防线①的新形态:拿不到转录 ≠ 卡住。起跑后 10 分钟只有心跳 → 不报。
+    const events = [beat(1, NOW - 600_000), beat(2, NOW - 30_000)];
+    expect(findingsOf(detectSupervisor({ now_ms: NOW, events }), RULE_STALL_AGENT_SILENT)).toBeUndefined();
+    // 而首条心跳距今超过黄线 → 报 yellow(观察开始就没动过)。
+    const long = [beat(1, NOW - (AGENT_SILENT_YELLOW_MS + 5_000)), beat(2, NOW - 30_000)];
+    expect(findingsOf(detectSupervisor({ now_ms: NOW, events: long }), RULE_STALL_AGENT_SILENT)?.severity).toBe("yellow");
+  });
+});
+
+describe("stall · last_event_gap(downlevel:无心跳的历史段)", () => {
+  it("无心跳段:只给 yellow,永不 red(没有独立时间源就不许分级)", () => {
+    const events = [evt({ seq: 1, ts: new Date(NOW - 24 * 60_000).toISOString() })];
+    const f = findingsOf(detectSupervisor({ now_ms: NOW, events }), RULE_STALL_LAST_EVENT_GAP);
+    expect(f?.severity).toBe("yellow");
+    expect(f?.evidence.has_heartbeat).toBe(false);
+    expect(f?.evidence.gap_ms).toBe(1_440_000);
+  });
+
+  it("黄线与 agent_silent 同一份常量(不留第二个数字)", () => {
+    expect(SUPERVISOR_THRESHOLDS.agent_silent_yellow_ms).toBe(LIVE_STALL_WARN_SECONDS * 1000);
+    expect(SUPERVISOR_THRESHOLDS.no_heartbeat_red_ms).toBe(LIVE_STALL_DANGER_SECONDS * 1000);
+  });
+
+  it("有心跳的段上这条不再参与:分级交给两条新判据", () => {
+    const events = [
+      evt({ seq: 1, ts: new Date(NOW - 24 * 60_000).toISOString() }),
+      evt({ seq: 2, kind: OBS_HEARTBEAT_KIND, ts: new Date(NOW - 30_000).toISOString(), payload: { status: "running" } }),
+    ];
+    expect(findingsOf(detectSupervisor({ now_ms: NOW, events }), RULE_STALL_LAST_EVENT_GAP)).toBeUndefined();
+  });
+});
+
+describe("阈值与实测同源(live.ts 只引用不重述)", () => {
+  it("Live 页面的秒数就是判据的毫秒数 / 1000", () => {
+    expect(LIVE_STALL_WARN_SECONDS * 1000).toBe(SUPERVISOR_THRESHOLDS.agent_silent_yellow_ms);
+    expect(LIVE_STALL_DANGER_SECONDS * 1000).toBe(SUPERVISOR_THRESHOLDS.no_heartbeat_red_ms);
+  });
+});
+
 /** 一条正常心跳的事件流:最后一条在 now-10s,不会触发 stall。 */
 function healthy(n = 3) {
   return Array.from({ length: n }, (_, i) => evt({ seq: i + 1 }));
@@ -61,58 +185,9 @@ function stallOf(findings: SupervisorFinding[]) {
   return findings.find((f) => f.kind === "stall");
 }
 
-describe("stall(心跳:最后一条观测事件距今多久)", () => {
-  it("人眼阈值与 Supervisor 阈值同一口径", () => {
-    // 两套阈值一旦漂移,会出现「Live UI 早就红了而 Supervisor 一声不响」
-    expect(SUPERVISOR_THRESHOLDS.stall_yellow_ms).toBe(LIVE_STALL_WARN_SECONDS * 1000);
-    expect(SUPERVISOR_THRESHOLDS.stall_red_ms).toBe(LIVE_STALL_DANGER_SECONDS * 1000);
-  });
-
-  it("gap 超过 yellow 未过 red → 一条 yellow,证据带精确 gap", () => {
-    const events = [evt({ seq: 1, ts: new Date(NOW - 120_000).toISOString() })];
-    const findings = detectSupervisor({ now_ms: NOW, events });
-    const stall = stallOf(findings);
-    expect(stall?.severity).toBe("yellow");
-    expect(stall?.rule).toBe(RULE_STALL_LAST_EVENT_GAP);
-    expect(stall?.evidence.gap_ms).toBe(120_000);
-    expect(stall?.evidence.last_event_ts).toBe(events[0].ts);
-    expect(stall?.evidence.window_size).toBe(1);
-  });
-
-  it("gap 超过 red → red(C2-r6 那次 24 分钟悬挂的形态)", () => {
-    const events = [evt({ seq: 1, ts: new Date(NOW - 24 * 60_000).toISOString() })];
-    const stall = stallOf(detectSupervisor({ now_ms: NOW, events }));
-    expect(stall?.severity).toBe("red");
-    expect(stall?.evidence.gap_ms).toBe(1_440_000);
-  });
-
-  it("健康(gap 10s)不报 stall", () => {
-    expect(stallOf(detectSupervisor({ now_ms: NOW, events: healthy() }))).toBeUndefined();
-  });
-
-  it("恰好等于阈值不报(严格大于)", () => {
-    const atYellow = [evt({ seq: 1, ts: new Date(NOW - SUPERVISOR_THRESHOLDS.stall_yellow_ms).toISOString() })];
-    expect(stallOf(detectSupervisor({ now_ms: NOW, events: atYellow }))).toBeUndefined();
-
-    // 恰好等于 red 不报 red,但**仍然 > yellow** → 落 yellow。档位的判据是「超过哪一档」,
-    // 不是「等于哪一档」:等于 red 的时刻确实已经越过了 yellow 那条线。
-    const atRed = [evt({ seq: 1, ts: new Date(NOW - SUPERVISOR_THRESHOLDS.stall_red_ms).toISOString() })];
-    expect(stallOf(detectSupervisor({ now_ms: NOW, events: atRed }))?.severity).toBe("yellow");
-  });
-
-  it("阈值 +1ms 立刻报:边界两侧各钉一次", () => {
-    const yellowEdge = [evt({ seq: 1, ts: new Date(NOW - (SUPERVISOR_THRESHOLDS.stall_yellow_ms + 1)).toISOString() })];
-    expect(stallOf(detectSupervisor({ now_ms: NOW, events: yellowEdge }))?.severity).toBe("yellow");
-    const redEdge = [evt({ seq: 1, ts: new Date(NOW - (SUPERVISOR_THRESHOLDS.stall_red_ms + 1)).toISOString() })];
-    expect(stallOf(detectSupervisor({ now_ms: NOW, events: redEdge }))?.severity).toBe("red");
-  });
-
-  it("注入时钟下 gap 精确到毫秒", () => {
-    const ts = "2026-09-03T00:00:00.123Z";
-    const stall = stallOf(detectSupervisor({ now_ms: Date.parse(ts) + 91_000, events: [evt({ seq: 1, ts })] }));
-    expect(stall?.evidence.gap_ms).toBe(91_000);
-  });
-});
+function findingsOf(findings: SupervisorFinding[], rule: string) {
+  return findings.find((f) => f.rule === rule);
+}
 
 describe("误报防线(没有证据 ≠ 卡住了)", () => {
   it("events 为空 → 不报 stall,返回空数组", () => {
@@ -233,12 +308,73 @@ describe("多判据并存", () => {
       ...Array.from({ length: n }, (_, i) =>
         evt({ seq: i + 1, payload: { tool_names: ["run_shell_command"], tool_targets: ["npm test"] } }),
       ),
-      // 最后一次动作停在 30 分钟前:stall red
+      // 最后一次动作停在 30 分钟前、且这段 journal 没有心跳 → downlevel yellow
       evt({ seq: 99, ts: new Date(NOW - 30 * 60_000).toISOString(), payload: { tool_names: ["run_shell_command"], tool_targets: ["npm test"] } }),
     ];
     const findings = detectSupervisor({ now_ms: NOW, events });
     expect(findings.map((f) => f.kind).sort()).toEqual(["loop", "stall"]);
-    expect(stallOf(findings)?.severity).toBe("red");
+    expect(stallOf(findings)?.severity).toBe("yellow");
+    expect(stallOf(findings)?.rule).toBe(RULE_STALL_LAST_EVENT_GAP);
+  });
+
+  it("同一轮里 no_heartbeat 与 agent_silent 可以并存(runner 与模型一起停)", () => {
+    const beatOld = (seq: number) =>
+      evt({ seq, kind: OBS_HEARTBEAT_KIND, ts: new Date(NOW - 20 * 60_000).toISOString(), payload: { status: "running" } });
+    const events = [
+      evt({ seq: 1, ts: new Date(NOW - 25 * 60_000).toISOString() }),
+      beatOld(2),
+    ];
+    const findings = detectSupervisor({ now_ms: NOW, events });
+    expect(findings.map((f) => f.rule).sort()).toEqual([RULE_STALL_AGENT_SILENT, RULE_STALL_NO_HEARTBEAT].sort());
+    // 两条各自一档:red 只来自心跳断,yellow 只来自转录静默。
+    expect(findings.find((f) => f.rule === RULE_STALL_NO_HEARTBEAT)?.severity).toBe("red");
+    expect(findings.find((f) => f.rule === RULE_STALL_AGENT_SILENT)?.severity).toBe("yellow");
+  });
+});
+
+describe("心跳不进 loop / no_progress 的滑窗(必须排除)", () => {
+  /** 一串只有心跳的 journal:一个 25 分钟任务会产 ~45 条,窗口 20/30 条会被心跳填满。 */
+  function beatsOnly(n: number, stepMs = 33_000): AgentEventV1[] {
+    return Array.from({ length: n }, (_, i) =>
+      evt({
+        seq: i + 1,
+        kind: OBS_HEARTBEAT_KIND,
+        ts: new Date(NOW - (n - i) * stepMs).toISOString(),
+        payload: { status: "running", round_ms: 3_000, gap_ms: stepMs },
+      }),
+    );
+  }
+
+  it("一串心跳不推进 loop/no_progress(否则每个健康任务都被判空转)", () => {
+    const findings = detectSupervisor({ now_ms: NOW, events: beatsOnly(45) });
+    // 45 条心跳 = 25 分钟里模型一条转录没产 → 允许报的是 agent_silent(黄),
+    // 行为类判据必须一条都不许有:它们看到的窗全被心跳填满的话就是筛子。
+    expect(findings.map((f) => f.kind).sort()).toEqual(["stall"]);
+    expect(findings.map((f) => f.rule)).toEqual([RULE_STALL_AGENT_SILENT]);
+  });
+
+  it("心跳混在真循环里也不改变计数(既不多算也不少算)", () => {
+    const n = SUPERVISOR_THRESHOLDS.loop_repeat_max;
+    const loop = Array.from({ length: n }, (_, i) =>
+      evt({ seq: i + 1, payload: { tool_names: ["read_file"], tool_targets: ["src/a.ts"] } }),
+    );
+    // 交错插进心跳:窗口的条数上限会被心跳吃掉,排除后仍应按行为事件计数命中 loop。
+    const mixed = loop.flatMap((e, i) => [e, ...beatsOnly(2).map((b) => ({ ...b, seq: 100 + i }))]);
+    const without = detectSupervisor({ now_ms: NOW, events: loop });
+    const withBeats = detectSupervisor({ now_ms: NOW, events: mixed });
+    expect(without.find((f) => f.kind === "loop")?.evidence.repeat_count).toBe(n);
+    expect(withBeats.find((f) => f.kind === "loop")?.evidence.repeat_count).toBe(n);
+    expect(withBeats.find((f) => f.kind === "loop")?.evidence.has_heartbeat).toBe(true);
+  });
+
+  it("同样的心跳仍要让 agent_silent 计时正确(排除≠丢弃时间源)", () => {
+    // 转录只有一条 20 分钟前的动作,心跳一直新 → 只报 agent_silent,不报行为类判据。
+    const events = [
+      evt({ seq: 1, ts: new Date(NOW - 20 * 60_000).toISOString() }),
+      ...beatsOnly(6, 30_000),
+    ];
+    const findings = detectSupervisor({ now_ms: NOW, events });
+    expect(findings.map((f) => f.rule)).toEqual([RULE_STALL_AGENT_SILENT]);
   });
 });
 
@@ -376,9 +512,12 @@ describe("ingress ↔ 判据的同一条缝(transcript 行 → sanitize → dete
   it("真实 transcript 里 loop 与 stall 可以并存(悬挂前在转圈)", () => {
     const events = ingest(
       Array.from({ length: n }, () => toolLine("edit", { file_path: "src/a.ts" })),
-    ).map((e, i) => ({ ...e, ts: new Date(NOW - (n - i + 2) * 60_000).toISOString() }));
+    ).map((e, i) => ({ ...e, ts: new Date(NOW - (n - i + 2) * 10 * 60_000).toISOString() }));
     const findings = detectSupervisor({ now_ms: NOW, events });
+    // 最后一行停在 30 分钟前、且这批段里没有心跳(downlevel)→ stall 一档 yellow。
+    // 旧的 300s 红线在这里会报 red,而那正是「对健康任务准备误报」的来源。
     expect(findings.map((f) => f.kind).sort()).toEqual(["loop", "stall"]);
+    expect(findings.find((f) => f.kind === "stall")?.severity).toBe("yellow");
   });
 });
 
@@ -388,7 +527,14 @@ function finding(severity: "yellow" | "red"): SupervisorFinding {
     kind: "stall",
     rule: RULE_STALL_LAST_EVENT_GAP,
     severity,
-    evidence: { last_event_ts: new Date(NOW).toISOString(), gap_ms: 120_000, window_size: 1 },
+    evidence: {
+      last_event_ts: new Date(NOW).toISOString(),
+      gap_ms: 120_000,
+      window_size: 1,
+      // 去重层不关心判据形状,但 SupervisorEvidence 的 has_heartbeat 是必填:它决定了
+      // shadow 样本怎么分段,所以「随手造一条 finding」的夹具也得如实带上。
+      has_heartbeat: false,
+    },
   };
 }
 

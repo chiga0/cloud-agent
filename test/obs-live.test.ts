@@ -3,7 +3,8 @@ import { createExecutionContext, env } from "cloudflare:test";
 import worker from "../src/index";
 import { TaskSession } from "../src/control/session";
 import { ingestTranscript, type ObsTranscriptReader } from "../src/obs/ingest";
-import { OBS_EVENT_KINDS, type AgentEventV1 } from "../src/obs/events";
+import { OBS_EVENT_KINDS, OBS_HEARTBEAT_KIND, type AgentEventV1 } from "../src/obs/events";
+import { SUPERVISOR_THRESHOLDS } from "../src/supervisor/detect";
 import {
   ES_READY_STATE_CLOSED,
   ES_READY_STATE_CONNECTING,
@@ -95,11 +96,17 @@ describe("GET /live/:taskId", () => {
     expect(body).toContain("EventSource");
     expect(body).toContain(`/api/tasks/${taskId}/events/stream`);
     expect(body).toContain("最后事件");
-    // 阈值是判据,必须能在产物里读到具体数字(缺省渲染成 JS 常量声明)
-    expect(LIVE_STALL_WARN_SECONDS).toBe(90);
-    expect(LIVE_STALL_DANGER_SECONDS).toBe(300);
-    expect(body).toContain(`var STALL_WARN_SECONDS = 90;`);
-    expect(body).toContain(`var STALL_DANGER_SECONDS = 300;`);
+    // 阈值是判据,必须能在产物里读到具体数字(缺省渲染成 JS 常量声明)。
+    // c12 起这两个数**不再是页面自己的数字**:派生自 supervisor/detect 的那份判据
+    // (见 detect.ts 的推导注释)。这里钉的就是「页面没有第二份理由」。
+    expect(LIVE_STALL_WARN_SECONDS * 1000).toBe(SUPERVISOR_THRESHOLDS.agent_silent_yellow_ms);
+    expect(LIVE_STALL_DANGER_SECONDS * 1000).toBe(SUPERVISOR_THRESHOLDS.no_heartbeat_red_ms);
+    expect(body).toContain(`var STALL_WARN_SECONDS = ${LIVE_STALL_WARN_SECONDS};`);
+    expect(body).toContain(`var STALL_DANGER_SECONDS = ${LIVE_STALL_DANGER_SECONDS};`);
+    // 两种异常在页面上必须是两个说法:红 = runner 停了,黄 = 模型沉默但 runner 活着。
+    expect(body).toContain("runner 停了");
+    expect(body).toContain("runner 活着");
+    expect(body).toContain(`var HEARTBEAT_KIND = "${OBS_HEARTBEAT_KIND}";`);
     expect(body).toContain(`var TEXT_MAX = ${LIVE_TEXT_SUMMARY_MAX_CHARS};`);
     // 规格点名要显示的东西:徽章清单、end 帧文案、坏帧计数、tool_names/raw_type
     for (const kind of OBS_EVENT_KINDS) expect(body).toContain(`>${kind}<`);
