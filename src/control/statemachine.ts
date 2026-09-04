@@ -54,7 +54,8 @@ export function attemptDeadline(a: { created_at: string; max_wall_seconds: numbe
  * 传了则取两者更早的那个:模型悬挂 24 分钟(C2-r6)时墙钟还剩十几分钟,截止驱动的
  * alarm 在悬挂期间根本不会触发,Supervisor 拿不到判断机会;tick 让它每 60s 醒一次。
  * tick 不早于 WATCHDOG_MIN_INTERVAL_MS:alarm 自旋会白烧 DO 请求,而 60s 已是最细的
- * 有效观测节拍(摄取本身 30s 一轮,更密的 tick 看不到新事件)。
+ * 有效观测节拍(新事件按 poll 相一轮一拍落地,实测中位 33s 且 22% 的轮次会被跳过 ——
+ * 更密的 tick 大概率只是把同一批事件重读一遍)。
  */
 export function nextWatchdogAlarm(args: {
   running: Array<{ created_at: string; max_wall_seconds: number }>;

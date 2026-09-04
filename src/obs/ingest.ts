@@ -2,9 +2,9 @@
  * Observation 层的写路径:poll 相的 transcript 增量摄取 + 每轮一条 runner 心跳。
  *
  * 每轮做两件事 —— 从**已存游标**起读 transcript 的新增字节,按行产事件;并把本轮的
- * 进程快照落成一条 kind=heartbeat 的事件(c12)。心跳与转录同拍正是它的要点:判据
+ * 进程快照落成一条 kind=heartbeat 的事件(c10b)。心跳与转录同拍正是它的要点:判据
  * 要问「摄取通道还通不通」,只有一条由 runner 每轮无条件写下的时间源答得了(理由见
- * events.ts 的 OBS_HEARTBEAT_KIND)。传了 snapshot 时空轮也落盘,不传则与 c12 之前一致。
+ * events.ts 的 OBS_HEARTBEAT_KIND)。传了 snapshot 时空轮也落盘,不传则与 c10b 之前一致。
  * 三条硬约束决定了这里的全部形状:
  *
  * 1. 游标存在 journal 的 index.json 里,不在 workflow 的 step 返回值里。
@@ -144,7 +144,8 @@ export async function resolveObsCursor(
 
 /**
  * 一轮增量摄取。调用方(workflow 的 poll step)不需要携带任何游标:状态全在 journal 里。
- * 无新增完整行时不落任何写 —— 30s 一次的空轮询不该把 R2 刷满小对象。
+ * 无新增完整行时:**不传 `snapshot`** 的调用方不落任何写(空轮询不该把 R2 刷满小对象);
+ * 传了 `snapshot` 则仍要落那一条心跳 —— 「这一轮什么新内容都没有」正是它要记录的事实。
  */
 export async function ingestTranscript(args: {
   bucket: R2Bucket;

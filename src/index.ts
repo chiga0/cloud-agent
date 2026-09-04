@@ -8,7 +8,7 @@ import { sha256Hex } from "./audit/evidence";
 import { assembleCandidate, candidateFileName } from "./audit/candidate";
 import { assembleRescueView } from "./audit/rescue";
 import { isValidSha } from "./exec/base";
-import type { AgentEventV1 } from "./obs/events";
+import { OBS_EVENT_KINDS, type AgentEventV1 } from "./obs/events";
 import { readObsAttemptEvents } from "./obs/journal";
 import {
   OBS_SSE_TAIL_INTERVAL_MS,
@@ -78,7 +78,7 @@ function landingHtml(env: Env): string {
       <dt>GET /api/tasks/:id/candidate?format=patch</dt><dd>下载补丁正文(<code>curl -o candidate.patch</code> 后本地 <code>git apply</code>);下发前重算 sha256,状态在 <code>x-candidate-status</code> / <code>x-safe-to-apply</code> / <code>x-patch-complete</code> 头里</dd>
       <dt>GET /api/tasks/:id/rescue</dt><dd><strong>BLOCKED 专用的抢救读面</strong>(需鉴权):被预算击杀的 writer 那一轮的差量视图。失败轮次按 M7 门禁从不钉入 <code>current_evidence</code>,所以它在 <code>/candidate</code> 上恒 404 —— 本端点读的是该 attempt 自己回报的 manifest。字段与 <code>/candidate</code> 同形,另加 <code>rescued: true</code> / <code>pinned: false</code>,且 <code>binding_digest</code> 恒 <code>null</code>、<code>safe_to_apply</code> 恒 <code>false</code>:它只是人接续工作的起点,不进任何审批口径。非 BLOCKED → 404 <code>not_blocked</code>;BLOCKED 但执行面未回报证据 → 404 <code>no_rescue_yet</code></dd>
       <dt>GET /api/tasks/:id/rescue?format=patch</dt><dd>下载抢救差量正文(同样逐字节重算 sha256,不一致 → 500 <code>integrity_error</code>);响应头额外带 <code>x-rescued: true</code> / <code>x-pinned: false</code>,只看头也不会把它当成可提交成品</dd>
-      <dt>GET /api/tasks/:id/events</dt><dd>在途事件流(需鉴权):读 Observation 层的 R2 段文件 journal,<strong>不经 D1 终态归档</strong>,因此任务 <code>RUNNING</code> 期间就有内容 —— 这是它相对 <code>/api/admin/events</code>(只读已归档的 hash chain)的核心增量。数据来自 poll 相每 30s 的 transcript 增量摄取:<strong>模型悬挂表现为「新事件停止而进程 alive」,凭最后一条事件的 <code>ts</code> 与轮询周期对比即可在 5 分钟内发现</strong>。按 attempt 创建序、attempt 内按 <code>generation</code> 与 <code>seq</code> 升序返回 <code>{"task_id",state,"events":[AgentEventV1],"count",total,"next_cursor","unreadable_attempts"}</code>;信封为 <code>{v:1,task_id,attempt_id,generation,seq,ts,kind,payload}</code>,<code>kind</code> ∈ system/assistant/user/tool_use/tool_result/result/error/raw(认不出的行不丢)。payload 已在 ingress 过白名单:只留类型/工具名/token 用量/时长/退出码等枚举字段,自由文本 ≤2048 字符并对平台注入的凭据值精确打码。分页:<code>?after=</code>(扁平有序流上已读的条数,默认 0)、<code>?limit=</code>(默认 500,上限 2000,非数字或越界 → 400);<code>next_cursor</code> 无后续时为 <code>null</code>。任务不存在 → 404;从未摄取过事件 → 空列表而不是 404</dd>
+      <dt>GET /api/tasks/:id/events</dt><dd>在途事件流(需鉴权):读 Observation 层的 R2 段文件 journal,<strong>不经 D1 终态归档</strong>,因此任务 <code>RUNNING</code> 期间就有内容 —— 这是它相对 <code>/api/admin/events</code>(只读已归档的 hash chain)的核心增量。数据来自 poll 相的 transcript 增量摄取,每轮另落一条 <code>kind=heartbeat</code> 心跳(runner 自己的时间源):模型悬挂表现为 <strong>「新事件停止而进程 alive」</strong>,而它有两种形状 —— <strong>连心跳都停 = runner 停了(红线);心跳在而转录静 = 模型沉默(只黄线)</strong>,两个阈值的推导与实测来源见 <code>docs/architecture.md</code> §9.8(权威常量在 <code>src/supervisor/detect.ts</code>)。按 attempt 创建序、attempt 内按 <code>generation</code> 与 <code>seq</code> 升序返回 <code>{"task_id",state,"events":[AgentEventV1],"count",total,"next_cursor","unreadable_attempts"}</code>;信封为 <code>{v:1,task_id,attempt_id,generation,seq,ts,kind,payload}</code>,<code>kind</code> ∈ ${OBS_EVENT_KINDS.join("/")}(认不出的行不丢)。payload 已在 ingress 过白名单:只留类型/工具名/token 用量/时长/退出码等枚举字段,自由文本 ≤2048 字符并对平台注入的凭据值精确打码。分页:<code>?after=</code>(扁平有序流上已读的条数,默认 0)、<code>?limit=</code>(默认 500,上限 2000,非数字或越界 → 400);<code>next_cursor</code> 无后续时为 <code>null</code>。任务不存在 → 404;从未摄取过事件 → 空列表而不是 404</dd>
       <dt>GET /api/tasks/:id/attempts/:aid/transcript</dt><dd>attempt 的 transcript 原文(verifier 为 JSON 验证报告,需鉴权)</dd>
       <dt>GET /api/admin/chain-check</dt><dd>校验归档事件 hash chain(需鉴权)。<strong>两种模式</strong>:不带参数 = 全局扫描 D1 <code>events</code> 表,返回 <code>{checked,broken,brokenTasks}</code>,破口标记 <code>&lt;task_id&gt;:&lt;seq&gt;:&lt;kind&gt;</code>,kind ∈ <code>prev</code>/<code>digest</code>(内容被改)、<code>seq</code>(序号不严格递增/重号)、<code>state</code>(状态行已是终态而链尾转换不是)。⚠ 全局模式<strong>看不见未归档的任务</strong>(events 只在归档成功时写)。带 <code>?task_id=</code>(36 字符 UUID,畸形 → 400)= <strong>DO↔D1 对账模式</strong>:同时读 DO 链与 D1 行,返回 <code>{mode:"reconcile",result,do_events,d1_events,do_tail_digest,d1_tail_digest,broken,brokenTasks}</code>,<code>result</code> 三态 = <code>consistent</code> / <code>not_archived</code>(DO 有链而 D1 零行)/ <code>diverged</code>(行数或尾 digest 不等);DO 无该任务记录 → 404 <code>task_not_found</code>。判据边界与运维含义见 <code>docs/architecture.md</code> §6.2</dd>
       <dt>GET /api/admin/tasks</dt><dd>归档任务列表(需鉴权):<strong>只读</strong>投影,数据源仅为 D1 归档的 <code>tasks</code> 表 —— 任务到终态才归档,因此<strong>不含仍在 DO 中运行、尚未归档的任务</strong>(实时状态看 <code>GET /api/tasks/:id</code>)。按 <code>updated_at</code> 降序返回 <code>{"tasks":[{id,state,created_at,updated_at,version}],"count":N}</code>;可选 <code>?state=</code> 精确过滤(合法取值见状态机,非法 → 400)、可选 <code>?limit=</code>(默认 50,上限 200,非数字或越界 → 400)</dd>
@@ -446,9 +446,12 @@ function parseObsLimit(raw: string | null): { limit: number; error: string | nul
  *
  * 这就是它与 GET /api/admin/events 的全部差别:后者读的是终态才归档的 hash chain,
  * 任务 RUNNING 时返回空 —— 于是 C2-r6 那种 24 分钟模型悬挂,外圈在 /api/tasks/:id 里
- * 只看到 `state: RUNNING`,与正常无异。本端点直接读 poll 相每 30s 增量摄取的段文件,
- * 因此「新事件停止但进程 alive」这件事在事件流里 5 分钟内就是可见的(判据:最后一条
- * 事件的 ts 与当前时刻的差,对比 poll 周期 30s)。
+ * 只看到 `state: RUNNING`,与正常无异。本端点直接读 poll 相增量摄取的段文件,于是悬挂的
+ * 两种形状都在这里可读:最后一条**心跳**的 ts 说的是「runner 还活着吗」,最后一条**行为
+ * 事件**的 ts 说的是「模型还在产字吗」。两者的阈值与分级判据不在这里重述 —— 权威常量在
+ * `src/supervisor/detect.ts`,推导与实测来源见 docs/architecture.md §9.8(旧口径「拿最后
+ * 一条事件的 ts 对比 30s 轮询周期」已被 prod 数据证伪:journal 的 ts 是**摄取时刻**,它量不到
+ * runner 自己还活不活着,所以那条对比既误报又漏报,已由两条独立时间源取代)。
  *
  * 有序返回该任务**全部 attempt** 的事件:attempt 顺序取 TaskSession DO 里的 attempts
  * 数组序(= 创建序,与 GET /api/tasks/:id 同源),attempt 内按 generation、seq 升序。
@@ -568,7 +571,8 @@ async function handleGetTaskEventStream(req: Request, env: Env, taskId: string):
 
 /**
  * GET /live/:taskId —— 在途事件时间线的**人眼端**(第④层下半)。页面怎么来的、为什么
- * 全内联、停滞阈值为什么是 90/300,都写在 src/obs/live.ts 顶部;这里只负责鉴权、404
+ * 全内联、停滞阈值为什么是那两个派生值,都写在 src/obs/live.ts 顶部(阈值本身在
+ * src/supervisor/detect.ts,§9.8 只在那里推导一次);这里只负责鉴权、404
  * 与响应头。事件内容一律由浏览器的 EventSource 拉,本函数不读 journal 的一个字节。
  *
  * **为什么一个「只是给人看」的页面也要鉴权**:事件 payload 已在 ingress 过白名单脱敏,

@@ -3,7 +3,7 @@ import { createExecutionContext, env } from "cloudflare:test";
 import worker from "../src/index";
 import { TaskSession } from "../src/control/session";
 import { ingestTranscript, type ObsTranscriptReader } from "../src/obs/ingest";
-import { OBS_SECRET_MASK, type AgentEventV1 } from "../src/obs/events";
+import { OBS_EVENT_KINDS, OBS_SECRET_MASK, type AgentEventV1 } from "../src/obs/events";
 import { applyMigrations } from "./d1";
 
 /**
@@ -295,5 +295,9 @@ describe("GET /api/tasks/:id/events", () => {
     expect(html).toContain("<dt>GET /api/tasks/:id/events</dt>");
     expect(html).toContain("不经 D1 终态归档");
     expect(html).toContain("新事件停止而进程 alive");
+    // 悬挂的两种形状(心跳=runner 时间源 / 转录=模型时间源)是页面必须说实话的地方
+    expect(html).toContain("连心跳都停");
+    // kind 词表由权威枚举派生而非页面写死:枚举变了页面跟不上就该红
+    expect(html).toContain(OBS_EVENT_KINDS.join("/"));
   });
 });

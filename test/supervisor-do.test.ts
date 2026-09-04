@@ -105,7 +105,7 @@ describe("Supervisor shadow(TaskSession DO 内的独立消费者)", () => {
     const tick = await stub.supervisorTick();
     expect(tick.mode).toBe("shadow");
     expect(tick.reported).toHaveLength(1);
-    // 这份夹具里**没有心跳**(= c12 之前落的历史段),所以走的是 downlevel 那条:
+    // 这份夹具里**没有心跳**(= c10b 之前落的历史段),所以走的是 downlevel 那条:
     // 只有 yellow。想要 red 必须有独立时间源可断 —— 见下面 heartbeatJournal 那两条。
     expect(tick.reported[0]).toMatchObject({ attempt_id: attemptId, kind: "stall", severity: "yellow" });
 
@@ -206,7 +206,7 @@ describe("Supervisor shadow(TaskSession DO 内的独立消费者)", () => {
 });
 
 /**
- * c12 的排程接线。这一组是**从 alarm 驱动**的,不是从 supervisorTick() RPC 驱动的。
+ * c10b 的排程接线。这一组是**从 alarm 驱动**的,不是从 supervisorTick() RPC 驱动的。
  *
  * 为什么必须这样测:c10 那一期判据与 DO 测试全绿,而 prod 从头到尾一次 tick 都没发生
  * —— 因为 `supervisorTick()` 测的是 tick 本体,而缺陷在排程(claim 只排了截止时刻)与
@@ -262,7 +262,7 @@ async function heartbeatJournal(
   });
 }
 
-describe("排程接线(c12:让 Supervisor 真的会被叫醒)", () => {
+describe("排程接线(c10b:让 Supervisor 真的会被叫醒)", () => {
   it("(a) 真实 alarm 周期体跑完 → 链里出现 supervisor_finding", async () => {
     setMode("shadow");
     const { stub, taskId, attemptId } = await runningWriterAttempt();

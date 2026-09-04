@@ -446,7 +446,7 @@ describe("摄取失败不杀 poll 相", () => {
 });
 
 /**
- * runner 心跳(c12)的**写路径**。这里钉形状:每轮恰好一条、空轮也写、payload 只有
+ * runner 心跳(c10b)的**写路径**。这里钉形状:每轮恰好一条、空轮也写、payload 只有
  * 枚举与数值、gap 自描述。判据侧的用例在 test/supervisor-detect.test.ts。
  */
 describe("runner 心跳(每轮一条,payload 只有枚举与数值)", () => {

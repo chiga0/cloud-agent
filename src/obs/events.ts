@@ -22,7 +22,7 @@ import type { Env } from "../types";
 
 /** 信封版本。加字段递增此值前必须先想清楚读端点如何兼容旧段文件。
  *
- * **c12 新增心跳 kind 时刻意不递增**,理由与 c10a(只加可选 payload 键不递增)不同类,
+ * **c10b 新增心跳 kind 时刻意不递增**,理由与 c10a(只加可选 payload 键不递增)不同类,
  * 所以要写清:心跳加的是**kind 取值**而不是信封字段。`v` 管的是「这行 JSON 的信封与
  * payload 通道长什么样」—— 加/改一个键的意义在于「所有读端点都要按新形状重解析」。
  * 而 kind 从设计上就是**开放集合**:读端点对不认识的 kind 必须照常返回(否则悬挂前
@@ -31,7 +31,7 @@ import type { Env } from "../types";
  * (readObsAttemptEvents 的 decodeJsonl、GET /events、Live 页)都要么拒绝新段、要么
  * 各写两份解码 —— 用一次版本分裂换「多一个 kind」这条本就被容忍的变化,不划算。
  * 兼容面:老读端点看到 kind="heartbeat" 会当成一个不认识的可读 kind 原样透出,
- * 判据侧(c12 的 detect)显式按 kind 排除心跳,不依赖 v。
+ * 判据侧(c10b 的 detect)显式按 kind 排除心跳,不依赖 v。
  */
 export const OBS_EVENT_V = 1;
 

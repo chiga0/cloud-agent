@@ -97,7 +97,7 @@ describe("GET /live/:taskId", () => {
     expect(body).toContain(`/api/tasks/${taskId}/events/stream`);
     expect(body).toContain("最后事件");
     // 阈值是判据,必须能在产物里读到具体数字(缺省渲染成 JS 常量声明)。
-    // c12 起这两个数**不再是页面自己的数字**:派生自 supervisor/detect 的那份判据
+    // c10b 起这两个数**不再是页面自己的数字**:派生自 supervisor/detect 的那份判据
     // (见 detect.ts 的推导注释)。这里钉的就是「页面没有第二份理由」。
     expect(LIVE_STALL_WARN_SECONDS * 1000).toBe(SUPERVISOR_THRESHOLDS.agent_silent_yellow_ms);
     expect(LIVE_STALL_DANGER_SECONDS * 1000).toBe(SUPERVISOR_THRESHOLDS.no_heartbeat_red_ms);

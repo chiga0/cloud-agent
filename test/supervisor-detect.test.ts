@@ -144,6 +144,20 @@ describe("stall · agent_silent(心跳在、转录静默)", () => {
     const long = [beat(1, NOW - (AGENT_SILENT_YELLOW_MS + 5_000)), beat(2, NOW - 30_000)];
     expect(findingsOf(detectSupervisor({ now_ms: NOW, events: long }), RULE_STALL_AGENT_SILENT)?.severity).toBe("yellow");
   });
+
+  it("静默再久也只 yellow:这条判据没有 red 分支(结构判据)", () => {
+    // 上一条把静默量停在黄线附近,而「×2 就升 red」这类改法恰恰只在**远大于**黄线时才写得出
+    // 差别 —— 于是它可以全绿通过。这里要的契约是分级本身:转录静默区分不了「挂了」与
+    // 「在干不产字的长活」(c10 实测健康 writer 静默 576s),判据不许把自己的分辨率上限
+    // 藏成一个更红的颜色 —— enforce 之后 red 就是处置信号,那是拿假设当证据。
+    const events = [
+      evt({ seq: 1, ts: new Date(NOW - 100 * AGENT_SILENT_YELLOW_MS).toISOString() }),
+      beat(2, NOW - 30_000),
+    ];
+    const findings = detectSupervisor({ now_ms: NOW, events });
+    expect(findingsOf(findings, RULE_STALL_AGENT_SILENT)?.severity).toBe("yellow");
+    expect(findings.filter((f) => f.severity === "red")).toEqual([]);
+  });
 });
 
 describe("stall · last_event_gap(downlevel:无心跳的历史段)", () => {
@@ -345,10 +359,23 @@ describe("心跳不进 loop / no_progress 的滑窗(必须排除)", () => {
     );
   }
 
-  it("一串心跳不推进 loop/no_progress(否则每个健康任务都被判空转)", () => {
+  /** 心跳排在行为事件**之后**(seq 与 ts 同序):窗槽位争夺的真实形态。 */
+  function beatsAfter(behavioralCount: number, n: number, stepMs = 33_000): AgentEventV1[] {
+    return Array.from({ length: n }, (_, i) =>
+      evt({
+        seq: behavioralCount + i + 1,
+        kind: OBS_HEARTBEAT_KIND,
+        ts: new Date(NOW - (n - i) * stepMs).toISOString(),
+        payload: { status: "running", round_ms: stepMs, gap_ms: stepMs },
+      }),
+    );
+  }
+
+  it("一串心跳不推进行为类判据(它们不该成为任何判据的输入)", () => {
     const findings = detectSupervisor({ now_ms: NOW, events: beatsOnly(45) });
     // 45 条心跳 = 25 分钟里模型一条转录没产 → 允许报的是 agent_silent(黄),
-    // 行为类判据必须一条都不许有:它们看到的窗全被心跳填满的话就是筛子。
+    // 行为类判据必须一条都不许有。注意失效方向:心跳没有 tool_names、塌不成
+    // repeat_key,所以**误报**不是这里的风险;风险在下面的槽位争夺(漏报)。
     expect(findings.map((f) => f.kind).sort()).toEqual(["stall"]);
     expect(findings.map((f) => f.rule)).toEqual([RULE_STALL_AGENT_SILENT]);
   });
@@ -365,6 +392,47 @@ describe("心跳不进 loop / no_progress 的滑窗(必须排除)", () => {
     expect(without.find((f) => f.kind === "loop")?.evidence.repeat_count).toBe(n);
     expect(withBeats.find((f) => f.kind === "loop")?.evidence.repeat_count).toBe(n);
     expect(withBeats.find((f) => f.kind === "loop")?.evidence.has_heartbeat).toBe(true);
+  });
+
+  it("真循环被心跳**追在身后**时仍要命中 loop(排除失效的后果是漏报)", () => {
+    // 交错形态对「有没有排除」不敏感(窗里总留得下那几条行为事件),而真实 journal 的形态
+    // 是**成串心跳排在行为事件之后**:一个 25 分钟任务攒 ~45 条心跳,而 loop 窗只有 20 槽。
+    // 不先排除心跳,slice(-20) 取到的全是心跳 → 真循环落在窗外 → 判据静默失聪。
+    const { loop_window, loop_repeat_max } = SUPERVISOR_THRESHOLDS;
+    const beats = loop_window + 5;
+    const loop = Array.from({ length: loop_repeat_max }, (_, i) =>
+      evt({
+        seq: i + 1,
+        ts: new Date(NOW - (beats + loop_repeat_max - i) * 33_000).toISOString(),
+        payload: { tool_names: ["read_file"], tool_targets: ["src/a.ts"] },
+      }),
+    );
+    const f = findingsOf(
+      detectSupervisor({ now_ms: NOW, events: [...loop, ...beatsAfter(loop.length, beats)] }),
+      RULE_LOOP_TOOL_REPEAT,
+    );
+    expect(f?.evidence.repeat_count).toBe(loop_repeat_max);
+    // 窗大小钉的是**行为**条数:它 == loop_window 就说明窗被心跳占了(漏报正在发生)。
+    expect(f?.evidence.window_size).toBe(loop_repeat_max);
+  });
+
+  it("同样形态下 no_progress 也要命中(两个窗各自有独立排除)", () => {
+    // 两条判据各有一次 slice,改一处漏一处是这套接线最自然的错法 —— 上面那条只杀得动 loop。
+    const { no_progress_window, no_progress_repeat_max } = SUPERVISOR_THRESHOLDS;
+    const beats = no_progress_window + 5;
+    const repeats = Array.from({ length: no_progress_repeat_max }, (_, i) =>
+      evt({
+        seq: i + 1,
+        ts: new Date(NOW - (beats + no_progress_repeat_max - i) * 33_000).toISOString(),
+        payload: { tool_names: [i % 2 === 0 ? "read_file" : "edit_file"], tool_targets: ["src/a.ts"] },
+      }),
+    );
+    const f = findingsOf(
+      detectSupervisor({ now_ms: NOW, events: [...repeats, ...beatsAfter(repeats.length, beats)] }),
+      RULE_NO_PROGRESS_TARGET_REPEAT,
+    );
+    expect(f?.evidence.repeat_count).toBe(no_progress_repeat_max);
+    expect(f?.evidence.window_size).toBe(no_progress_repeat_max);
   });
 
   it("同样的心跳仍要让 agent_silent 计时正确(排除≠丢弃时间源)", () => {

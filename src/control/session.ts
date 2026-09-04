@@ -570,7 +570,7 @@ export class TaskSession extends DurableObject<Env> {
     const instance = await this.env.ATTEMPT_WORKFLOW.create({ id, params });
     record.workflow_instance_id = instance.id;
 
-    // c12 排程接线:这一次唤醒**必须**同时是 Supervisor 的一次 tick。
+    // c10b 排程接线:这一次唤醒**必须**同时是 Supervisor 的一次 tick。
     //
     // 为什么改在这里:prod 从上线到 c10 之间零 tick,根因就是 claim 只排了
     // `attemptDeadline(record)`(纯截止驱动),而带 tick 的续期只存在于 alarm() 尾部 ——
@@ -1939,7 +1939,7 @@ export class TaskSession extends DurableObject<Env> {
   /**
    * RPC:读回当前排定的下一次唤醒时刻(只读,不改任何状态)。
    *
-   * 为什么需要这个窗口:c12 的接线契约本身就是「下一次什么时候醒」(claim 只排截止时刻
+   * 为什么需要这个窗口:c10b 的接线契约本身就是「下一次什么时候醒」(claim 只排截止时刻
    * 时 prod 零 tick,而那种失效在 tick 本体里**看不见**)。测试侧两条路都堵着 ——
    * `alarm` 是 workerd 的保留方法名不能 RPC,`stub.getAlarm()` 在 vitest-pool-workers
    * 里也没实现(receiver does not implement getAlarm)。所以由 DO 自己开一个只读口,

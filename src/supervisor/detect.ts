@@ -124,7 +124,7 @@ function ceilToTick(ms: number): number {
  * 跳过现象计两次。按独立轮次粗估:单轮没落盘 ≈ 0.22,而 gap 要超过 180s 需要连续 5 轮
  * 没落盘(6 × 33s = 198s)≈ 0.22⁵ = 0.05%;一个 45 轮的 attempt 出现一次 ≈ 2%。
  * 这个 2% 建立在「跳过的轮次相互独立」上,而真实的跳过多半成批出现(容器抖动、RPC 重试)
- * —— 所以它既是估计也是假设。⚠️ **enforce 之前必须用 shadow 期样本复核**:c12 起
+ * —— 所以它既是估计也是假设。⚠️ **enforce 之前必须用 shadow 期样本复核**:c10b 起
  * journal 里每条心跳自带 gap_ms,这条分布可以直接量出来,不必再靠上面的模型。
  */
 export const NO_HEARTBEAT_RED_MS = ceilToTick(NO_HEARTBEAT_MISS_ROUNDS * HEARTBEAT_ROUND_MS);
@@ -152,12 +152,17 @@ export const AGENT_SILENT_YELLOW_MS = ceilToTick(576_000 * 1.5);
  * 事件密度本身就是要看的东西;用时间窗口会让高频空转(每秒一次工具调用)与低频空转
  * 用同一把尺子。重复上限取窗口的一半量级,低于它的重复在正常任务里是常态(改一个
  * 文件要 read→edit→read 两三次),所以取「明显超出常态」而不是「绝不可能是常态」。
- * 两个窗口的输入一律**排除心跳**(见 SUPERVISOR_BEHAVIORAL_KINDS):心跳每轮一条、
- * target 恒定,不排除就等于把「同一 target 反复出现」的完美饲料喂给判据,loop 与
- * no_progress 会立刻变成筛子。
+ * 两个窗口的输入一律**排除心跳**(见 `behavioralOnly`):心跳没有 `tool_names`、塌不出
+ * repeat_key,所以它造成的不是误报 —— 而是滑窗按**条数**取,每轮一条的心跳会把 20/30 槽
+ * 填满,把真循环挤到窗外 ⇒ 长任务尾部的行为判据集体失聪(漏报)。机理与对偶用例见
+ * `behavioralOnly` 上方注释及 §9.8。
  */
 export const SUPERVISOR_THRESHOLDS = {
-  /** 最后一条**心跳**滞后超过它 → red(no_heartbeat)。派生自 POLL_INTERVAL,见上。 */
+  /**
+   * 最后一条**心跳**滞后超过它 → red(no_heartbeat)。= `5 × max(POLL_INTERVAL_MS,
+   * 实测中位 33s)` 向上取整到 tick;当前胜出项是**实测**那一侧,名义轮询周期只是下界
+   * (改 POLL_INTERVAL_MS 不带动这个数,§9.8 有这条仪器盲区的说明)。
+   */
   no_heartbeat_red_ms: NO_HEARTBEAT_RED_MS,
   /** 心跳在、最后一条**转录**事件滞后超过它 → yellow(agent_silent)。 */
   agent_silent_yellow_ms: AGENT_SILENT_YELLOW_MS,
@@ -198,7 +203,7 @@ export interface SupervisorEvidence {
   repeat_count?: number;
   /**
    * 本段 journal 有没有心跳。**每条 finding 自带这个标记**,因为 shadow 样本必须按
-   * 「有心跳 / 无心跳」分段统计:混算等于拿旧数据判新判据(c12 的阈值来自有心跳的那段,
+   * 「有心跳 / 无心跳」分段统计:混算等于拿旧数据判新判据(c10b 的阈值来自有心跳的那段,
    * 而旧段的 gap 量的是「上一轮读到新东西的时刻」,分布完全不同)。
    */
   has_heartbeat: boolean;
@@ -231,9 +236,13 @@ export const RULE_NO_PROGRESS_TARGET_REPEAT = "no_progress.target_repeat";
 /**
  * 「行为事件」= 除心跳以外的一切观测事件。loop / no_progress / agent_silent 只看这一类。
  *
- * 为什么必须排除心跳:心跳**每轮一条、target 恒定**,正是「同一 target 反复出现」的
- * 完美饲料 —— 一个 25 分钟的任务会攒 45 条一模一样的心跳,no_progress 的窗口(30 条)
- * 光靠心跳就填满,于是每一个健康任务都被判成空转。排除之后心跳只剩一个用途:当时间源。
+ * 为什么必须排除心跳:**失效方向是漏报,不是误报**。心跳 payload 只有枚举与数值(没有
+ * `tool_names`),而两条行为判据的键函数都要求先有工具名才成形 —— 塌不出 repeat_key
+ * 就不构成假阳性。它们真正的破坏力在**槽位**:滑窗是 `events.slice(-window)`,按条数取,
+ * 而心跳每轮一条 —— 一个 25 分钟的 attempt 攒 ~45 条,多于 `loop_window=20` 与
+ * `no_progress_window=30`,不排除时窗里全是心跳,真循环整个落在窗外,于是**每条长任务尾部
+ * 的行为判据集体失聪**,恰好是最需要它们的那一段。排除之后心跳只剩一个用途:当时间源。
+ * 判别力对偶用例见 `test/supervisor-detect.test.ts`「真循环被心跳追在身后时仍要命中」。
  */
 function behavioralOnly(events: AgentEventV1[]): AgentEventV1[] {
   return events.filter((e) => e.kind !== OBS_HEARTBEAT_KIND);
@@ -481,7 +490,7 @@ export function detectSupervisor(args: {
       });
     }
   } else if (gapMs !== null && gapMs > t.agent_silent_yellow_ms) {
-    // (3) downlevel:c12 之前落的段(以及心跳上线前的历史 attempt)根本没有心跳这条
+    // (3) downlevel:c10b 之前落的段(以及心跳上线前的历史 attempt)根本没有心跳这条
     //     时间源,于是「分级」无从谈起。这里保留 last_event_gap,但**只有 yellow** ——
     //     判据能说的只是「这个观测面上很久没出现新东西」,而那句话在没有独立时间源时
     //     推不出「runner 停了」。§9.8 要求 shadow 样本按有心跳/无心跳分段统计:混算等于

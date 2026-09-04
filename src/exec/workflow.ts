@@ -270,12 +270,13 @@ export class AttemptWorkflow extends WorkflowEntrypoint<Env, AttemptParams> {
               const snap = await pollLongRun(sandbox);
               // Observation 层旁路(M10):与轮询同拍做 transcript 增量摄取,落 R2 段
               // journal,让 GET /api/tasks/:id/events 在 RUNNING 期间就读得到事件。
-              // 判据「新事件停止而进程 alive」要求摄取节奏 == 轮询节奏,所以就在
-              // 这个 step 里,不另开 step(轮询本来就按 30s 占着 step 配额)。
-              // c12 兑现了那句注释:本轮的 snap 一并交给摄取侧,落成心跳。于是
-              // 「节奏」不再是需要读者假设的前提(30s?),而是 journal 里自描述的
-              // 数据 —— 每条心跳的 gap_ms 就是实测轮次长度,supervisor 的阈值由它
-              // 那一侧的 POLL_INTERVAL_MS 推导,不必再猜。
+              // 放在轮询这个 step 里、不另开 step(轮询本来就按 30s 占着 step 配额):
+              // 同一步就是同一轮,进程快照与本轮读到的新增字节本是同一时刻的两面。
+              // c10b 兑现了那句注释:本轮的 snap 一并交给摄取侧,落成心跳。于是
+              // 「节奏」不再是需要读者假设的前提(旧前提「== 30s」已被实测取代:
+              // 中位 33s、22% 轮次跳过),而是 journal 里自描述的数据 —— 每条心跳的
+              // gap_ms 就是实测轮次长度,supervisor 的阈值由它那一侧的
+              // POLL_INTERVAL_MS 推导,不必再猜。
               // 永不抛:观测失败最多丢一轮观测(也丢这一条心跳,于是下一轮的 gap_ms
               // 变长 = 跳过被记录在数据里),不该把 attempt 拖成 BLOCKED。
               await ingestObsBestEffort(this.env, {

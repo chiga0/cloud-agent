@@ -574,6 +574,8 @@ C2-r6 那次单次模型调用悬挂 24 分钟(§13.19)。当时外圈能拿到�
 
 **本层的验收基准一句话:同样的悬挂重现,外圈凭事件流 5 分钟内能发现。** 它是下一期无人值守监督(Supervisor)的数据底座 —— 本期只做数据路径,不做判定与分流。
 
+⚠️ 这句基准里的「5 分钟」是 c7 按当时的算法算的(最后一条事件停滞 ⇒ 悬挂),那个算法后来被证明把两个问题当了一个(下面那张表就是它原来的形状),c10b 起**数字与算法一起由 §9.8 接管**;本节保留原句是为了记清这层当初的验收口径,**照它设闹钟会漏**。
+
 ### 数据路径(基准对应的每一跳)
 
 ```
@@ -595,11 +597,11 @@ R2  obs/<task_id>/<attempt_id>/g<generation>-seg<N>.jsonl  +  index.json
 | 时刻 | 发生什么 | 外圈看到什么 |
 |---|---|---|
 | t=0 | 模型调用挂住,qwen 不再往 stdout 写任何字节 | — |
-| t≤30s | `poll-i` 读到 0 条新增完整行 → **不落任何写**(空轮询不该刷 R2 小对象) | 事件流尾部不再增长 |
-| t=30s..N | 每拍如此:进程 `status=running`,事件数恒定 | `state=RUNNING` + `total` 不变 |
-| 任意时刻 | `GET /api/tasks/:id/events` | 最后一条事件的 `ts` 停在 t≈0,与当前时刻的差单调增大 |
+| t≤30s | `poll-i` 读到 0 条新增完整行 → 转录无新事件,但**仍落一条 `kind=heartbeat`**(c10b;不传 `snapshot` 的历史调用方才是「不落任何写」) | 尾部只增长心跳 |
+| t=30s..N | 每拍如此:进程 `status=running`,心跳的 `gap_ms` ≈ 实测轮次 | 行为事件数恒定,心跳恒定增长 |
+| 任意时刻 | `GET /api/tasks/:id/events` | **两个数分开看**:最后一条**行为**事件的 ts 距今单调增大(= 模型静默),最后一条**心跳**的 ts 距今 ≈ 一拍(= runner 活着) |
 
-判据是 **「最新事件 `ts` 距今 > 若干个 30s 轮询周期,而 attempt 仍 RUNNING」**,而不是「没有事件」(第一轮轮询之前本来就没有事件)。按 3 个周期(90s)无新增 + 外圈 60s 拉一次算,最坏 150s 出结论 —— 相对 5 分钟基准有 2 倍裕度。摄取与轮询在**同一个 step、同一拍**发生,所以「轮询节奏 == 摄取节奏」由构造保证:悬挂时不会混淆「进程还活着但观测层静默」与「观测层还在写但写的都是旧行」。
+这里要问的是**两个**问题而不是一个:「模型还在产字吗」看最后一条行为事件的 ts,「runner 还活着吗」看最后一条心跳的 ts —— 只有一条时间源时这两个问题同形,而这正是 §9.5 本节旧算式与 §9.7 Live UI 旧阈值的判据答错的地方。c7 那份算式(「> 3 个 30s 周期 + 外圈 60s 拉一次 ⇒ 最坏 150s 出结论」)把两问当一问用,已被 prod 数据证伪并在 §9.8 重标定 —— **阈值数字只在那里推导一次**,本节不复制。摄取与轮询仍发生在同一个 step、同一拍(放置理由见 `src/exec/workflow.ts` 的注释:同一步就是同一轮,快照与本轮新增字节是同一时刻的两面),但「同一拍」不再被当成判据的前提:节奏由每条心跳自带的 `gap_ms` 自描述。
 
 ### 事件 schema:`AgentEventV1`
 
@@ -694,7 +696,7 @@ obs/<task_id>/<attempt_id>/index.json                   每 attempt 一份:段�
 | `obs_index_malformed` / `obs_index_inconsistent` / `obs_commit_seq_discontinuity` / `obs_segment_count_drift` | 游标自洽性被破坏 → 整轮拒写 |
 | `obs_read_attempt_failed` | 读端点遇到坏 journal,降级为「列出该 attempt 但不返回其事件」 |
 
-### runner 心跳:`kind="heartbeat"`(c12)
+### runner 心跳:`kind="heartbeat"`(c10b)
 
 poll 相每轮把已经拿到的 `ProcessSnapshot` 交给 `ingestObsBestEffort`(新增可选入参 `snapshot`),
 由摄取侧**每轮落一条**心跳。它不是 transcript 行:`obsKindOfLine` 永远不会返回这个 kind,它由
@@ -724,7 +726,7 @@ poll 相每轮把已经拿到的 `ProcessSnapshot` 交给 `ingestObsBestEffort`(
 读路径要么拒绝新段、要么各写两份解码」,而收益为零:判据侧靠 `kind` 排除心跳,不依赖 `v`。
 
 **空轮也写**:`ingestTranscript` 原本在「无新增完整行」时不落任何写(30s 一次的空轮询不该把 R2
-刷满小对象)。传了 `snapshot` 之后空轮也要落 —— 「这一轮什么新内容都没有」正是心跳要记录的fact;
+刷满小对象)。传了 `snapshot` 之后空轮也要落 —— 「这一轮什么新内容都没有」正是心跳要记录的事实;
 不传 `snapshot` 的调用方(历史形态)路径逐字段不变。
 
 ### 为什么加 `tool_targets` 不递增 `OBS_EVENT_V`
@@ -913,7 +915,7 @@ that your Worker's code had hung
 
 为什么 §9.5/§9.6 的出口不足以发现它:那两个出口都**有**数据 —— 问题恰恰是「新数据停止而进程 alive」。人眼盯着滚动的 NDJSON 或一个 `state: RUNNING` 徽章,量不出「距离上一条过了多久」,而「多久」是这件事唯一的判据。所以本 UI 的核心价值不是渲染,是**把时长变成一个会自己涨的数字**。
 
-阈值(单位:秒)。**c12 起这两个数不再是本页自己的数字** —— 它们派生自 §9.8 的那份判据
+阈值(单位:秒)。**c10b 起这两个数不再是本页自己的数字** —— 它们派生自 §9.8 的那份判据
 (`LIVE_STALL_* = detect.ts 的 AGENT_SILENT_YELLOW_MS / NO_HEARTBEAT_RED_MS ÷ 1000`),
 本页不再自带一份理由。旧表里的 90/300 建立在「新数据每 30s 推进一次」这个前提上,prod 已证伪
 (实测中位轮次 33s、22% 轮次被跳过、健康 writer 静默过 576s)—— 也就是说旧页面早就在对健康任务准备误报。
@@ -927,8 +929,13 @@ that your Worker's code had hung
 与「模型静默 Ns(runner 活着)」。计时器读两条独立时间源:`lastEventMs`(任意事件,含心跳)与
 `lastBehavioralMs`(仅非心跳事件),后者绝不能把心跳算进去 —— 否则静默计时永远归零,`agent_silent` 形同虚设。
 
-按这个标尺,C2-r6 那次 24 分钟悬挂在**打开页面的情况下约 3 分钟内变红**(心跳先停 ⇒ 红),
-而不是 24 分钟后恰好有人在看终端。旧文案写的「90 秒变黄、5 分钟内必红」随阈值重标定一起作废。
+按这个标尺,C2-r6 那次 24 分钟悬挂**不会亮红**:挂起发生在容器内的单次模型调用上,poll 相每轮
+照常返回快照 ⇒ 心跳不断,红线量的是「runner 停了」而 runner 没停。它在静默 900s(15 分钟)后
+**亮黄**,而不是旧文案宣称的「5 分钟内必红」。这个变慢是**用检出时延换精度**,不是回退:旧红线
+建立在「新数据每 30s 推进一次」上,而 prod 实测健康 writer 静默过 576s —— 那条线早就在对正常任务
+误报,误报的观测面会让人不再相信它。换到的东西同样要说清:「runner 停了」这个判据在旧的单时间源
+下**根本表达不出来**(最后一条事件停滞,分不清是模型不产字还是摄取通道死了)。旧文案「90 秒变黄、
+5 分钟内必红」随阈值重标定一起作废。
 
 还有一条同构的自律:计时器必须**每秒自跑**,不能只在事件到达时刷新 —— 悬挂的时候恰恰没有事件来触发刷新,而那一刻是它唯一有用的时刻。
 
@@ -978,7 +985,7 @@ that your Worker's code had hung
 
 | 未覆盖 | 为什么单测覆盖不到 |
 |---|---|
-| 计时器每秒自增;跨 90s/300s 时黄→红真的变 | 需要真实时钟与真实 CSS 计算 |
+| 两条计时器每秒各自自增;心跳停止跨 180s / 模型静默跨 900s 时 pill 真的变红 / 变黄 | 需要真实时钟与真实 CSS 计算;单测只钉得住渲染出去的数字与两条时间源的取值规则 |
 | `end` 帧后「流已结束」并停止计时 | 需要真实 EventSource |
 | 一条坏帧只跳过那一条、坏帧计数累加、其余继续渲染 | 需要浏览器的事件派发 |
 | 真实 401 下 `onerror` 是否真的把 `readyState` 停在 2、真实拒连是否停在 0(即上面的实测结论在新版本上仍成立) | 分支**规则**由单测钉住,但规则与浏览器实现的对应关系只能实测;探针在页面之外 |
@@ -1030,22 +1037,26 @@ red。**Supervisor 是第②层的消费者,不是第①层的新读者。**
 
 | kind | rule | 判据(缺省阈值) | severity | 边界纪律 |
 | --- | --- | --- | --- | --- |
-| `stall` runner 停了 | `stall.no_heartbeat` | `gap = now_ms - Date.parse(最后一条**心跳**.ts)`;`> no_heartbeat_red_ms = 180_000` → **red** | red | 输入是 §9.5 的 `kind="heartbeat"`(c12 起每轮 poll 无条件一条)。阈值 = `NO_HEARTBEAT_MISS_ROUNDS(5) × HEARTBEAT_ROUND_MS(max(POLL_INTERVAL_MS, 实测中位轮次 33s))` = 165s,**向上取整到 tick(60s)的整数倍 = 180s**。只在「这段 journal 里有心跳」时参与判定 |
+| `stall` runner 停了 | `stall.no_heartbeat` | `gap = now_ms - Date.parse(最后一条**心跳**.ts)`;`> no_heartbeat_red_ms = 180_000` → **red** | red | 输入是 §9.5 的 `kind="heartbeat"`(c10b 起每轮 poll 无条件一条)。阈值 = `NO_HEARTBEAT_MISS_ROUNDS(5) × HEARTBEAT_ROUND_MS(max(POLL_INTERVAL_MS, 实测中位轮次 33s))` = 165s,**向上取整到 tick(60s)的整数倍 = 180s**。只在「这段 journal 里有心跳」时参与判定 |
 | `stall` 模型沉默 | `stall.agent_silent` | 心跳在,`transcript_gap = now_ms - 最后一条**行为**(非心跳)事件.ts`;`> agent_silent_yellow_ms = 900_000` → **只 yellow** | yellow(**永不 red**) | 阈值 = 实测健康 writer 最长静默 `576s × 1.5 = 864s` → 取整到 tick = 900s。样本 n=1,所以这条只黄不红。整段没有行为事件时参照点退回首条心跳 ts(观察开始),否则每个刚起跑的 attempt 都会因「还没有转录」被判 |
-| `stall` 无心跳历史段(downlevel) | `stall.last_event_gap` | 仅当这段 journal **一条心跳都没有**(= c12 部署前落的段)时生效:`gap = now_ms - 最后一条事件.ts > 900_000` → yellow | yellow(**永不 red**) | 保留它是为了旧数据可读,不是为了旧判据继续吓人。没有独立时间源就推不出「runner 停了」,所以这一档不给 red。**shadow 样本必须按有心跳 / 无心跳分段统计** —— 混算等于拿旧数据判新判据 |
-| `loop` 循环嫌疑 | `loop.tool_repeat` | 末尾 `loop_window=20` 条**行为**事件的滑窗内,同一 `repeat_key = 工具名 @ target` 出现 `>= loop_repeat_max=5` 次 | yellow;`>= 2×` → red | 只有带 `tool_names` 的事件参与计数(否则一串无文本的 `assistant`/`system` 心跳会塌成同一个键 → 误报)。target 见下方三级取值。**心跳一律排除**(见下条边界纪律) |
+| `stall` 无心跳历史段(downlevel) | `stall.last_event_gap` | 仅当这段 journal **一条心跳都没有**(= c10b 部署前落的段)时生效:`gap = now_ms - 最后一条事件.ts > 900_000` → yellow | yellow(**永不 red**) | 保留它是为了旧数据可读,不是为了旧判据继续吓人。没有独立时间源就推不出「runner 停了」,所以这一档不给 red。**shadow 样本必须按有心跳 / 无心跳分段统计** —— 混算等于拿旧数据判新判据 |
+| `loop` 循环嫌疑 | `loop.tool_repeat` | 末尾 `loop_window=20` 条**行为**事件的滑窗内,同一 `repeat_key = 工具名 @ target` 出现 `>= loop_repeat_max=5` 次 | yellow;`>= 2×` → red | 只有带 `tool_names` 的事件参与计数(否则一串无文本的 `assistant`/`system` 行会塌成同一个键 → 误报)。target 见下方三级取值。**心跳一律排除**(见下条边界纪律) |
 | `no_progress` 空转 | `no_progress.target_repeat` | 末尾 `no_progress_window=30` 条**行为**事件里 `tool_use` 的**目标**重复 `>= no_progress_repeat_max=8` 次 | yellow;`>= 2×` → red | 与 loop 的分工:loop 看「动作全等(工具名 + 目标)」,本条只看「目标」—— `read A → edit A → read A …` 这种工具名交替、loop 抓不到的形态由它抓 |
 
-**为什么 loop / no_progress 的滑窗必须排除心跳**:心跳每轮一条、`target` 恒定,正是「同一 target 反复出现」的完美饲料 —— 一个 25 分钟的 attempt 会攒 ~45 条一模一样的心跳,30 条的窗口光靠心跳就填满,于是**每一个健康任务都被判成空转**。排除后心跳只剩一个用途:当时间源。正反两向都有用例(`test/supervisor-detect.test.ts` 的「心跳不进 loop / no_progress 的滑窗」):一串心跳不推进行为类判据,而同一串心跳仍要让 `agent_silent` 计时正确。
+**为什么 loop / no_progress 的滑窗必须排除心跳**:失效方向是**漏报**,不是误报。心跳 payload 里只有枚举与数值(§9.5),没有 `tool_names`,而两条判据都要求先有工具名才成形(`repeatKeyOf` / `targetOf` 的入口门)—— 所以一串心跳**塌不出 repeat_key**,不构成假阳性。它们真正的破坏力在别处:滑窗取的是 `events.slice(-window)`,**窗口按条数算,而心跳占槽位**。一个 25 分钟的 attempt 会攒 ~45 条心跳,比 `loop_window=20` 与 `no_progress_window=30` 都多 —— 不排除心跳时,窗里全是心跳,真循环整个落在窗外,于是**每条长任务尾部的行为类判据集体失聪**,而这恰好是最需要它们的那一段。
 
-**阈值的来源与天花板(c12 重标定)**。旧的 90/300 已被 prod 数据证伪,两条前提都不成立:
+排除后心跳只剩一个用途:当时间源。三向都有用例(`test/supervisor-detect.test.ts` 的「心跳不进 loop / no_progress 的滑窗」):①一串心跳不推进行为类判据;②真循环**被心跳追在身后**时 loop 与 no_progress 各仍要命中(这两条才是①的判别力对偶 —— 交错形态在两种实现下都命中,杀不动任何变异);③同一串心跳仍要让 `agent_silent` 计时正确(排除 ≠ 丢弃时间源)。
+
+**阈值的来源与天花板(c10b 重标定)**。旧的 90/300 已被 prod 数据证伪,两条前提都不成立:
 
 - 前提「摄取节拍每 30s 一次」 ⇒ 实测一个真实轮次是「30s 睡眠 + 一次 30 秒级的 `Sandbox rpc:readFile`」,**中位 33s**;且健康 writer 上 **22% 的轮次会被跳过**(41 轮里 9 个间隔 >60s,最长 94s = 连跳 2 轮)。
-- 前提「最后事件滞后 ≈ agent 有没有在动」 ⇒ journal 的 `ts` 写的是**摄取时刻**(`ingestTranscript` 给同一轮全部事件写 `ts: now`),所以它量的是「上一轮读到新东西的时刻」,分辨率天花板就是摄取节奏本身。**在这个数据源上无论怎么调 90/300 都是在猜** —— 这就是加心跳的理由:c12 起每条心跳自带 `gap_ms` / `round_ms`,节奏在数据里自描述,下一次改阈值可以先从 journal 量出来。
+- 前提「最后事件滞后 ≈ agent 有没有在动」 ⇒ journal 的 `ts` 写的是**摄取时刻**(`ingestTranscript` 给同一轮全部事件写 `ts: now`),所以它量的是「上一轮读到新东西的时刻」,分辨率天花板就是摄取节奏本身。**在这个数据源上无论怎么调 90/300 都是在猜** —— 这就是加心跳的理由:c10b 起每条心跳自带 `gap_ms` / `round_ms`,节奏在数据里自描述,下一次改阈值可以先从 journal 量出来。
+
+⚠️ **`max(POLL_INTERVAL_MS, 实测中位 33s)` 里今天起作用的是实测那一项**。名义轮询周期在这条派生式中的角色是**下界**(阈值不得小于一轮名义睡眠,否则一次正常跳过就足以误红),而 33s > 30s ⇒ 胜出项是实测值。所以「红线由轮询节奏派生」**不能**读成「改 `POLL_INTERVAL_MS` 会带动 180s」:改成 10s 阈值不动,改成 60s 才动。这条区别在黑盒断言里测不出来 —— 实测过变异:把 `max(...)` 换成只取 `MEASURED_ROUND_MEDIAN_MS`,全量 521 条全绿(两个表达式当前给出同一个 33s)。它是**已知的仪器盲区**,写下来是为了将来有人按「轮询一改阈值就跟动」推理时不被本节误导。
 
 | 推进条件 | 达成标准 |
 | --- | --- |
-| shadow 攒样本 → 数字判据 → enforce | ①c12 起 prod 有心跳,`gap_ms` 分布可直接量(不必再 tail 反推);②按**有心跳 / 无心跳**分段统计各规则的命中率与人工复核结论;③`no_heartbeat` 的实测误红率 ≈ 0(独立轮次模型的先验是每 attempt ~2%)且 `agent_silent` 的真阳性能被复核承认 —— 三条齐了才谈 enforce 与处置动作。**enforce 之前必须用 shadow 样本复核这两个阈值**(与 c11 的归档取证清单同属一份证据链,互相指认)。 |
+| shadow 攒样本 → 数字判据 → enforce | ①c10b 起 prod 有心跳,`gap_ms` 分布可直接量(不必再 tail 反推);②按**有心跳 / 无心跳**分段统计各规则的命中率与人工复核结论;③`no_heartbeat` 的实测误红率 ≈ 0(独立轮次模型的先验是每 attempt ~2%)且 `agent_silent` 的真阳性能被复核承认 —— 三条齐了才谈 enforce 与处置动作。**enforce 之前必须用 shadow 样本复核这两个阈值**(与 c11 的归档取证清单同属一份证据链,互相指认)。 |
 
 **target 的三级取值**(实现在 `targetOf`,顺序即优先级,每一级都过 `normalizeTarget`):
 
@@ -1133,12 +1144,12 @@ target 因此有了上面的三级取值。仍然要说清楚的是:
 | --- | --- | --- |
 | 续期时刻 | `max(min(attemptDeadline), now + 60s)` —— **纯截止驱动** | `min(上面的既有结果, now + SUPERVISOR_TICK_MS)` |
 | attempt 不死时 | 不醒 | 每 60s 醒一次 |
-| C2-r6 形态(悬挂 24 分钟、墙钟还剩 ~14 分钟) | 悬挂期间 alarm **一次都不触发** | 悬挂期间醒来 ~14 次,yellow 在 90s 内、red 在 300s 内入链 |
+| C2-r6 形态(悬挂 24 分钟、墙钟还剩 ~14 分钟) | 悬挂期间 alarm **一次都不触发** | 悬挂期间醒来 ~14 次。c10b 双时间源后这一形态入链的是 `stall.agent_silent` / **yellow**(静默满 900s 后的那次 tick),不是 red —— 挂的是容器内的模型调用,poll 相每轮仍写心跳,而 red 现在只说「runner 停了」 |
 | `SUPERVISOR_MODE=off` | — | **不传 tick**,逐字段等于修正前(回归证据,`test/statemachine.test.ts` 钉住) |
 
 改动只落在 `statemachine.ts` 的纯函数上(加一个可选参数),`session.ts` 只决定「传还是不
 传」。tick 不早于 `WATCHDOG_MIN_INTERVAL_MS`:alarm 自旋会白烧 DO 请求,而 60s 已是最细的
-有效观测节拍(摄取本身 30s 一轮,更密看不到新事件)。
+有效观测节拍(摄取的实测中位轮次 33s、且 22% 的轮次会被跳过,更密只会看到同一批事件)。
 
 ### 降级与故障纪律
 
@@ -1154,9 +1165,16 @@ target 因此有了上面的三级取值。仍然要说清楚的是:
 
 ### 验收标本与本期边界
 
-验收标本仍是 **C2-r6:单次模型调用悬挂 24 分钟**(§13.19),要求 **5 分钟内可发现** —— 按
-60s tick + 300s red 阈值,最迟在悬挂后 300s 后的那一次 tick,`supervisor_finding` / `red`
-入链,不再依赖「恰好有人在看终端」。
+验收标本仍是 **C2-r6:单次模型调用悬挂 24 分钟**(§13.19)。c10 写的「5 分钟内可发现」随
+300s red 一起作废 —— 那个算式假设「最后一条事件停滞 = runner 停了」,而该前提已被 prod 证伪
+(证伪过程与重标定后的数字见上面「阈值的来源与天花板」)。按 c10b 的口径,这类悬挂的最迟入链
+时刻是 **静默 900s + 一个 tick(60s)≈ 16 分钟**,结论是 `stall.agent_silent` / yellow;
+red 档留给「连心跳都没了」这种形状,阈值 180s + 一个 tick ≈ 4 分钟 —— 而这一档旧口径**根本没有**
+(旧的那条线分不清「模型不产字」与「摄取通道死了」)。所以净变化是:模型静默这一档变慢了,
+换来的是不再对健康任务误报(实测静默过 576s),并多出一条能真的说「runner 停了」的红线。
+误报的判据一旦 enforce,等于拿假设当处置依据。
+**yellow 的时延能不能压回 5 分钟,是 shadow 样本要回答的问题**
+(见上面推进条件表),不是重标定时钟能回答的。
 
 本期明确不做:
 
@@ -1212,7 +1230,7 @@ target 因此有了上面的三级取值。仍然要说清楚的是:
 | GET | `/api/tasks/:id/events` | `Bearer $WORKER_API_TOKEN` | **在途事件流**(§9.5):直接读 R2 的 `obs/` 段文件 journal,**不经 D1 终态归档**,所以任务 `RUNNING` 期间就有内容。返回 `{ task_id, state, events: AgentEventV1[], count, total, next_cursor, unreadable_attempts }`;按 attempt 创建序、attempt 内按 `generation`/`seq` 升序。`?after=`(扁平流上已读的条数,缺省 0)、`?limit=`(缺省 500,上限 2000;非法 → 400 `invalid_after`/`invalid_limit`)。任务不存在 → 404;从未摄取过 → 空列表 |
 | GET | `/api/tasks/:id/events/stream` | `Bearer $WORKER_API_TOKEN` | **在途事件的 SSE 投影**(§9.6):`text/event-stream`,与 `/events` 同一份 journal、同一个位置游标的两种读法(推/拉),互为恢复源。帧 `id` = **该帧之后已读的条数**(扁平序 1-based 位置),与 `?after=` 完全同口径 → 断线带 `Last-Event-ID: <id>` 续传不重发也不漏读(header 缺省 = 0 = 从头回放;值为空或畸形 → 400 `invalid_last_event_id`)。每拍 3s 尾读增量,零新增发 `: ping` 注释帧;任务离开 `RUNNING` 且增量推完 → 一帧 `event: end`(id = 总条数,`data` 带 `unreadable_attempts`)后关流。某 attempt 的 journal 读不到只列进 `unreadable_attempts`,**不杀流**。任务不存在 → 404(在建流之前判定)。**只读投影:不写任何权威状态** |
 | GET | `/api/tasks/:id/attempts/:aid/transcript` | `Bearer $WORKER_API_TOKEN` | 流式透传 R2 里的 transcript 原文 |
-| GET | `/live/:taskId` | `Bearer $WORKER_API_TOKEN` | **Live UI**(§9.7):第④层投影的人眼端。返回 `text/html`(`cache-control: no-store`),CSS/JS **全内联**、零外部依赖、无构建步骤;页面自己用 `EventSource` 连上一条端点(浏览器按标准重连并回传 `Last-Event-ID`,与帧 `id` 同口径 → 续传不需要 UI 侧代码)。顶部 = 任务 id + state 徽章;主体 = 事件时间线按到达序渲染 `seq`/`kind` 徽章(清单派生自 `OBS_EVENT_KINDS`)/`ts`/`payload.text` 摘要(>200 字符截断并标注全文长度),`tool_use` 附 `tool_names`、`raw` 附 `raw_type`、`result`/`error` 视觉强调。**核心价值 = 停滞检测**:显著位置显示「最后事件 Ns 前」且每秒自增,>90s 黄、>300s 红(验收标本 C2-r6:单次模型调用悬挂 24 分钟,当时只有人工 tail 才发现)。收到 `event: end` → 显示「流已结束」并停止计时。前端防御性解析:坏帧跳过并计数,`onerror` 有**分枝**的可见提示(401 不承诺重连)。鉴权与 `/api/tasks/:id/events*` 同源(无凭据 401、任务不存在 404,均在生成 HTML 之前判定 —— 要守的是**任务存在性**本身,不只是 payload);`taskId` 按上下文分两套转义(HTML 文本节点 / JS 字面量)。**只被动显示:不做任何判定、不做任何处置**(Supervisor 是独立消费者层,下一期)。⚠️ `EventSource` 不能携带 `Authorization` 头 → prod 无凭据直开得到 **401(预期:全局鉴权门有意覆盖这个出口)**;而 401 与网络断连按 `es.readyState` **可区分**(401 → 2/CLOSED 且永不重连,拒连 → 0/CONNECTING 且每 3s 重连),页面据此分分支提示,401 下如实写「不会自动重连」并指向带凭据的 API 客户端。浏览器可达性等后续产品化会话方案统一解决,**本期不引入任何临时凭据出口**(详见 §9.7「已知的部署侧前提」) |
+| GET | `/live/:taskId` | `Bearer $WORKER_API_TOKEN` | **Live UI**(§9.7):第④层投影的人眼端。返回 `text/html`(`cache-control: no-store`),CSS/JS **全内联**、零外部依赖、无构建步骤;页面自己用 `EventSource` 连上一条端点(浏览器按标准重连并回传 `Last-Event-ID`,与帧 `id` 同口径 → 续传不需要 UI 侧代码)。顶部 = 任务 id + state 徽章;主体 = 事件时间线按到达序渲染 `seq`/`kind` 徽章(清单派生自 `OBS_EVENT_KINDS`)/`ts`/`payload.text` 摘要(>200 字符截断并标注全文长度),`tool_use` 附 `tool_names`、`raw` 附 `raw_type`、`result`/`error` 视觉强调。**核心价值 = 停滞检测**:显著位置一条 pill 每秒自增,c10b 起是**两条时间源、三个说法** —— 平时「最后事件 Ns 前」,心跳停止 >180s 转红并改口「心跳停止 Ns(runner 停了)」,模型静默 >900s 转黄并改口「模型静默 Ns(runner 活着)」;静默那一档**永不转红**(两个阈值的推导与理由只在 §9.8 出现一次,页面只是它的读者)。收到 `event: end` → 显示「流已结束」并停止计时。前端防御性解析:坏帧跳过并计数,`onerror` 有**分枝**的可见提示(401 不承诺重连)。鉴权与 `/api/tasks/:id/events*` 同源(无凭据 401、任务不存在 404,均在生成 HTML 之前判定 —— 要守的是**任务存在性**本身,不只是 payload);`taskId` 按上下文分两套转义(HTML 文本节点 / JS 字面量)。**只被动显示:不做任何判定、不做任何处置**(Supervisor 是独立消费者层,下一期)。⚠️ `EventSource` 不能携带 `Authorization` 头 → prod 无凭据直开得到 **401(预期:全局鉴权门有意覆盖这个出口)**;而 401 与网络断连按 `es.readyState` **可区分**(401 → 2/CLOSED 且永不重连,拒连 → 0/CONNECTING 且每 3s 重连),页面据此分分支提示,401 下如实写「不会自动重连」并指向带凭据的 API 客户端。浏览器可达性等后续产品化会话方案统一解决,**本期不引入任何临时凭据出口**(详见 §9.7「已知的部署侧前提」) |
 
 ### 典型调用序列
 

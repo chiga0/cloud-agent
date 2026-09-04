@@ -1,13 +1,16 @@
 import { describe, expect, it } from "vitest";
 import {
   OBS_EVENT_KINDS,
+  OBS_HEARTBEAT_KIND,
   OBS_SECRET_MASK,
   OBS_TEXT_MAX_CHARS,
   maskSecrets,
   obsKindOfLine,
   obsSecretValues,
   toAgentEventV1,
+  toHeartbeatEvent,
 } from "../src/obs/events";
+import { LONGRUN_STATUSES, type LongRunStatus, type ProcessSnapshot } from "../src/exec/longrun";
 import type { Env } from "../src/types";
 
 /**
@@ -346,5 +349,54 @@ describe("ingress 打码与截断(自由文本 / 标量字段一视同仁)", () 
       KEY,
     ]);
     expect(obsSecretValues({ DASHSCOPE_API_KEY: "tiny" } as unknown as Env)).toEqual([]);
+  });
+});
+
+/**
+ * 心跳 payload 的类型门(§9.5)。它是外流面上唯一**由 runner 无条件书写**的通道:
+ * 每轮一条、无人审阅、内容取自沙箱内部,还兼任 §9.8 分级唯一的时间源。所以它比
+ * transcript 通道更窄 —— 没有 text 键、没有自由文本,只认枚举与有限数值。
+ *
+ * 这里要的是**负向**证据:上面那组「心跳只留枚举与数值」的用例都在证明「该留的留下了」,
+ * 而把 `HEARTBEAT_STATUS_VALUES.includes(status)` 这道守卫删掉(改成一个不校验枚举的
+ * `if (status !== null)`)在上述用例里全绿 —— 于是这条通道悄悄变成文本通道。
+ */
+describe("心跳 payload 的类型门:status 只认枚举、其余只认有限数值", () => {
+  function beat(snapshot: Partial<ProcessSnapshot>, over: { round_ms?: number; gap_ms?: number | null } = {}) {
+    return toHeartbeatEvent({
+      taskId: TASK,
+      attemptId: ATTEMPT,
+      generation: 1,
+      seq: 1,
+      ts: TS,
+      snapshot: { status: "running", exitCode: null, startedAtMs: null, ...snapshot } as ProcessSnapshot,
+      round_ms: over.round_ms ?? 33_000,
+      gap_ms: "gap_ms" in over ? over.gap_ms! : 33_000,
+    });
+  }
+
+  it("枚举外的 status 整键丢掉:文本不得借 status 之名进 journal", () => {
+    const leaky = 'running | {"content":"整个文件正文"}';
+    const e = beat({ status: leaky as LongRunStatus });
+    expect(e.kind).toBe(OBS_HEARTBEAT_KIND);
+    expect(e.payload).not.toHaveProperty("status");
+    // 只断「没有 status 键」不够:守卫被删掉时键名会换,内容才是真正的判据。
+    expect(JSON.stringify(e.payload)).not.toContain(leaky);
+  });
+
+  it("LONGRUN_STATUSES 每个取值都收:白名单是引用,不是抄本", () => {
+    // events.ts 引用 longrun.ts 的清单。抄一份的失败形状是:上游加一个状态,抄的那份
+    // 不再匹配 → 心跳的 status 键悄悄消失,而判据看起来还在工作(§9.5 同一理由)。
+    for (const status of LONGRUN_STATUSES) {
+      expect(beat({ status }).payload.status).toBe(status);
+    }
+  });
+
+  it("非有限数值与 null 一律不写键:缺观测 ≠ 观测到 0", () => {
+    const e = beat({ exitCode: Number.NaN as number, startedAtMs: "1725" as unknown as number }, { gap_ms: null });
+    expect(e.payload).not.toHaveProperty("exit_code");
+    expect(e.payload).not.toHaveProperty("started_at_ms");
+    expect(e.payload).not.toHaveProperty("gap_ms");
+    expect(e.payload.round_ms).toBe(33_000);
   });
 });
