@@ -1,5 +1,6 @@
 import type { BaseReport, Env, TaskSpec } from "../types";
 import type { ReviewVerdict } from "../control/gates";
+import { resolveBudget } from "../control/budget";
 import type { TranscriptUsage } from "./extract";
 import { TaskSession } from "../control/session";
 
@@ -94,7 +95,7 @@ export async function handleQueue(
           idempotency_key: body.idempotency_key,
           spec: body.spec,
           max_model_tokens: Number(env.DEFAULT_MAX_MODEL_TOKENS),
-          max_wall_seconds: Number(env.DEFAULT_MAX_WALL_SECONDS),
+          max_wall_seconds: resolveBudget(undefined, env).budgetSeconds,
         });
         msg.ack();
         continue;
@@ -107,7 +108,7 @@ export async function handleQueue(
           spec: body.spec,
           verify_context: { writer_manifest_key: body.writer_manifest_key },
           max_model_tokens: Number(env.DEFAULT_MAX_MODEL_TOKENS),
-          max_wall_seconds: Number(env.DEFAULT_MAX_WALL_SECONDS),
+          max_wall_seconds: resolveBudget(undefined, env).budgetSeconds,
         });
         msg.ack();
         continue;

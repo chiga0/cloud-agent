@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { MAX_SAFE_WALL_MINUTES, deriveWriterBudget } from "../src/exec/sandbox";
+import { deriveWriterBudget } from "../src/exec/sandbox";
+import { MAX_SAFE_WALL_MINUTES } from "../src/control/budget";
 
 /**
  * qwen 双预算推导:曾硬编码 5m/12turns,代码类任务(装依赖+跑测试)必然撞墙;
@@ -27,7 +28,11 @@ describe("deriveWriterBudget", () => {
 
   it("极小预算不产生 0/负分钟,墙钟下限 1 分钟", () => {
     expect(deriveWriterBudget(60, {}).wallMinutes).toBe(1);
-    expect(deriveWriterBudget(0, {}).wallMinutes).toBe(1);
+    // 0 不再是「合法的极小预算」:非法值在入口就被拒(400 invalid_budget),内部投影
+    // 按缺省回落。旧行为是 max(1, floor((0-120)/60)) 把它**掩盖**成 1 分钟预算,
+    // 于是「0」和「60」在沙箱侧长成同一个数 —— 那正是 c14b 要治的分叉。
+    expect(deriveWriterBudget(0, {}).wallMinutes).toBe(MAX_SAFE_WALL_MINUTES);
+    expect(deriveWriterBudget(-60, {}).wallMinutes).toBe(MAX_SAFE_WALL_MINUTES);
   });
 
   it("MAX_WRITER_WALL_MINUTES 可覆盖上限,非法值回落 25", () => {

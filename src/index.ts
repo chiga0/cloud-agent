@@ -3,6 +3,7 @@ import { ATTEMPT_ROLES } from "./types";
 import { handleQueue } from "./exec/queue";
 import { ATTEMPT_STATES, duplicateSeqs, TaskSession } from "./control/session";
 import { TASK_TRANSITIONS } from "./control/statemachine";
+import { resolveBudget, validateMaxWallSeconds } from "./control/budget";
 import type { EvidenceManifest } from "./audit/evidence";
 import { sha256Hex } from "./audit/evidence";
 import { assembleCandidate, candidateFileName } from "./audit/candidate";
@@ -69,7 +70,7 @@ function landingHtml(env: Env): string {
     <strong>API</strong>
     <dl>
       <dt>GET /healthz</dt><dd>公开,返回 <code>{"ok":true}</code></dd>
-      <dt>POST /api/tasks</dt><dd>创建任务(需要 <code>Authorization: Bearer WORKER_API_TOKEN</code>)</dd>
+      <dt>POST /api/tasks</dt><dd>创建任务(需要 <code>Authorization: Bearer WORKER_API_TOKEN</code>)。<code>budget.max_wall_seconds</code> 必须是 <strong>JSON 正整数</strong>(秒):负数 / 0 / 小数 / 字符串 / 非有限值 → <code>400 invalid_budget</code> 且不建任务;不给则取 <code>DEFAULT_MAX_WALL_SECONDS</code>。注意这是<strong>用户契约</strong>而非 writer 能力:平台安全上限可能把实际墙钟夹钳到更少分钟数,夹钳会往权威链落一条 <code>budget.clamped</code> 事件(<code>requested_seconds</code> / <code>writer_wall_minutes</code> / <code>ceiling_minutes</code> / <code>clamp_reason</code>),DO 的超时兜底仍按请求预算排 —— 口径见 <code>src/control/budget.ts</code> 与 <code>docs/architecture.md</code> §7.2.2</dd>
       <dt>GET /api/tasks/:id</dt><dd>查询任务、attempts 与事件链(需鉴权)</dd>
       <dt>GET /api/tasks/:id/result</dt><dd>读取 agent 最终答案(纯文本,需鉴权)</dd>
       <dt>POST /api/tasks/:id/approve</dt><dd>审批,只收 <code>approve</code> / <code>reject</code>(必须带 attempt_id + evidence_digest,需鉴权;<code>accept_with_notes</code> 是控制面内部降级决策,不由外部提交)</dd>
@@ -151,6 +152,13 @@ async function handleCreateTask(req: Request, env: Env): Promise<Response> {
   if (baseShaError) {
     return Response.json({ error: { type: "invalid_base_sha", detail: baseShaError } }, { status: 400 });
   }
+  // 预算是会被落进任务记录并排出 alarm 的数字:负数/0/小数/字符串/NaN 曾经照单全收,
+  // 结果是 attemptDeadline 排在过去、沙箱侧 max(1,…) 把它掩盖成 1 分钟,没人报原因。
+  // 缺省(不给)合法 —— 走环境缺省;给了非法值必须拒绝(见 control/budget.ts 的边界纪律)。
+  const budgetError = validateMaxWallSeconds(body.budget?.max_wall_seconds);
+  if (budgetError) {
+    return Response.json({ error: { type: "invalid_budget", detail: budgetError } }, { status: 400 });
+  }
   const mode =
     body.review_evidence_mode === "enforce" || body.review_evidence_mode === "shadow"
       ? body.review_evidence_mode
@@ -163,7 +171,7 @@ async function handleCreateTask(req: Request, env: Env): Promise<Response> {
     role: "writer",
     idempotency_key: `${taskId}:attempt:1`,
     max_model_tokens: body.budget?.max_model_tokens ?? Number(env.DEFAULT_MAX_MODEL_TOKENS),
-    max_wall_seconds: body.budget?.max_wall_seconds ?? Number(env.DEFAULT_MAX_WALL_SECONDS),
+    max_wall_seconds: resolveBudget(body.budget?.max_wall_seconds, env).budgetSeconds,
   });
 
   return Response.json({

@@ -12,6 +12,8 @@ import {
   pinWorkspace,
 } from "./base";
 import { LONGRUN_SCRIPT, collectLongRunOutput, longRunScript } from "./longrun";
+import type { BudgetEnv } from "../control/budget";
+import { resolveBudget } from "../control/budget";
 
 export interface SandboxRunResult {
   exitCode: number;
@@ -70,39 +72,17 @@ function pinMode(env: Env): BasePinMode {
 }
 
 /**
- * workerd 挂起检测会在 ~29:48 杀掉单条正在 await 的请求(M9 prod 实测),
- * 单条命令的安全上限 = 25 分钟。qwen 的墙钟绝不能超过它:超了拿到的是平台
- * 击杀(无产物、无回报、无退出码),而不是 qwen 自己的干净退出。
- * 可被 env.MAX_WRITER_WALL_MINUTES 覆盖(可选 + 回落)。
- */
-export const MAX_SAFE_WALL_MINUTES = 25;
-
-/**
- * qwen-code 双预算推导(纯函数,可单测)。
- * 墙钟与任务预算同源:留 120s 给 patch 导出/证据/回报,让 qwen 先于外层
- * 预算干净退出(否则外层杀进程时产物与回报都拿不到),再钳到平台上限。
- * turns 闸随墙钟缩放:实测健康产出速率 ≈ 8 turns/min(C2-r5 attempt 1
- * 5.3 分钟撞旧的固定 40 上限,且死在自己做变异验证的中途)—— turns 上限
- * 不该比墙钟先到,它只兜 reasoning loop 这类退化性快转。
+ * qwen-code 双预算的**投影**(薄封装):算法在 control/budget.ts 的 resolveBudget,
+ * 这里只取命令行需要的两个数。曾经它自己算一份(缺省、余量、上限各写一遍),
+ * 于是「入口看到的预算」与「writer 拿到的墙钟」分叉时没人知道 —— 现在两份都
+ * 出自同一次解析。钳制语义(120s 导出余量 + 平台安全上限)与 turns 缩放
+ * (≈8/min,下限 40)的动机见 budget.ts 与 test/writer-budget.test.ts。
  */
 export function deriveWriterBudget(
   maxWallSeconds: number | undefined,
-  env: {
-    DEFAULT_MAX_WALL_SECONDS?: string;
-    DEFAULT_MAX_SESSION_TURNS?: string;
-    MAX_WRITER_WALL_MINUTES?: string;
-  },
+  env: BudgetEnv,
 ): { wallMinutes: number; maxSessionTurns: number } {
-  const budgetSeconds = maxWallSeconds ?? Number(env.DEFAULT_MAX_WALL_SECONDS ?? "3600");
-  const ceilingRaw = Number(env.MAX_WRITER_WALL_MINUTES ?? "");
-  const ceiling =
-    Number.isFinite(ceilingRaw) && ceilingRaw > 0 ? Math.floor(ceilingRaw) : MAX_SAFE_WALL_MINUTES;
-  const wallMinutes = Math.min(ceiling, Math.max(1, Math.floor((budgetSeconds - 120) / 60)));
-  const turnsRaw = Number(env.DEFAULT_MAX_SESSION_TURNS ?? "");
-  const maxSessionTurns =
-    Number.isFinite(turnsRaw) && turnsRaw > 0
-      ? Math.floor(turnsRaw)
-      : Math.max(40, wallMinutes * 8);
+  const { wallMinutes, maxSessionTurns } = resolveBudget(maxWallSeconds, env);
   return { wallMinutes, maxSessionTurns };
 }
 
@@ -114,11 +94,7 @@ export function deriveWriterBudget(
  */
 export function qwenCommand(
   maxWallSeconds: number | undefined,
-  env: {
-    DEFAULT_MAX_WALL_SECONDS?: string;
-    DEFAULT_MAX_SESSION_TURNS?: string;
-    MAX_WRITER_WALL_MINUTES?: string;
-  },
+  env: BudgetEnv,
 ): string {
   const { wallMinutes, maxSessionTurns } = deriveWriterBudget(maxWallSeconds, env);
   return (
@@ -133,14 +109,13 @@ export function qwenCommand(
  * 「qwen 自己都没能退出」的悬挂(r6 实测单次模型调用悬挂 24 分钟)。
  * = min(qwen 墙钟 + 3min 余量, 任务预算 - 60s),后者保证赶在 DO 的
  * attemptDeadline alarm(claim + budget)之前给出带证据的回报。
+ * 推导在 resolveBudget,这里只是取那一个数。
  */
 export function qwenDeadlineSeconds(
   maxWallSeconds: number | undefined,
-  env: { DEFAULT_MAX_WALL_SECONDS?: string; MAX_WRITER_WALL_MINUTES?: string },
+  env: BudgetEnv,
 ): number {
-  const { wallMinutes } = deriveWriterBudget(maxWallSeconds, env);
-  const budget = maxWallSeconds ?? Number(env.DEFAULT_MAX_WALL_SECONDS ?? "3600");
-  return Math.max(60, Math.min(wallMinutes * 60 + 180, budget - 60));
+  return resolveBudget(maxWallSeconds, env).deadlineSeconds;
 }
 
 export interface QwenPrepareResult {

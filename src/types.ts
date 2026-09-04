@@ -19,6 +19,11 @@ export interface Env {
   MODEL_UPSTREAM_BASE: string;
   DEFAULT_MODEL: string;
   DEFAULT_MAX_MODEL_TOKENS: string;
+  /**
+   * 未给预算时的墙钟缺省(秒)。**只是缺省值**:校验、夹钳、四个时钟的推导全部在
+   * src/control/budget.ts 的 resolveBudget(§7.2.2)。给了非法值 → 回落 3600 并打
+   * `budget_default_invalid` 告警,不再让 NaN 流进 qwen 命令行。
+   */
   DEFAULT_MAX_WALL_SECONDS: string;
   DEFAULT_MAX_ATTEMPTS: string;
   /** reviewer reject 的证据校验:"shadow"(只记账) | "enforce"(不成立即降级 accept-with-notes) */
@@ -36,13 +41,14 @@ export interface Env {
   MAX_PATCH_BYTES?: string;
   /**
    * writer 沙箱内 qwen-code 的 session turns 上限。可选,缺配/非法时随墙钟
-   * 推导(≈8 turns/min,下限 40,见 sandbox.ts deriveWriterBudget)。
+   * 推导(≈8 turns/min,下限 40,见 control/budget.ts resolveBudget)。
    */
   DEFAULT_MAX_SESSION_TURNS?: string;
   /**
    * qwen 墙钟的平台安全上限(分钟)。可选,缺配/非法回落 25 —— workerd 挂起
    * 检测会在 ~29:48 杀掉单条 await 中的请求(M9 prod 实测),超过它拿到的是
-   * 平台击杀而非 qwen 的干净退出。
+   * 平台击杀而非 qwen 的干净退出。**只降 writer 能力,不改 DO alarm**;生效时
+   * 往权威链落一条 budget.clamped 事件(§7.2.2)。
    */
   MAX_WRITER_WALL_MINUTES?: string;
   /**

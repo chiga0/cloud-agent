@@ -16,6 +16,7 @@ import {
   type TranscriptUsage,
 } from "./extract";
 import type { ReviewVerdict } from "../control/gates";
+import { resolveBudget } from "../control/budget";
 import {
   isLongRunTerminal,
   killLongRun,
@@ -228,10 +229,15 @@ export class AttemptWorkflow extends WorkflowEntrypoint<Env, AttemptParams> {
               const out = await launchOrReattach(getSandbox(this.env.Sandbox, p.attempt_id));
               // verifier 没有内层墙钟,到期线 = 任务预算 - 120s(赶在 DO alarm 前回报);
               // writer 由 qwenDeadlineSeconds 与 qwen 自身 --max-wall-time 对齐。
+              // 预算数字一律出自 resolveBudget:这里曾自己写一份 `?? 3600`,是「同一规则
+              // 三个副本」的第四份(且它绕过了 DEFAULT_MAX_WALL_SECONDS,与环境缺省脱钩)。
               const deadlineS =
                 prep.kind === "writer"
                   ? qwenDeadlineSeconds(p.max_wall_seconds, this.env)
-                  : Math.max(60, (p.max_wall_seconds ?? 3600) - 120);
+                  : Math.max(
+                      60,
+                      resolveBudget(p.max_wall_seconds, this.env).budgetSeconds - 120,
+                    );
               const startedAtMs = out.snapshot.startedAtMs ?? Date.now();
               return {
                 snapshot: out.snapshot,

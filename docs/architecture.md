@@ -125,7 +125,7 @@ interface TaskSpec {
 
 ### Attempt
 Task 的一次执行尝试。同一 task 可能有多次 attempt(rework 再试;或 verifier / reviewer 接力)。每个 attempt 有自己的:
-- `max_model_tokens` / `max_wall_seconds` — 预算(时长/turn 由 qwen-code 参数硬停;tokens 事后记账)
+- `max_model_tokens` / `max_wall_seconds` — 预算(时长/turn 由 qwen-code 参数硬停;tokens 事后记账)。`max_wall_seconds` 的口径权威在 `src/control/budget.ts`:入口形状校验(非法 → 400 `invalid_budget`)、缺省只有一份、被平台上限夹钳时往链里落一条 `budget.clamped`(§7.2.2)
 - `tokens_used` — transcript 解析出的实际用量,由 workflow 的 extract step 统计
 - `workflow_instance_id` — 对应的 Durable Workflow 实例
 - `idempotency_key` — `task_id:attempt:N` 或 verifier/reviewer 场景的自定义键,UNIQUE 约束保证去重
@@ -510,6 +510,34 @@ c12 只走通了执行面那一半:差量导出来了、自称不完整了,但�
 > **落地端同批补的门**:`scripts/land-gate.mjs` 的 candidate 门现在读 `evidence.manifest.patch_complete`,显式 `false` 即 `digest_ok=false` → 退出码 2,且在取补丁本体**之前**就拒,`fetchPatch`/git 一次都不碰。理由:落地是唯一不可逆的动作,而「不完整」这句话此前只存在于读端展示,消费方漏看头就能把在途差量 commit 进 main。
 
 取证日志三条,都带退出码,可 grep:`budget_abort_no_diff`(到期且无差量)、`budget_abort_patch_export_failed`(到期且导出失败/超限)、`patch too large:`(容器内预检的超限原文,§13.17 那条上限的既有出口)。
+
+### 7.2.2 预算的诚实性:一个请求值,三个时钟(c14b)
+
+`budget.max_wall_seconds` 是**用户契约**,writer 真正拿到的墙钟是**平台事实**,这是两个数。此前系统在三处各写一份缺省(`src/index.ts` 的入口、`deriveWriterBudget`、`qwenDeadlineSeconds` 里各自的 `?? Number(... ?? "3600")`),入参零校验,夹钳发生时也不留痕 —— 于是「任务记录说 3600s、writer 实际只跑 25 分钟」这件事只能靠读代码复原。现在收成一个权威:`src/control/budget.ts` 的 `resolveBudget(maxWallSeconds, env)`,一次解析返回 `budgetSeconds / wallMinutes / ceilingMinutes / maxSessionTurns / deadlineSeconds / clamp`,`deriveWriterBudget` 与 `qwenDeadlineSeconds` 降为取数的薄封装(执行面投影与 `qwenCommand` 拼命令行时不再自己算一遍 min/max)。
+
+**三个时钟的相对关系**(`test/budget.test.ts` 逐条钉住):
+
+| 时钟 | 值 | 由谁排 | 意义 |
+| --- | --- | --- | --- |
+| qwen 墙钟 | `min(ceiling, max(1, floor((预算 - 120)/60)))` 分钟 | 容器内 `--max-wall-time` | writer 能力 |
+| poll 到期线 | `max(60, min(墙钟×60 + 180, 预算 - 60))` 秒 | workflow 的轮询循环 | 兜「qwen 自己都没能退出」的悬挂 |
+| DO alarm | `claim + 预算 + 300s`(`attemptDeadline`) | TaskSession alarm | 用户契约的兜底击杀 |
+
+顺序恒定:**qwen 墙钟 ≤ poll 到期 < DO alarm**。到期线里「预算 - 60」这一支就是它存在的全部意义 —— 赶在 alarm 之前给出带证据的回报(Fix C,§13.19),而 120s 导出余量保证那份回报带得上产物。
+
+**设计取向:夹钳只降 writer 能力,不改用户契约。** `MAX_WRITER_WALL_MINUTES`(缺配/非法回落 `MAX_SAFE_WALL_MINUTES = 25`,即 §13.18 那堵 workerd ~29:48 挂起墙)把 3600s 预算的 writer 削到 25 分钟时,DO alarm 仍按 `3600s + 宽限` 排。把 alarm 也一起提前看似「口径统一」,实际是悄悄把用户契约改小 —— 那是另一种不诚实。
+
+**留痕:权威链里多一条 `budget.clamped`**(`startAttemptInternal` 只对 writer 判,平台上限约束的是单条 await 中的沙箱命令)。payload 与 c10b 心跳同一卫生纪律 —— 只有标识符、数值与枚举,没有自由文本通道:
+
+```json
+{"attempt_id":"…","requested_seconds":3600,"writer_wall_minutes":25,"ceiling_minutes":25,"clamp_reason":"writer_wall_ceiling"}
+```
+
+`clamp_reason` ∈ `BUDGET_CLAMP_REASONS` = `writer_wall_ceiling`(撞上限被削平)/ `minimum_wall`(预算扣完 120s 导出余量后不足 1 分钟,被下限**抬**到 1 分钟 —— 方向相反的偏差同样要报)。未夹钳**不写事件**,而不是写一条「本无事」的噪声:`budgetClampPayload` 直接返回 `null` 来表达这件事,所以 `grep budget.clamped` 的命中集合恰好就是「被夹过的那批 attempt」。
+
+**入口 fail-closed**:`POST /api/tasks` 校验 `budget.max_wall_seconds` 的形状 —— 必须是 JSON 正整数;负数 / 0 / 小数 / 字符串 / NaN / Infinity 一律 `400 invalid_budget` 并带原因,**不建任务、不起 attempt**(非法值过去能落进 `TaskRecord`,于是 `attemptDeadline` 排出一个过去的 alarm,而沙箱侧的 `max(1, …)` 又把它掩盖成「1 分钟预算」)。这与配置侧的纪律刻意不对称:环境变量缺配 → 静默回落;给了非法值 → 回落 + `budget_default_invalid` 告警留痕(旧行为是 `Number("abc") = NaN` 一路流到命令行,变成 `--max-wall-time NaNm`)。理由是**请求方拿得到 400 并改正,配置方拿不到**;而对非法请求值做静默修正,产出的是与请求不符且无人报告的静默行为。
+
+> 时间账口径示例:`max_wall_seconds = 1800` 在 `MAX_WRITER_WALL_MINUTES=40`(prod)下 → 有效墙钟 **28 分钟**(扣掉 120s 导出预算),不夹钳、无事件;同一预算在无覆盖值的环境里 → **25 分钟**,链上必有一条 `budget.clamped`。历史形状注一句以免误读:§7.2 第 5 步里的 `--max-session-turns 12 --max-wall-time 5m` 是 Fix C 之前的字面量,那两个数现在由 `resolveBudget` 推导。
 
 ### 7.3 答案提取与记账 (src/exec/extract.ts)
 
@@ -1387,7 +1415,9 @@ git -C /path/to/repo apply task-$TASK-*.patch
 | Secret | `WORKER_API_TOKEN` | 控制面 API token |
 | Var | `DEFAULT_MODEL` = `qwen3.8-flash` | 默认模型 |
 | Var | `DEFAULT_MAX_MODEL_TOKENS` = `5000000` | 软上限,基本不触达 |
-| Var | `DEFAULT_MAX_WALL_SECONDS` = `3600` | 单 attempt 1 小时 |
+| Var | `DEFAULT_MAX_WALL_SECONDS` = `3600` | 单 attempt 1 小时。**只是缺省值**,算术全在 `src/control/budget.ts`:未给预算时取它,给了非法值则回落 `3600` 并打 `budget_default_invalid` 告警(§7.2.2) |
+| Var | `MAX_WRITER_WALL_MINUTES` = `40` | writer 沙箱墙钟上限(分钟),**可选 + 回落** —— 缺配/非法回落 `MAX_SAFE_WALL_MINUTES = 25`(§13.18 的 workerd ~29:48 挂起墙)。它只降 writer 能力,不改 DO alarm;生效即落一条 `budget.clamped`(§7.2.2) |
+| Var | `DEFAULT_MAX_SESSION_TURNS` | writer 的 turns 闸,**可选 + 回落** —— 缺配/非法时随墙钟推导(≈8 turns/min,下限 40)。prod 未设,故 `wrangler.jsonc` 里不出现 |
 | Var | `REJECT_EVIDENCE_MODE` = `shadow` | reviewer 证据硬校验模式:`shadow` 只记事件、`enforce` 才降级返工(§13.12) |
 | Var | `BASE_PIN_MODE` = `shadow` | 基线材质化失败的处理:`shadow` 回落已解析的默认分支并记 `base.fallback`、`enforce` 直接 `BLOCKED` 转人工(§13.13)。**两种模式都真实使用冻结基线材质化工作副本**,只在失败路径上分叉;verifier 侧恒为 enforce |
 | Var | `EGRESS_MODE` = `enforce` | 沙箱出站策略:`shadow` 只记账放行、`enforce` 白名单拒绝(§13.14)。有否决权的策略,先 shadow 取样再翻 |

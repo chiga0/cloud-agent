@@ -13,6 +13,7 @@ import { BASE_ERRORS, isValidSha, isBaseError } from "../exec/base";
 import { costWeightedFromUsage, type TranscriptUsage } from "../exec/extract";
 import type { CandidateDecision, CandidateEvidence } from "../audit/candidate";
 import { assertTransition, attemptDeadline, decideRework, isLegalTransition, nextWatchdogAlarm } from "./statemachine";
+import { BUDGET_CLAMP_EVENT_KIND, budgetClampPayload, resolveBudget } from "./budget";
 import {
   assessReviewRejection,
   describeVerifyFailure,
@@ -588,6 +589,16 @@ export class TaskSession extends DurableObject<Env> {
       idempotency_key: args.idempotency_key,
       base_pin: params.base_pin,
     });
+
+    // 夹钳留痕:任务记录里的预算与 writer 真正拿到的墙钟是两个数(曾长期如此却无痕),
+    // 分叉必须在权威链上自描述,而不是靠读者去代码里复原 min() 的算术。
+    // 只在 writer 上判 —— 平台上限约束的是单条 await 中的沙箱命令,reviewer/verifier
+    // 的到期线直接由预算推导。下面的 alarm 仍按 args.max_wall_seconds 排:夹钳只降
+    // writer 能力,不悄悄缩小用户契约。
+    if (args.role === "writer") {
+      const clamp = budgetClampPayload(id, resolveBudget(args.max_wall_seconds, this.env));
+      if (clamp) await this.appendEvent(s, BUDGET_CLAMP_EVENT_KIND, clamp);
+    }
 
     if (
       args.role === "writer" &&
@@ -1405,7 +1416,7 @@ export class TaskSession extends DurableObject<Env> {
       role: "writer",
       idempotency_key: `${s.task!.id}:attempt:${writerAttempts.length + 1}`,
       max_model_tokens: Number(this.env.DEFAULT_MAX_MODEL_TOKENS),
-      max_wall_seconds: Number(this.env.DEFAULT_MAX_WALL_SECONDS),
+      max_wall_seconds: resolveBudget(undefined, this.env).budgetSeconds,
       instructions: args.instructions,
     });
     await this.appendEvent(s, args.eventKind, {
