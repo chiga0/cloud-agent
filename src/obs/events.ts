@@ -430,6 +430,14 @@ function segmentShape(tokens: string[]): string {
  * `… | tail -20` 这类尾巴钉在收尾噪音上。装饰段总是短段,段越长越像是这件事本身。
  * 全段都是前缀段时(裸 `cd /workspace/repo`)照旧取它 —— 反复只 `cd` 不干活就是空转,
  * 这条判据不许因为这次拆段而变哑。
+ *
+ * 残余局限(完整清单的唯一权威在 §9.8,这里不重复阈值推导):① flag 永远看不见(上
+ * 面已说);② 读同一文件的不同行范围会算成不同键 ⇒ 判据从过火转为偏冷,这是接受的
+ * 代价;③ 记账型尾段(`… ; echo "TSC_EXIT=$?"`)由「token 数最多」的选段规则天然避开,
+ * **不许**用给 echo/printf 建动词黑名单的方式「再修」—— 名单会长成第二个
+ * TOOL_TARGET_KEYS 且永远滞后。另:分词是引号感知的,含引号的无分段符输入形状相对
+ * 旧实现(0f30fb3)是有意变化(旧形状会漏引号碎片);「与旧实现逐字节一致」只在
+ * 无引号输入上成立,两个方向都有测试钉住(test/obs-events.test.ts「A2 边界」两用例)。
  */
 function commandShape(command: string): string {
   const segments = commandSegments(command);

@@ -341,6 +341,57 @@ describe("payload.tool_targets(入参形状摘要:按键白名单 + 打码 + ≤
     }
   });
 
+  /**
+   * 操作员补充(2026-09-04,c10b 先例)。派单验收 2 曾要求「不含分段符的输入与旧实现
+   * 逐字节相同(含 bash -c 带引号例)」;落地实现把分词改成了引号感知(引号内空白不切),
+   * 于是**含引号**的无分段符输入形状相对旧实现是有意变化 —— 旧形状是 `bash 'curl` /
+   * `sed '1,2p'` / `grep "async` 这类引号碎片。disclosure 描述了机制但未承认这处偏离;
+   * 操作员审查用 12 用例经公共路径实证:无引号输入 6/6 逐字节一致,引号输入 3/3 变化
+   * 且全是改善(碎片 → 真目标)。这里把两个方向都钉住:无引号方向对齐 0f30fb3 的旧
+   * 算法(下面的引用实现照抄该提交),引号方向钉住新形状 —— 任何一侧静默漂移都会红。
+   */
+  const legacyShape = (command: string): string => {
+    const tokens = command.trim().split(/\s+/).filter((t) => t.length > 0);
+    if (tokens.length === 0) return "";
+    const head = tokens[0].slice(0, 128);
+    const arg = tokens.slice(1).find((t) => !t.startsWith("-"));
+    return arg === undefined ? head : `${head} ${arg.slice(0, 128)}`;
+  };
+  const shapeOf = (command: string): string => {
+    const e = build({ type: "assistant", content: [tool({ command }, "run_shell_command")] });
+    const targets = e.payload.tool_targets as string[] | undefined;
+    return targets === undefined ? "" : targets[0];
+  };
+
+  it("A2 边界(操作员钉):无引号的无分段符输入与旧实现(0f30fb3)逐字节一致", () => {
+    const cases = [
+      "npm test -- --reporter=verbose",
+      "git status",
+      "pwd",
+      "ls -la",
+      "npm test 2>&1",
+      "tail -5 /tmp/install.log 2>/dev/null",
+      "cd /workspace/repo",
+      "   ",
+      "",
+    ];
+    for (const command of cases) {
+      expect(shapeOf(command), JSON.stringify(command)).toBe(legacyShape(command));
+    }
+  });
+
+  it("A2 边界(操作员钉):含引号输入是有意变化 —— 碎片换真目标,不得回退也不得再漂", () => {
+    const cases: Array<[string, string]> = [
+      [`bash -c 'curl -H "Authorization: Bearer x" https://example.com'`, "bash"],
+      [`sed -n '1,2p' src/a.ts`, "sed src/a.ts"],
+      [`grep -n "async archive\\|archive(" src/a.ts`, "grep src/a.ts"],
+    ];
+    for (const [command, want] of cases) {
+      expect(shapeOf(command), command).toBe(want);
+      expect(shapeOf(command), command).not.toBe(legacyShape(command));
+    }
+  });
+
   it("键名大小写与分隔符不敏感:同一工具改名换写法仍能取到", () => {
     const variants = ["filePath", "FILE_PATH", "File-Path", " file path ", "path"];
     for (const key of variants) {
