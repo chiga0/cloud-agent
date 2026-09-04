@@ -1527,5 +1527,114 @@ describe("归档停滞可发现性(c11b)", () => {
       await unpoison();
     }
   });
+
+  /**
+   * 把 DO 当前分片里 seq=`seq` 的那条复制 `copies` 份(同 seq、别的 digest),复现
+   * pre-c11a 并发追加被 DO 快照冻结下来的形态:prod 标本 5489dc8a 的 seq 4–9 各有 4–5 份。
+   *
+   * 走 storage 直写而不是造 RPC:重号快照**造不出来**(写层的 seq CAS 早在 c11a 修好了),
+   * 只能作为存量损坏被注入。本棒测的正是「已经带病的存量快照怎么体面地死」。
+   */
+  async function duplicateSeqInSnapshot(stub: Stub, seq: number, copies: number): Promise<void> {
+    await runInDurableObject(stub, async (_instance, state) => {
+      type Row = {
+        seq: number;
+        kind: string;
+        payload: unknown;
+        canonical: string;
+        digest: string;
+        prev_digest: string | null;
+        created_at: string;
+      };
+      const cur = (await state.storage.get<Row[]>("events:cur")) ?? [];
+      const row = cur.find((e) => e.seq === seq);
+      if (!row) throw new Error(`夹具:当前分片里没有 seq=${seq} 的事件`);
+      await state.storage.put(
+        "events:cur",
+        cur.concat(
+          Array.from({ length: copies }, (_, i) => ({
+            ...row,
+            digest: `${i}`.repeat(64),
+            prev_digest: `f${i}`.repeat(32).slice(0, 64),
+          })),
+        ),
+      );
+    });
+  }
+
+  const countRows = async (sql: string, id: string): Promise<number> => {
+    const row = await env.DB.prepare(sql).bind(id).first<{ n: number | string }>();
+    return Number(row?.n ?? -1);
+  };
+
+  it("(d4) 快照自带重号 seq ⇒ 归档在构批之前拒收:具名日志 + D1 一条请求也没打", async () => {
+    const errors = spyErrors();
+    const stub = newStub();
+    const taskId = crypto.randomUUID();
+    await stub.createTask({ prompt: "duplicate seq snapshot" } as never, taskId);
+    await stub.startAttempt({ role: "writer", idempotency_key: crypto.randomUUID(), ...BUDGET });
+    await stallArchive(stub);
+    await duplicateSeqInSnapshot(stub, 1, 4); // seq 1 一共 5 份
+
+    const before = Date.now();
+    await fireAlarm(stub);
+
+    // ① 失效有名字:一行可 grep 的 archive_rejected,带 task_id 与重号清单。
+    const rejected = errors.filter((l) => l.includes("archive_rejected"));
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0]).toContain(`task=${taskId}`);
+    expect(rejected[0]).toContain("reason=duplicate_seq");
+    expect(rejected[0]).toContain("duplicate_seqs=1");
+    expect(rejected[0]).toContain("duplicate_seq_count=1");
+    expect(rejected[0]).toContain("d1_batch_constructed=false");
+
+    // ② 不碰 D1:整批没构造,四张表一条都没写(原先每 30 分钟白打一整批)。
+    expect(await countRows("SELECT COUNT(*) AS n FROM events WHERE task_id = ?", taskId)).toBe(0);
+    expect(await countRows("SELECT COUNT(*) AS n FROM attempts WHERE task_id = ?", taskId)).toBe(0);
+    expect(await countRows("SELECT COUNT(*) AS n FROM tasks WHERE id = ?", taskId)).toBe(0);
+
+    // ③ 幂等处置(方案 a):阶梯算术一行未改 —— 仍然喊 archive_stalled、仍然排下一次,
+    //    只是 error 里带的是**有名字的拒收**,而不是神秘的 D1 UNIQUE 报错。
+    const stalled = errors.filter((l) => l.includes("archive_stalled"));
+    expect(stalled).toHaveLength(1);
+    expect(stalled[0]).toContain("duplicated seq");
+    expect(stalled[0]).not.toContain("UNIQUE constraint");
+    expect((await storedTask(stub))!.archive_retry_step).toBe(1);
+    expect(
+      Math.abs((await scheduledAlarm(stub))! - before - ARCHIVE_RETRY_LADDER_MS[0]),
+    ).toBeLessThan(2_000);
+
+    // ④ 没有新状态:任务仍是 BLOCKED、仍未归档。拒收不改权威,只拒绝投影。
+    const snap = (await snapOf(stub))!;
+    expect(snap.task.state).toBe("BLOCKED");
+    expect(snap.task.archived).toBe(false);
+    expect(snap.events.length).toBeGreaterThan(1);
+  });
+
+  it("(d5) 干净快照回归:同一条 alarm 归档路径行为一字未变(全量落 D1、置位、零拒收日志)", async () => {
+    const errors = spyErrors();
+    const stub = newStub();
+    const taskId = crypto.randomUUID();
+    await stub.createTask({ prompt: "clean snapshot" } as never, taskId);
+    await stub.startAttempt({ role: "writer", idempotency_key: crypto.randomUUID(), ...BUDGET });
+    await stallArchive(stub);
+    const doSeqs = (await snapOf(stub))!.events.map((e) => e.seq);
+    expect(doSeqs.length).toBeGreaterThan(0);
+
+    await fireAlarm(stub);
+
+    const after = (await snapOf(stub))!;
+    expect(after.task.archived).toBe(true);
+    expect(after.events.map((e) => e.seq)).toEqual(doSeqs);
+    expect((await storedTask(stub))!.archive_retry_step).toBe(0);
+    const rows = await env.DB.prepare("SELECT seq FROM events WHERE task_id = ? ORDER BY seq")
+      .bind(taskId)
+      .all<{ seq: number }>();
+    expect(rows.results.map((r) => r.seq)).toEqual(doSeqs);
+    expect(await countRows("SELECT COUNT(*) AS n FROM attempts WHERE task_id = ?", taskId)).toBe(1);
+    // 判据是「有重号才拒」,不是「归档前先自查一遍并抱怨」:干净链必须零噪声。
+    expect(errors.filter((l) => l.includes("archive_rejected"))).toEqual([]);
+    expect(errors.filter((l) => l.includes("archive_stalled"))).toEqual([]);
+  });
 });
 

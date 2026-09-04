@@ -261,6 +261,40 @@ export function archiveRetryDelayMs(step: number): number {
 const ARCHIVE_RETRY_MAX_STEP = ARCHIVE_RETRY_LADDER_MS.length - 1;
 
 /**
+ * 快照里出现两次及以上的 seq,升序去重。空数组 = 序号唯一。
+ *
+ * 口径刻意只做「重号计数」,不做逐链校验:pre-c11a 并发追加留下的分叉尸体里,孤儿分支
+ * 不在 tail 链上,拿 `prev_digest` 去走全量事件会到处误报(见 docs/architecture.md §13.1)。
+ *
+ * 单一判据、两处共用:归档面的拒收与 `/api/admin/chain-check?task_id=` 的补盲检测都调它。
+ * 各数一次迟早数出两个答案,而「这条快照能不能归档」与「仪器怎么说」必须是同一件事。
+ */
+export function duplicateSeqs(events: readonly { seq: number }[]): number[] {
+  const seen = new Set<number>();
+  const dup = new Set<number>();
+  for (const e of events) {
+    if (seen.has(e.seq)) dup.add(e.seq);
+    else seen.add(e.seq);
+  }
+  return [...dup].sort((a, b) => a - b);
+}
+
+/**
+ * 归档对**自身带重号 seq 的快照**的确定性拒收。
+ *
+ * 与暂态故障的分界:这条永远不会「下一次自己就好」。`events` 表有
+ * `idx_events_task_seq` UNIQUE(migrations/0003),而归档是 DELETE-then-INSERT ——
+ * 旧行被清掉之后,同一批内第 2 条相同 `(task_id, seq)` 的 INSERT 自己撞自己。
+ * 与其让 D1 回一句 `UNIQUE constraint failed` 逼人事后反查,不如在构批之前叫出名字。
+ */
+export class ArchiveRejectedSnapshot extends Error {
+  constructor(msg: string) {
+    super(msg);
+    this.name = "ArchiveRejectedSnapshot";
+  }
+}
+
+/**
  * BLOCKED 的结论原文(进事件链与 D1 归档)。刻意自带「该动哪个旋钮」:转人工之后,
  * 读事件的人不必再反查 exit code 的语义才能决定下一步。
  *
@@ -1760,6 +1794,24 @@ export class TaskSession extends DurableObject<Env> {
   private async archive(s: SessionData): Promise<void> {
     if (s.task!.archived) return;
     const t = s.task!;
+    /**
+     * 构批之前的第一道门,且只有这一道:归档有多个入口(终态 RPC 的 `archiveWithRetry`、
+     * alarm 的停滞重试、alarm 里 watchdog 把任务打成 BLOCKED 之后的归档),判据写在写口本身
+     * 才能保证「哪一个入口都不白打一整批 D1 请求」。写在调用方就得各写一遍。
+     */
+    const dupSeqs = duplicateSeqs(s.events);
+    if (dupSeqs.length > 0) {
+      const shown = dupSeqs.slice(0, 20).join(",");
+      console.error(
+        `archive_rejected task=${t.id} state=${t.state} reason=duplicate_seq ` +
+          `duplicate_seqs=${shown} duplicate_seq_count=${dupSeqs.length} ` +
+          `events=${s.events.length} d1_batch_constructed=false ` +
+          `(快照自身重号,重试必然同样失败:见 docs/architecture.md §6.2)`,
+      );
+      throw new ArchiveRejectedSnapshot(
+        `snapshot has ${dupSeqs.length} duplicated seq(s): ${shown} — archive refused before building the D1 batch`,
+      );
+    }
     const stmts: D1PreparedStatement[] = [];
     stmts.push(
       this.env.DB.prepare(

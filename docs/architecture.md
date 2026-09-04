@@ -347,7 +347,8 @@ D1 里查不到,而且它会一直重试到成功或人工介入」。同一个 
 
 1. **看不见未归档的任务。** 数据源仍是 `SELECT DISTINCT task_id FROM events`,而 events 只在归档
    成功时写。`5489dc8a` 从头到尾对它不可见 —— 这也是当年 `checked=79, broken=0` 的全部原因。
-   **唯一出口有两条**:`?task_id=` 对账模式(下面),和 `archive_stalled` 日志。
+   **唯一出口有两条**:`?task_id=` 对账模式(下面),和 `archive_stalled` / `archive_rejected` 日志
+   (§6.2.4)。补盲之后前者已经覆盖这条损伤:它不再需要靠容器日志考古才能发现。
 2. 看不见 **seq 空洞**(只判严格递增唯一,不判连续)—— 少一行且恰好不打断前后继时不报。
 3. `:state` 在链里一条 `to` 都解析不出来时**主动不判**(历史行/非当前写路径的产物)。假阳性的代价是
    淹没真信号,所以这里宁可留盲区并在本节写明。
@@ -367,6 +368,52 @@ DO 里没有这个任务 ⇒ `404 task_not_found`(三态说的是「两份记录
 `task_id` 畸形 ⇒ `400 invalid_task_id`(与 `/api/admin/events` 同一条 `[0-9a-f-]{36}` 口径)。
 响应额外带 `do_events`/`d1_events`/`do_tail_digest`/`d1_tail_digest` 与同一套 `brokenTasks`,
 这样「差在哪」不需要再连一次库去猜。
+
+**对账模式的 `broken`/`brokenTasks` 覆盖两侧**(c11b 补盲)。D1 侧沿用 `chainBreaks` 的四类判据,
+一行未改;DO 侧对**全量事件**做一次重号计数,复用同一种 `:seq` 标记。为什么必须有 DO 这一半:
+`not_archived` 的任务在 D1 里零行,只查 D1 等于替它宣布「损伤不存在」,而 `5489dc8a` 的损伤恰好
+全程只存在于 DO 快照里(它一次都没进过 D1)。DO 侧**只扫重号、不走链** —— 分叉的孤儿分支不在 tail
+链上,按 `prev_digest` 校验全量事件会满屏误报(判据 3 里那种「假阳性淹没真信号」在这里更严重)。
+判据与归档面共用同一个 `duplicateSeqs`,不留两份口径。
+
+#### 6.2.4 `archive_rejected`:把确定性死亡变成有名字的失效形状
+
+失效形状:**快照自身带重复 seq**(pre-c11a 并发追加的分叉被 DO 快照冻结,§13.1)。`events` 表有
+`UNIQUE(task_id, seq)`(migrations/0003),而归档是 DELETE-then-INSERT —— 旧行被清掉之后,**同一批内
+第 2 条相同 `(task_id, seq)` 的 INSERT 自己撞自己**。所以这不是「重试从头重插所以撞约束」(那个早期
+猜测不成立:四张表全是 DELETE-then-INSERT,归档路径本身是幂等的),而是这份快照**在任何时刻都不可
+归档**:第 N 次重试与第 1 次的报错逐字节相同。这是确定性死亡,不是暂态故障。
+
+现在的处置是**构批之前拒收**(`src/control/session.ts:archive()`):
+
+```
+console.error("archive_rejected task=<id> state=<state> reason=duplicate_seq duplicate_seqs=<升序去重的前 20 个> duplicate_seq_count=<N> events=<链长> d1_batch_constructed=false …")
+throw ArchiveRejectedSnapshot
+```
+
+日志判读:三个 token 各管一件事。`archive_rejected` = 失效有名字,且 `reason=duplicate_seq` 直接
+给出机理与 `duplicate_seqs=` 清单(不必再反查 SQLITE 报错说的是哪张表);`d1_batch_constructed=false`
+= 这一轮 D1 一个请求都没打(原先每 30 分钟白写一整批四表);而同一轮的 `archive_stalled` **照旧喊**,
+只是它的 `error=` 从 `UNIQUE constraint failed: events.task_id, events.seq` 换成了这句有名字的拒收 ——
+既有告警口径不必改,而两类原因的 grep 面从此分开。
+
+**为什么不去重**:`INSERT OR REPLACE` / `ON CONFLICT` 静默去重是**伪造审计记录**。分叉链里「哪一条才是
+真发生过的」没有任何代码可以判定 —— 那几份复制品的 `prev_digest` 各不相同,每一条都自证为真。选一条
+写入 = 由归档层替审计决定历史上发生过什么,而归档层是读模型,不是权威(§3)。宁可这份档案缺席,
+也不许它说谎。
+
+**幂等处置选的是方案 (a)**:判据放在 `archive()` 构批之前,而不是各调用方各查一遍 —— 归档有三个入口
+(终态 RPC 的 `archiveWithRetry`、alarm 的停滞重试、alarm 里 watchdog 打成 BLOCKED 之后的归档),
+写在写口本身才能保证哪一个入口都不白打 D1。代价是阶梯**逐档爬到 30min 封顶并一直心跳**这件事原样
+保留:`ARCHIVE_RETRY_LADDER_MS` 数值一行未动(`archive_retry_step` 也照旧累加),没有为拒收发明新的
+任务状态机状态。**为什么保留**:终态任务的 `nextWatchdogAlarm` 返回 `null`,所以停滞 alarm 是这条 DO
+唯一还剩的观察者,而 Supervisor tick 就寄生在同一个 alarm 里(§9.8)—— 停掉它等于把一条仍然持有权威链
+的 DO 永久静音,比每分钟多看一行日志危险得多;而 30 分钟一次的内存扫描成本可以忽略,换来的是操作员
+真去修快照时不必重新部署就能被捡起。换句话说:拒收省下的是**白打的 D1 批写与误导性的报错文本**,
+不是阶梯本身 —— 阶梯的语义(「连续失败」)在这里仍然成立。
+
+**这类任务不会自愈**。看到 `archive_rejected` 意味着「它在等人工处置」,选项与各自的代价见 §13.1 的
+open options;本棒不实现任何一种。
 
 ---
 
@@ -1338,6 +1385,33 @@ git -C /path/to/repo apply task-$TASK-*.patch
 修复(`migrations/0003_add_event_seq.sql` + `authority.appendEvent`):events 增加按 task 单调的 `seq` 列,`UNIQUE(task_id, seq)` 做 CAS;append 时单条 SELECT 原子取 `MAX(seq)+1` 与 prev digest,INSERT 冲突即重读重试(最多 5 次)。链不会分叉。
 
 **修复时发现并处置了一个真实分叉**:任务 `8ba58c8c` 在旧代理架构下,budget.exhausted 与 model.call 同一秒(created_at 秒级精度)并发写入,seq 7/8 同时指向 seq 6。已按序重算 digest 将分叉重链,修复后全库断链检查 `broken = 0`。
+
+**历史分叉尸体的归档面后果(c11b 补)**。写层修好 ≠ 存量干净:`J.2` 全量重放「84 链 0 broken」说的是
+**新任务**不再分叉,而 pre-c11a 已经写坏并被 DO 快照冻结的老损伤仍然原样躺在 storage 里。prod 标本
+`5489dc8a-a2bd-4b81-85be-3265f7a77bb6`(BLOCKED)的 `GET /api/tasks/<id>` 读出 29 条事件,其中
+seq 4–9 各有 4–5 份重复(同 seq、`prev_digest` 各不相同)。
+
+要分清谁是受害者:**权威层自己没事** —— DO 是权威,读面按到达序工作,重复那份只是多显示一遍。
+**只有 D1 归档读模型与审计回放受害** —— 归档的 DELETE-then-INSERT 清掉旧行之后,同一批内第 2 条相同
+`(task_id, seq)` 的 INSERT 自撞 `idx_events_task_seq`,于是这条任务**永远进不了 D1**:`/api/admin/events`、
+`/api/admin/tasks`、全局 chain-check 全都看不见它(它一次都没归成档)。当年唯一的可见面是容器日志里的
+`archive_stalled` + 那句 `UNIQUE constraint failed`,对全部现有仪器不可见。
+
+现在的形状:归档在构批之前**具名拒收**(`archive_rejected`,§6.2.4),而 `?task_id=` 对账模式对 DO 全量
+事件做重号扫描(`:seq` 破口,§6.2.3)—— 这类损伤从此在仪器上是**主动可见**的,不再需要日志考古。
+
+**遗留尸体的处置是 open options(操作员的产品决策,本棒不实现任何一种)**:
+
+1. **留档不归档**:接受它永不进 D1,靠 DO 读面 + `?task_id=` 对账兜住。零写风险;代价是审计回放有
+   永久缺口,且这份权威链只存在于 DO storage —— DO 一旦被淘汰就再无第二次机会(§6.1 第 5 条)。
+2. **手术修快照**:人工判定「哪条是真」、删掉孤儿分支、按序重算 digest 重链,之后归档自然成功(§13.1
+   对 `8ba58c8c` 就是这么做的)。**必须连同权威层的审计记录一起做** —— 谁在何时以何依据删了哪几条;
+   否则修完的链虽然自洽,却成了一份不可自证的档案。
+3. **隔离归档**:给这类任务开一条允许重号的旁路(独立表,或放宽 UNIQUE)。慎选:那是 **D1 语义变化**,
+   而 `UNIQUE(task_id, seq)` 正是 c11a 的 seq CAS 机制本身(migrations/0003)—— 除非确认旁路行不参与
+   CAS 且不会被任何校验口径误读,否则不要走这条路。
+
+不许做的第四种:用 `INSERT OR REPLACE` / `ON CONFLICT` 在归档层静默去重 —— 那是伪造审计记录,理由见 §6.2.4。
 
 ### 13.2 budget overshoot 窗口 — 已随代理废弃消除
 

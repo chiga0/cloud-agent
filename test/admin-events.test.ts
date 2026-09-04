@@ -1,5 +1,5 @@
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { createExecutionContext, env } from "cloudflare:test";
+import { createExecutionContext, env, runInDurableObject } from "cloudflare:test";
 import worker from "../src/index";
 import { sha256Hex } from "../src/audit/evidence";
 import type { TaskState } from "../src/types";
@@ -961,6 +961,48 @@ describe("GET /api/admin/chain-check", () => {
       expect(r.do_events).toBeGreaterThan(0);
       expect(r.archived).toBe(false);
       // 这一行就是「监控为什么当年看不见它」:全局模式连 checked 都不加。
+      expect(await globalCheck()).toEqual({ checked: 0, broken: 0, brokenTasks: [] });
+    });
+
+    /**
+     * 补盲用例的夹具:往 DO 当前分片里按**同一个 seq** 复制事件,复现 pre-c11a 并发追加
+     * 被快照冻结下来的形态(5489dc8a 的 seq 4–9 各有 4–5 份)。重号快照经正常写路径造不出来
+     * (c11a 的 seq CAS 挡住了),所以只能直写 storage。
+     */
+    async function duplicateSeqInDoSnapshot(taskId: string, seq: number, copies: number) {
+      const stub = env.TASK_SESSION.get(env.TASK_SESSION.idFromName(taskId));
+      await runInDurableObject(stub, async (_instance, state) => {
+        type Row = { seq: number; kind: string; digest: string; prev_digest: string | null };
+        const cur = (await state.storage.get<Row[]>("events:cur")) ?? [];
+        const row = cur.find((e) => e.seq === seq);
+        if (!row) throw new Error(`夹具:当前分片里没有 seq=${seq} 的事件`);
+        await state.storage.put(
+          "events:cur",
+          cur.concat(
+            Array.from({ length: copies }, (_, i) => ({
+              ...row,
+              digest: `${i}`.repeat(64),
+              prev_digest: `f${i}`.repeat(32).slice(0, 64),
+            })),
+          ),
+        );
+      });
+    }
+
+    it("补盲:DO 快照自带重号 ⇒ 对账模式报 :seq 破口,而全局模式仍然看不见它", async () => {
+      const taskId = crypto.randomUUID();
+      await doTask(taskId);
+      await duplicateSeqInDoSnapshot(taskId, 1, 4);
+
+      const r = (await reconcile(taskId).then((x) => x.body)) as ReconcileBody;
+      // 三态口径不因补盲而变:这条的「两份记录的关系」仍然是没归档。
+      expect(r.result).toBe("not_archived");
+      expect(r.d1_events).toBe(0);
+      expect(r.do_events).toBeGreaterThan(1);
+      // 重号 5 次 = 1 个破口(与全局模式同一套去重口径),标记格式复用 <task>:<seq>:<kind>。
+      expect(r.broken).toBe(1);
+      expect(r.brokenTasks).toEqual([`${taskId}:1:seq`]);
+      // 仍然只有对账模式看得见:补盲没有给全局模式凭空加数据源(events 表零行)。
       expect(await globalCheck()).toEqual({ checked: 0, broken: 0, brokenTasks: [] });
     });
 

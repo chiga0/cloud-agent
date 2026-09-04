@@ -1,7 +1,7 @@
 import type { Env, TaskSpec, TaskState } from "./types";
 import { ATTEMPT_ROLES } from "./types";
 import { handleQueue } from "./exec/queue";
-import { ATTEMPT_STATES, TaskSession } from "./control/session";
+import { ATTEMPT_STATES, duplicateSeqs, TaskSession } from "./control/session";
 import { TASK_TRANSITIONS } from "./control/statemachine";
 import type { EvidenceManifest } from "./audit/evidence";
 import { sha256Hex } from "./audit/evidence";
@@ -80,7 +80,7 @@ function landingHtml(env: Env): string {
       <dt>GET /api/tasks/:id/rescue?format=patch</dt><dd>下载抢救差量正文(同样逐字节重算 sha256,不一致 → 500 <code>integrity_error</code>);响应头额外带 <code>x-rescued: true</code> / <code>x-pinned: false</code>,只看头也不会把它当成可提交成品</dd>
       <dt>GET /api/tasks/:id/events</dt><dd>在途事件流(需鉴权):读 Observation 层的 R2 段文件 journal,<strong>不经 D1 终态归档</strong>,因此任务 <code>RUNNING</code> 期间就有内容 —— 这是它相对 <code>/api/admin/events</code>(只读已归档的 hash chain)的核心增量。数据来自 poll 相的 transcript 增量摄取,每轮另落一条 <code>kind=heartbeat</code> 心跳(runner 自己的时间源):模型悬挂表现为 <strong>「新事件停止而进程 alive」</strong>,而它有两种形状 —— <strong>连心跳都停 = runner 停了(红线);心跳在而转录静 = 模型沉默(只黄线)</strong>,两个阈值的推导与实测来源见 <code>docs/architecture.md</code> §9.8(权威常量在 <code>src/supervisor/detect.ts</code>)。按 attempt 创建序、attempt 内按 <code>generation</code> 与 <code>seq</code> 升序返回 <code>{"task_id",state,"events":[AgentEventV1],"count",total,"next_cursor","unreadable_attempts"}</code>;信封为 <code>{v:1,task_id,attempt_id,generation,seq,ts,kind,payload}</code>,<code>kind</code> ∈ ${OBS_EVENT_KINDS.join("/")}(认不出的行不丢)。payload 已在 ingress 过白名单:只留类型/工具名/token 用量/时长/退出码等枚举字段,自由文本 ≤2048 字符并对平台注入的凭据值精确打码。分页:<code>?after=</code>(扁平有序流上已读的条数,默认 0)、<code>?limit=</code>(默认 500,上限 2000,非数字或越界 → 400);<code>next_cursor</code> 无后续时为 <code>null</code>。任务不存在 → 404;从未摄取过事件 → 空列表而不是 404</dd>
       <dt>GET /api/tasks/:id/attempts/:aid/transcript</dt><dd>attempt 的 transcript 原文(verifier 为 JSON 验证报告,需鉴权)</dd>
-      <dt>GET /api/admin/chain-check</dt><dd>校验归档事件 hash chain(需鉴权)。<strong>两种模式</strong>:不带参数 = 全局扫描 D1 <code>events</code> 表,返回 <code>{checked,broken,brokenTasks}</code>,破口标记 <code>&lt;task_id&gt;:&lt;seq&gt;:&lt;kind&gt;</code>,kind ∈ <code>prev</code>/<code>digest</code>(内容被改)、<code>seq</code>(序号不严格递增/重号)、<code>state</code>(状态行已是终态而链尾转换不是)。⚠ 全局模式<strong>看不见未归档的任务</strong>(events 只在归档成功时写)。带 <code>?task_id=</code>(36 字符 UUID,畸形 → 400)= <strong>DO↔D1 对账模式</strong>:同时读 DO 链与 D1 行,返回 <code>{mode:"reconcile",result,do_events,d1_events,do_tail_digest,d1_tail_digest,broken,brokenTasks}</code>,<code>result</code> 三态 = <code>consistent</code> / <code>not_archived</code>(DO 有链而 D1 零行)/ <code>diverged</code>(行数或尾 digest 不等);DO 无该任务记录 → 404 <code>task_not_found</code>。判据边界与运维含义见 <code>docs/architecture.md</code> §6.2</dd>
+      <dt>GET /api/admin/chain-check</dt><dd>校验归档事件 hash chain(需鉴权)。<strong>两种模式</strong>:不带参数 = 全局扫描 D1 <code>events</code> 表,返回 <code>{checked,broken,brokenTasks}</code>,破口标记 <code>&lt;task_id&gt;:&lt;seq&gt;:&lt;kind&gt;</code>,kind ∈ <code>prev</code>/<code>digest</code>(内容被改)、<code>seq</code>(序号不严格递增/重号)、<code>state</code>(状态行已是终态而链尾转换不是)。⚠ 全局模式<strong>看不见未归档的任务</strong>(events 只在归档成功时写)。带 <code>?task_id=</code>(36 字符 UUID,畸形 → 400)= <strong>DO↔D1 对账模式</strong>:同时读 DO 链与 D1 行,返回 <code>{mode:"reconcile",result,do_events,d1_events,do_tail_digest,d1_tail_digest,broken,brokenTasks}</code>,<code>result</code> 三态 = <code>consistent</code> / <code>not_archived</code>(DO 有链而 D1 零行)/ <code>diverged</code>(行数或尾 digest 不等);DO 无该任务记录 → 404 <code>task_not_found</code>。对账模式的 <code>broken</code>/<code>brokenTasks</code> 覆盖<strong>两侧</strong>:D1 链的四类破口,加上对 <strong>DO 全量事件</strong>的重号扫描(复用同一种 <code>seq</code> 标记)—— 未归档的任务在 D1 里零行,只查 D1 等于替它宣布「损伤不存在」。判据边界与运维含义见 <code>docs/architecture.md</code> §6.2</dd>
       <dt>GET /api/admin/tasks</dt><dd>归档任务列表(需鉴权):<strong>只读</strong>投影,数据源仅为 D1 归档的 <code>tasks</code> 表 —— 任务到终态才归档,因此<strong>不含仍在 DO 中运行、尚未归档的任务</strong>(实时状态看 <code>GET /api/tasks/:id</code>)。按 <code>updated_at</code> 降序返回 <code>{"tasks":[{id,state,created_at,updated_at,version}],"count":N}</code>;可选 <code>?state=</code> 精确过滤(合法取值见状态机,非法 → 400)、可选 <code>?limit=</code>(默认 50,上限 200,非数字或越界 → 400)</dd>
       <dt>GET /api/admin/events</dt><dd>归档事件流(需鉴权):按任务回放审计事件的 hash chain。<strong>只读</strong>投影,数据源仅为 D1 归档的 <code>events</code> 表 —— 事件随任务终态才归档,因此<strong>只含已归档(终态)任务的事件</strong>,<strong>看不到仍在 DO 中运行、尚未归档的在途事件</strong>(实时状态看 <code>GET /api/tasks/:id</code>)。<code>?task_id=</code>(36 字符 UUID)<strong>必填</strong>:每 task 的 <code>seq</code> 才是分页脊线,跨 task 分页无意义;缺失或畸形 → 400。按 <code>seq</code> 升序(审计回放顺序)返回 <code>{"events":[{seq,kind,digest,prev_digest,created_at,canonical}],"next_cursor":&lt;string|null&gt;}</code>。<code>canonical</code> 是 D1 <code>payload</code> 列<strong>逐字原文</strong>(即 <code>JSON.stringify({task_id,kind,payload})</code>,正是被 hash 的那个串),不解析、不重新序列化 —— 客户端因此能独立重算 <code>digest == sha256Hex((prev_digest ?? "GENESIS") + canonical)</code> 并逐条核对 <code>prev_digest</code>,即在本地重放一遍 <code>/api/admin/chain-check</code>。安全:审计 journal 按构造<strong>绝不携带</strong>一次性模型代理凭据 <code>proxy_token</code>(它只存在于 <code>attempts</code> 表,从不进事件链)。游标分页:<code>?limit=</code>(默认 50,上限 200,非数字或越界 → 400)、<code>?cursor=</code>(不透明游标,首页省略;畸形 → 400),<code>next_cursor</code> 为下一页起点、无后续时为 <code>null</code>;过滤不命中返回空列表而不是 404</dd>
       <dt>GET /api/admin/attempts</dt><dd>归档 attempt 列表(需鉴权):按任务复盘各 attempt(writer / verifier / reviewer)的终态与 token 消耗。<strong>只读</strong>投影,数据源仅为 D1 归档的 <code>attempts</code> 表 —— attempt 随任务终态才归档,因此<strong>不含尚未归档的在途 attempt</strong>(实时状态看 <code>GET /api/tasks/:id</code>)。按 <code>created_at</code> 降序返回 <code>{"attempts":[{id,task_id,role,state,tokens_used,input_tokens,cache_read_tokens,output_tokens,cost_weighted_tokens,max_model_tokens,max_wall_seconds,workflow_instance_id,created_at,finished_at}],"count":N}</code>(<code>count</code> 是本次返回条数,受 limit 截断)。口径:<code>tokens_used</code> 是 raw total(历史可比,<strong>不是成本</strong> —— r11 实测其 96.9% 是最便宜的隐式缓存命中);四元组拆分与 <code>cost_weighted_tokens</code>(缓存命中按 <code>CACHE_READ_COST_FACTOR</code> 折扣加权)才是成本口径,今后看成本看后者。四列与 <code>cost_weighted_tokens</code> 为 <code>null</code> 表示该记录产生时未记过拆分口径(M8 前的历史行),<strong>不等于消耗为 0</strong>。安全投影:<code>proxy_token</code>(一次性模型代理凭据)<strong>绝不下发</strong>,内部去重用的 <code>idempotency_key</code> 同样不进投影。可选过滤器按 AND 组合:<code>?task_id=</code>(36 字符 UUID,畸形 → 400)、<code>?role=</code>(writer/reviewer/verifier)、<code>?state=</code>(RUNNING/SUCCEEDED/FAILED/BLOCKED;合法取值来自权威声明,非法 → 400,不命中返回空列表)、<code>?limit=</code>(默认 50,上限 200,非数字或越界 → 400)</dd>
@@ -751,8 +751,8 @@ async function handleChainCheck(env: Env): Promise<Response> {
  * 为什么必须有这个模式:全局模式的数据源是 `SELECT DISTINCT task_id FROM events`,
  * 而 events 只在归档成功时才写 —— **未归档的任务对它完全不可见**,连「有事件行但缺了
  * 终态」都看不见(它按任务分组,不做任何完整性推断)。5489dc8a 当时返回 checked=79,
- * broken=0,而那条任务正在每 30 秒空转一次。对账模式与 `archive_stalled` 日志是仅有的
- * 两个出口(docs/architecture.md 同节)。
+ * broken=0,而那条任务正在每 30 秒空转一次。对账模式与 `archive_stalled` /
+ * `archive_rejected` 日志是仅有的出口(docs/architecture.md 同节)。
  *
  * 三态判据(按此顺序,第一条命中即结论):
  * - `not_archived`:DO 有链而 D1 零行。正是 5489dc8a 的形态。
@@ -761,6 +761,14 @@ async function handleChainCheck(env: Env): Promise<Response> {
  *
  * DO 里没有这个任务 ⇒ 404,不猜结论。三态说的是「两份记录的关系」,而这里连一份都没有;
  * 把它塞进任何一态都是替运维造一个不存在的判断。
+ *
+ * 破口口径(`broken` / `brokenTasks`)现在覆盖**两侧**:
+ * - D1 侧:`chainBreaks` 逐链校验(`:prev` / `:digest` / `:seq` / `:state`),原口径一行不改;
+ * - DO 侧:对全量事件做重号计数,复用同一种 `:seq` 标记。这一半是补盲 —— `not_archived`
+ *   的任务在 D1 里零行,只查 D1 等于宣布「没归档的损伤一律不存在」,而 5489dc8a 的损伤
+ *   恰好全程只在 DO 快照里(它一次都没进过 D1)。
+ * DO 侧刻意**只扫重号、不走链**:分叉的孤儿分支不在 tail 链上,按 `prev_digest` 校验全量
+ * 事件会满屏误报,而假阳性的代价是淹没真信号。判据与归档面共用 `duplicateSeqs`,不留两份。
  */
 async function handleChainReconcile(env: Env, taskId: string): Promise<Response> {
   const snapshot = await TaskSession.from(env, taskId).getSnapshot();
@@ -779,6 +787,8 @@ async function handleChainReconcile(env: Env, taskId: string): Promise<Response>
   const d1 = rows.results;
   const chainBreaksOfTask = await chainBreaks(taskId, d1, snapshot.task.state);
   const doEvents = snapshot.events;
+  const doDupSeqBreaks = duplicateSeqs(doEvents).map((seq) => `${taskId}:${seq}:seq`);
+  const breaks = [...new Set([...chainBreaksOfTask, ...doDupSeqBreaks])];
   const result =
     d1.length === 0 && doEvents.length > 0
       ? "not_archived"
@@ -796,8 +806,8 @@ async function handleChainReconcile(env: Env, taskId: string): Promise<Response>
     d1_events: d1.length,
     do_tail_digest: doEvents.length > 0 ? doEvents[doEvents.length - 1].digest : null,
     d1_tail_digest: d1.length > 0 ? d1[d1.length - 1].digest : null,
-    broken: chainBreaksOfTask.length,
-    brokenTasks: chainBreaksOfTask.slice(0, 20),
+    broken: breaks.length,
+    brokenTasks: breaks.slice(0, 20),
   });
 }
 
