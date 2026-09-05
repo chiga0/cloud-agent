@@ -85,7 +85,7 @@ function evidenceResponse(over: Record<string, unknown> = {}): Record<string, un
 }
 
 /** runGate 会经过的全部副作用名。GIT_WRITE_STEPS 是「真的动手」的那几个:任何一门不过都不该出现。 */
-const GIT_WRITE_STEPS = ["openWorktree", "applyCheck", "applyPatch", "install", "typecheck", "runTests", "commit", "push"];
+const GIT_WRITE_STEPS = ["openWorktree", "applyCheck", "applyPatch", "install", "typecheck", "runTests", "build", "commit", "push"];
 
 /** h/i 两段的材料:下一任务的 spec 原文 + 平台返回的新 id。 */
 const NEXT_SPEC_TEXT = '{"spec":{"prompt":"接着上一轮","repo_url":"https://github.com/octocat/Hello-World"},"budget":{"max_wall_seconds":1800}}';
@@ -114,6 +114,7 @@ function fakeDeps(over: Record<string, unknown> = {}) {
     install: () => pass,
     typecheck: () => ({ ok: true, out: "ok", detail: "" }),
     runTests: () => ({ ok: true, passed: 214, detail: "" }),
+    build: () => pass,
     commit: (_handle: unknown, message: string) => (messages.push(message), COMMIT_SHA),
     push: () => undefined,
     readSpecFile: () => ({ ok: true, text: NEXT_SPEC_TEXT }),
@@ -378,6 +379,29 @@ describe("守门链:任一门不过即终止", () => {
     expect(calls).not.toContain("push");
   });
 
+  it("npm run build 失败 → 守门拒绝(2)且绝不 commit;typecheck 已红时 test/build 都不空跑", async () => {
+    const { deps, calls } = fakeDeps({ build: async () => ({ ok: false, detail: "vite build failed" }) });
+    const outcome = await runGate(landOpts({ execute: true, push: true }), deps);
+    expect(outcome.exitCode).toBe(EXIT.GATE);
+    expect(outcome.gates.tests_ok).toBe(false);
+    expect(outcome.reason).toContain("build fail");
+    expect(calls).toContain("build");
+    expect(calls).not.toContain("commit");
+    expect(calls).not.toContain("push");
+
+    // verify_command 是一条链:typecheck 红了,后面的 test/build 不再消耗机时。
+    const skip = fakeDeps({
+      typecheck: async () => ({ ok: false, out: "fail", detail: "tsc error" }),
+      build: async () => {
+        throw new Error("build must not run when typecheck failed");
+      },
+    });
+    const skipped = await runGate(landOpts(), skip.deps);
+    expect(skipped.exitCode).toBe(EXIT.GATE);
+    expect(skip.calls).not.toContain("runTests");
+    expect(skip.calls).not.toContain("build");
+  });
+
   it("npm ci 失败 → 环境侧故障(1),不冒充候选裁决(2)", async () => {
     const { deps, calls } = fakeDeps({ install: async () => ({ ok: false, detail: "registry unreachable" }) });
     const outcome = await runGate(landOpts({ execute: true }), deps);
@@ -403,7 +427,7 @@ describe("顺序不变量:commit 先于 push", () => {
     const { deps, calls, messages } = fakeDeps();
     const outcome = await runGate(landOpts({ execute: true, push: true }), deps);
     expect(outcome.exitCode).toBe(EXIT.OK);
-    expect(calls.slice(calls.indexOf("runTests"))).toEqual(["runTests", "commit", "push", "closeWorktree"]);
+    expect(calls.slice(calls.indexOf("runTests"))).toEqual(["runTests", "build", "commit", "push", "closeWorktree"]);
     expect(outcome).toMatchObject({ committed: true, pushed: true, commitSha: COMMIT_SHA });
     expect(messages).toHaveLength(1);
   });
@@ -596,7 +620,7 @@ describe("迭代循环续命段:--next / --wait", () => {
     const outcome = await runGate(landOpts({ execute: true, push: true }), deps);
     expect(outcome.exitCode).toBe(EXIT.OK);
     for (const step of ["readSpecFile", "postNext", "fetchTaskState", "sleep"]) expect(calls, step).not.toContain(step);
-    expect(calls.slice(calls.indexOf("runTests"))).toEqual(["runTests", "commit", "push", "closeWorktree"]);
+    expect(calls.slice(calls.indexOf("runTests"))).toEqual(["runTests", "build", "commit", "push", "closeWorktree"]);
   });
 });
 
@@ -639,8 +663,9 @@ describe("摘要形状与提交信息", () => {
       bindingDigest: BINDING_DIGEST,
       typecheckOut: "ok",
       testsPassed: 214,
+      buildOut: "ok",
     });
-    for (const needle of [TASK, BASE_SHA, PATCH_DIGEST, BINDING_DIGEST, "tests 214 passed"]) {
+    for (const needle of [TASK, BASE_SHA, PATCH_DIGEST, BINDING_DIGEST, "tests 214 passed", "build ok"]) {
       expect(msg).toContain(needle);
     }
     expect(msg).toMatch(new RegExp(`^base: ${BASE_SHA}$`, "m"));

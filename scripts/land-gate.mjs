@@ -182,7 +182,7 @@ export function planRun(argv, env) {
  * 提交信息是「落地了什么」的唯一离线凭据,所以四要素必须逐字在内:task_id、base sha 全长、
  * patch sha256、binding digest,外加一行真实验证摘要(数字来自 npm test 的实际输出)。
  *
- * @param {{task:string, baseSha:string, patchDigest:string, bindingDigest:string, typecheckOut:string, testsPassed:number}} info
+ * @param {{task:string, baseSha:string, patchDigest:string, bindingDigest:string, typecheckOut:string, testsPassed:number, buildOut:string}} info
  * @returns {string}
  */
 export function buildCommitMessage(info) {
@@ -193,7 +193,7 @@ export function buildCommitMessage(info) {
     `base: ${info.baseSha}`,
     `patch-sha256: ${info.patchDigest}`,
     `binding-digest: ${info.bindingDigest}`,
-    `verify: typecheck ${info.typecheckOut} / tests ${info.testsPassed} passed`,
+    `verify: typecheck ${info.typecheckOut} / tests ${info.testsPassed} passed / build ${info.buildOut}`,
   ].join("\n");
 }
 
@@ -313,7 +313,8 @@ export async function pollNextTask(opts, id, deps) {
  *   sha256Hex(bytes) / openWorktree(opts, baseSha) / closeWorktree(handle)
  *   applyCheck(handle, bytes) / applyPatch(handle, bytes) -> {ok, detail}
  *   install(handle) -> {ok, detail} / typecheck(handle) -> {ok, out, detail}
- *   runTests(handle) -> {ok, passed, detail} / commit(handle, message) -> sha / push(handle)
+ *   runTests(handle) -> {ok, passed, detail} / build(handle) -> {ok, detail}
+ *   commit(handle, message) -> sha / push(handle)
  *   readSpecFile(opts) -> {ok:true, text} | {ok:false, detail}(h 步)
  *   postNext(opts, text) -> 新任务 id / fetchTaskState(opts, id) -> state / sleep(ms)(h/i 步)
  *
@@ -421,7 +422,7 @@ export async function runGate(opts, deps) {
     g.apply_ok = true;
     deps.log("apply", "ok", "clean apply on detached worktree");
 
-    // ── e. 本地验证:typecheck + test ─────────────────────────────────────
+    // ── e. 本地验证:typecheck + test + build ─────────────────────────────
     deps.log("install", "start", "npm ci --no-audit --no-fund");
     const ci = await deps.install(handle);
     if (!ci.ok) {
@@ -435,9 +436,14 @@ export async function runGate(opts, deps) {
     deps.log("test", "start", "npm test");
     const tests = tc.ok ? await deps.runTests(handle) : { ok: false, passed: 0, detail: "skipped: typecheck failed" };
     deps.log("test", tests.ok ? "ok" : "fail", tests.detail);
-    g.tests_ok = tc.ok && tests.ok;
+    // build 与 verify_command(typecheck+test+build)对齐:w2 前端基座起交付面含 dist/
+    // 产物,单测钉不住「能不能构建」。typecheck/test 已红时 build 不再空跑。
+    deps.log("build", "start", "npm run build");
+    const build = tc.ok && tests.ok ? await deps.build(handle) : { ok: false, detail: "skipped: verify 未过" };
+    deps.log("build", build.ok ? "ok" : "fail", build.detail);
+    g.tests_ok = tc.ok && tests.ok && build.ok;
     if (!g.tests_ok) {
-      return refuse(EXIT.GATE, "verify", `typecheck ${tc.ok ? "ok" : "fail"} / tests ${tests.ok ? `${tests.passed} passed` : "fail"}`);
+      return refuse(EXIT.GATE, "verify", `typecheck ${tc.ok ? "ok" : "fail"} / tests ${tests.ok ? `${tests.passed} passed` : "fail"} / build ${build.ok ? "ok" : "fail"}`);
     }
 
     // ── f. commit(仅 --execute)─────────────────────────────────────────
@@ -449,6 +455,7 @@ export async function runGate(opts, deps) {
         bindingDigest: String(evidence.binding_digest ?? ""),
         typecheckOut: tc.out ?? "ok",
         testsPassed: tests.passed,
+        buildOut: build.ok ? "ok" : "fail",
       });
       deps.log("commit", "start", `git add -A && git commit in ${handle.dir}`);
       const sha = await deps.commit(handle, message);

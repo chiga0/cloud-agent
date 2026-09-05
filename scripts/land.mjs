@@ -36,6 +36,18 @@ function oneLine(text) {
   return String(text ?? "").replace(/\s+/g, " ").trim();
 }
 
+/** `git status --porcelain` 每行的路径列(XY 前两格 + 空格;rename 形状 apply 不产生,仍取箭头后)。 */
+function statusPaths(text) {
+  return String(text ?? "")
+    .split("\n")
+    .filter((l) => l.length > 3)
+    .map((l) => {
+      const p = l.slice(3);
+      const arrow = p.indexOf(" -> ");
+      return arrow >= 0 ? p.slice(arrow + 4) : p;
+    });
+}
+
 function log(step, status, detail) {
   const tail = oneLine(detail);
   process.stderr.write(`[land] ${step} ${status}${tail ? ` ${tail}` : ""}\n`);
@@ -191,6 +203,28 @@ const deps = {
     // 收在 parseTestCount;解析不出来时如实写 0(宁可得出的摘要难看,也不编一个数)。
     const passed = parseTestCount(`${r.stdout}\n${r.stderr}`);
     return { ok: r.code === 0, passed, detail: passed > 0 ? `passed=${passed}` : r.detail };
+  },
+
+  async build(handle) {
+    // build 前的 porcelain 快照 = 候选补丁自身造成的全部工作树变化;build 之后**新增**的
+    // 条目是 build(或 test)泄漏的产物 —— commit 的 `git add -A` 会把它们卷进落地提交,
+    // 「落地 commit 的差量 == 候选 patch」就被静默破坏。dist/ 已在根 .gitignore,这条拦
+    // 的是 writer 侧例外化(.gitignore 反选、产物落别的目录)那一类。
+    const before = gitAt(handle.dir, ["status", "--porcelain"]);
+    if (before.code !== 0) return { ok: false, detail: before.detail };
+    const r = npmAt(handle.dir, ["run", "build"]);
+    if (r.code !== 0) return { ok: false, detail: r.detail };
+    const after = gitAt(handle.dir, ["status", "--porcelain"]);
+    if (after.code !== 0) return { ok: false, detail: after.detail };
+    const beforePaths = new Set(statusPaths(before.stdout));
+    const leaked = statusPaths(after.stdout).filter((p) => !beforePaths.has(p));
+    if (leaked.length > 0) {
+      return {
+        ok: false,
+        detail: `build 产生未被 .gitignore 覆盖的产物(${leaked.slice(0, 5).join(", ")}${leaked.length > 5 ? " 等" : ""})— 卷进落地提交会破坏 commit==候选patch,先修 .gitignore`,
+      };
+    }
+    return { ok: true, detail: "no leakage" };
   },
 
   async commit(handle, message) {

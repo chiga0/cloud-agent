@@ -181,7 +181,7 @@ node scripts/land.mjs --task <task_id> --execute --push --next backlog/next.json
 2. `manifest_cross` —— `GET /api/tasks/:id/evidence` 的 `digest` 必须等于 `task.current_evidence.writer_manifest_digest`(证据口径单一来源,不一致即有一边被换过)。
 3. `digest_ok` —— `GET /api/tasks/:id/candidate?format=patch` 的**响应体字节**本地重算 sha256,与 `manifest.patch.digest` 逐字符比对。这是防篡改硬门:材料是拿到的字节,不是服务端的声称。
 4. `apply_ok` —— `git fetch origin` 后在 `<base_sha>` 上开 detached worktree,`git apply --check` 通过再 `git apply`(patch 走 stdin,不在工作树里留文件)。
-5. `tests_ok` —— worktree 内 `npm ci --no-audit --no-fund` → `npm run typecheck` → `npm test`。
+5. `tests_ok` —— worktree 内 `npm ci --no-audit --no-fund` → `npm run typecheck` → `npm test` → `npm run build`(build 前后各做一次 `git status --porcelain` 快照:build 若产生未被 .gitignore 覆盖的新产物,同样判 tests_ok 不过 —— 落地 commit 的差量必须恰为候选 patch)。
 
 全绿且带 `--execute` 才 commit,提交信息逐字含四要素(task / base sha 全长 / patch sha256 / binding digest)加一行真实验证摘要;`--push` 必须与 `--execute` 同传,且 push 只在**已 commit** 后发生。push 失败(含非快进)直接报错退出,**绝不 `--force`**。
 
