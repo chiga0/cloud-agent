@@ -76,7 +76,10 @@ async function seedRunningTask(): Promise<{ taskId: string; attemptId: string }>
  * expected 是带合法夹具、正确鉴权下的响应特征 —— 只要求「不是 not_found」,
  * 具体业务语义由各端点自己的测试文件钉,这里钉的是路由归属。
  */
-function apiEndpoints(taskId: string, attemptId: string): Array<{ method: string; path: string; body?: unknown }> {
+function apiEndpoints(
+  taskId: string,
+  attemptId: string,
+): Array<{ method: string; path: string; body?: unknown; preauth?: boolean }> {
   return [
     { method: "POST", path: "/api/tasks", body: { nope: true } }, // → 400 invalid_spec,分发命中
     { method: "GET", path: `/api/tasks/${taskId}` },
@@ -92,6 +95,14 @@ function apiEndpoints(taskId: string, attemptId: string): Array<{ method: string
     { method: "GET", path: "/api/admin/tasks" },
     { method: "GET", path: "/api/admin/attempts" },
     { method: "GET", path: "/api/admin/events" }, // 缺 task_id → 400,同样命中分发
+    // preauth = 这条端点**故意**在鉴权门之前(w1b 登录:拿凭据换凭据,无凭据也得答)。
+    // 它照样挂在 /api 之下 —— 前缀分区与鉴权门是两件事,漏挂一样会被 SPA fallback 静默吞掉。
+    {
+      method: "POST",
+      path: "/api/session/login",
+      body: { token: "wrong-on-purpose" }, // → 401 invalid_credentials,分发命中
+      preauth: true,
+    },
   ];
 }
 
@@ -115,6 +126,7 @@ describe("/api 前缀契约", () => {
       { method: "GET", path: "/admin/tasks" },
       { method: "GET", path: "/admin/attempts" },
       { method: "GET", path: "/admin/events" },
+      { method: "POST", path: "/session/login" }, // w1b 新增:同样只认 /api 前缀,门前的分支不给旧路径开后门
     ];
     for (const { method, path } of dead) {
       const res = await request(path, { method });
@@ -136,6 +148,9 @@ describe("/api 前缀契约", () => {
   it("分发命中清单(未鉴权):同一批端点 401 unauthorized,而不是 not_found", async () => {
     const { taskId, attemptId } = await seedRunningTask();
     for (const ep of apiEndpoints(taskId, attemptId)) {
+      // preauth 端点本来就在鉴权门**之前**,这道门对它的 401 语义不成立(它自己的 401 是
+      // invalid_credentials,形状由 test/session-auth.test.ts 钉)。路由归属由上一条用例覆盖。
+      if (ep.preauth) continue;
       const res = await request(ep.path, { method: ep.method, token: null });
       expect(res.status, `${ep.method} ${ep.path} 缺 token 应 401`).toBe(401);
       expect(((await res.json()) as ErrorBody).error?.type).toBe("unauthorized");

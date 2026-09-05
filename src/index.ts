@@ -1,5 +1,13 @@
 import type { Env, TaskSpec, TaskState } from "./types";
 import { ATTEMPT_ROLES } from "./types";
+import {
+  constantTimeEqual,
+  isSameOrigin,
+  mintSessionCookieValue,
+  readSessionCookie,
+  sessionSetCookieHeader,
+  verifySessionCookieValue,
+} from "./auth/session";
 import { handleQueue } from "./exec/queue";
 import { ATTEMPT_STATES, duplicateSeqs, TaskSession } from "./control/session";
 import { TASK_TRANSITIONS } from "./control/statemachine";
@@ -27,6 +35,24 @@ export { TaskSession } from "./control/session";
 
 function unauthorized(): Response {
   return Response.json({ error: { type: "unauthorized" } }, { status: 401 });
+}
+
+/**
+ * Origin 兜底失败(CSRF 双保险的第二层)。与 `unauthorized` 分两个码:401 的含义是
+ * 「凭据不成立」,而这里凭据是成立的、被拒的是**请求的来源** —— 把两者混成一个 401,
+ * 前端就会在源配错时把用户踢回登录页(反复登录的死循环),而 403 说的是「你已登录,
+ * 但这条请求不该出现在这里」。
+ */
+function invalidOrigin(): Response {
+  return Response.json(
+    {
+      error: {
+        type: "invalid_origin",
+        detail: "cookie-authenticated requests must carry a same-origin Origin header",
+      },
+    },
+    { status: 403 },
+  );
 }
 
 function landingHtml(env: Env): string {
@@ -101,9 +127,70 @@ function landingHtml(env: Env): string {
 </html>`;
 }
 
-function checkApiToken(req: Request, env: Env): boolean {
+/** 凭据种类:`bearer` = API 客户端/land.mjs,`cookie` = 浏览器会话。null = 未鉴权。 */
+type ApiCredential = "bearer" | "cookie";
+
+/**
+ * 全局那一条鉴权门(docs/product.md §3,w1b 起扩展但不换门)。
+ *
+ * **Bearer 优先**:命中即返回,不走任何密码学、不看 cookie 头 —— 这是 land.mjs 与全部
+ * API 客户端零回归的根据(§7 把它列为 w1b 第一验收)。cookie 只是浏览器那条路的兜底:
+ * `EventSource` 带不了自定义头,而它自动带同源 cookie。
+ * cookie 分支要求签名有效**且**未过期(过期即当作没有凭据,不做「宽限期」)。
+ *
+ * 返回值带凭据种类而不是布尔值:CSRF 的 Origin 兜底只适用于 cookie 鉴权的非 GET,
+ * 判据是「这条请求靠什么过关」,不是「有没有过关」。
+ */
+async function checkApiToken(req: Request, env: Env): Promise<ApiCredential | null> {
+  if (!env.WORKER_API_TOKEN) return null;
   const token = (req.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "");
-  return !!env.WORKER_API_TOKEN && token === env.WORKER_API_TOKEN;
+  if (token && token === env.WORKER_API_TOKEN) return "bearer";
+  const session = readSessionCookie(req);
+  if (session && (await verifySessionCookieValue(session, env.WORKER_API_TOKEN, Date.now()))) {
+    return "cookie";
+  }
+  return null;
+}
+
+/**
+ * POST /api/session/login —— 唯一发凭据给浏览器的出口(docs/product.md §3)。
+ *
+ * 零存储:`Set-Cookie` 里那条自签名串就是会话本身,所以本函数不写 D1/DO/R2 的一个字节,
+ * 也没有需要清理的登录态 —— 换掉 WORKER_API_TOKEN 即全量撤销(与既有运维模型同构)。
+ * HMAC key 复用 WORKER_API_TOKEN 本身,**不新增 secret**。
+ *
+ * 失败面刻意收窄成一个形状:JSON 畸形、缺 `token` 字段、token 不等、服务端未配 token,
+ * 一律同一个 401 `invalid_credentials`。多一个分支就多一个探测面 —— 「body 能拿到 400
+ * 而 token 错拿到 401」就是「这台部署配了 token 吗」的 oracle,而 /login 页的文案要求
+ * 恰恰是不区分「token 错」与「网络错」(§5)。代价(登录侧可调试性变差)由服务端日志承担,
+ * 不由响应体承担。
+ *
+ * token 比较走 `constantTimeEqual`(逐字节、不提前退出):这里是全 Worker 唯一一处
+ * 「拿攻击者可控串与真凭据比对」的入口。
+ */
+async function handleSessionLogin(req: Request, env: Env): Promise<Response> {
+  const reject = (): Response =>
+    Response.json(
+      { error: { type: "invalid_credentials" } },
+      { status: 401, headers: { "cache-control": "no-store" } },
+    );
+  let provided: unknown;
+  try {
+    provided = ((await req.json()) as { token?: unknown } | null)?.token;
+  } catch {
+    return reject();
+  }
+  if (typeof provided !== "string") return reject();
+  if (!env.WORKER_API_TOKEN) return reject();
+  if (!constantTimeEqual(provided, env.WORKER_API_TOKEN)) return reject();
+  const cookie = await mintSessionCookieValue(env.WORKER_API_TOKEN, Date.now());
+  return Response.json(
+    { ok: true },
+    {
+      status: 200,
+      headers: { "cache-control": "no-store", "set-cookie": sessionSetCookieHeader(cookie) },
+    },
+  );
 }
 
 /**
@@ -1150,8 +1237,25 @@ export default {
       });
     }
 
-    // 鉴权门位置保持不变:在 /healthz、GET / 之后,一切 /api/* 与 /live 之前。
-    if (!checkApiToken(req, env)) return unauthorized();
+    // 登录端点在鉴权门**之前**:它是唯一一条「无凭据也要答」的 API(拿凭据换凭据)。
+    // 仍然挂 /api/* 之下 —— 前缀分区对它的约束与其余端点一模一样,漏挂就会被 w2 的
+    // SPA fallback 静默吞成 index.html,防线同 test/api-prefix.test.ts 的分发清单。
+    if (url.pathname === "/api/session/login" && req.method === "POST") {
+      return handleSessionLogin(req, env);
+    }
+
+    // 鉴权门位置保持不变:在 /healthz、GET /、登录之后,一切 /api/* 与 /live 之前。
+    const credential = await checkApiToken(req, env);
+    if (!credential) return unauthorized();
+
+    // CSRF 双保险的第二层(docs/product.md §3):SameSite=Strict 是主防(跨站请求根本带不上
+    // cookie),Origin 同源检查兜住 Strict 不生效的场景(旧浏览器、顶层导航的 form POST)。
+    // 只管 **cookie 鉴权的非 GET**:Bearer 不能被要求带 Origin —— land.mjs 的落地通道是
+    // Bearer + 无 Origin,给它加这道门等于断粮(§7「Bearer 零回归是 w1b 第一验收」)。
+    // GET 全免:跨站 GET 写不了状态(全部写端点是 POST),而 EventSource 正是 GET。
+    if (credential === "cookie" && req.method !== "GET" && !isSameOrigin(req)) {
+      return invalidOrigin();
+    }
 
     // API 一律挂 /api/*:w2 起本 Worker 挂 Static Assets 并配 single-page-application
     // fallback,届时任何未匹配的 GET 会返回 SPA 的 index.html(200 + text/html)。
