@@ -20,6 +20,10 @@
     "DEFAULT_MAX_ATTEMPTS": "3",
     "REJECT_EVIDENCE_MODE": "shadow",
     "BASE_PIN_MODE": "shadow",
+    // writer 侧 provider 错误分流的档位(§13.23)。缺省 shadow:只分类并落一条
+    // route.infra_candidate 事件,**不改路由动作**(仍按 quality 派返工)。
+    // 与 §13.12/§13.13/§13.14/§13.21 同一纪律:攒够真实样本前不得写 enforce。
+    "ROUTING_INFRA_MODE": "shadow",
     "EGRESS_MODE": "enforce",
     "EGRESS_GIT_HOSTS": "github.com,registry.npmjs.org",
     // Supervisor(四层可观测第②层 Observation 的独立消费者)的启用点。代码里缺省 off,

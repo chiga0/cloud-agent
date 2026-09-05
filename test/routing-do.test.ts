@@ -1,4 +1,4 @@
-import { beforeAll, describe, expect, it } from "vitest";
+import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import { env } from "cloudflare:test";
 import type { TaskSession } from "../src/control/session";
 import { applyMigrations } from "./d1";
@@ -8,6 +8,10 @@ import {
   envTransientReport,
   verifyReport,
 } from "./fixtures/env-transient-report";
+import {
+  PROVIDER_403_RESULT_TEXT,
+  QUALITY_RESULT_TEXT,
+} from "./fixtures/provider-error-report";
 
 /**
  * 路由分流的权威侧测试(M9.5②③):分类器接进 TaskSession 的两个返工决策点之后,
@@ -362,6 +366,196 @@ describe("路由分流:环境签名(shadow 档,只发事件)", () => {
     expect(kinds(snap!)).toContain("verify.rework_scheduled");
     expect(snap!.task.state).toBe("RUNNING");
     chainIntact(snap!.events);
+  });
+});
+
+/**
+ * §13.23 的 provider 分流:**缺省即 shadow**。测试环境不写 ROUTING_INFRA_MODE,
+ * 所以下面这些断言跑的就是「操作员什么都没拨」时的形态 —— 多一条事件,路由一字不改。
+ * 2026-09-03 标本(task daa8dd44)在这里被逐字重放:result 整串是 403、终态 exit 11。
+ */
+describe("路由分流:provider 错误形状(shadow 档,只发事件)", () => {
+  it("2026-09-03 标本重放:exit 11 + 整串 403 → 记候选,仍按 quality 派返工", async () => {
+    const stub = newStub();
+    await createTask(stub);
+    const attempt_id = await report(stub, {
+      role: "writer",
+      exit_code: 11,
+      result_text: PROVIDER_403_RESULT_TEXT,
+    });
+
+    const snap = await stub.getSnapshot();
+    // ① 新事件:payload 只有枚举与数值(整表 toEqual ⇒ 多一个文本字段就会红)
+    expect(payloads(snap!, "route.infra_candidate")).toEqual([
+      {
+        attempt_id,
+        role: "writer",
+        exit_code: 11,
+        error_class: "provider_access_denied",
+        is_infra: true,
+        mode: "shadow",
+        action: "rework",
+      },
+    ]);
+    // ② route_decision 逐字段 = 分流之前的形态:仍是 quality/rework
+    expect(payloads(snap!, "route_decision")).toEqual([
+      {
+        attempt_id,
+        role: "writer",
+        exit_code: 11,
+        outcome_kind: "quality",
+        rule: "quality_fallback",
+        action: "rework",
+        enforced: true,
+      },
+    ]);
+    // ③ 处置不变:照旧返工,不 BLOCKED —— shadow 档没有否决权
+    expect(snap!.task.state).toBe("RUNNING");
+    expect(snap!.attempts.filter((a) => a.role === "writer")).toHaveLength(2);
+    expect(kinds(snap!)).toContain("writer.rework_scheduled");
+    expect(payloads(snap!, "task.transition").filter((p) => p.to === "BLOCKED")).toHaveLength(0);
+    chainIntact(snap!.events);
+  });
+
+  it("事件卫生:错误原文一个字都不进权威链(它只在 R2 transcript 产物里)", () => {
+    const payload = JSON.stringify({
+      error_class: "provider_access_denied",
+      is_infra: true,
+      mode: "shadow",
+      exit_code: 11,
+    });
+    expect(payload).not.toContain("Access to model denied");
+    expect(payload).not.toContain("[API Error");
+    expect(PROVIDER_403_RESULT_TEXT).toContain("Access to model denied");
+  });
+
+  it("质量失败不记候选:误报会吞掉本该返工的轮次", async () => {
+    const stub = newStub();
+    await createTask(stub);
+    await report(stub, { role: "writer", exit_code: 11, result_text: QUALITY_RESULT_TEXT });
+
+    const snap = await stub.getSnapshot();
+    expect(kinds(snap!)).not.toContain("route.infra_candidate");
+    expect(payloads(snap!, "route_decision")).toHaveLength(1);
+    expect(payloads(snap!, "route_decision")[0]).toMatchObject({
+      outcome_kind: "quality",
+      action: "rework",
+    });
+  });
+
+  it("成功回报不经过分流:没有失败就没有成因可判", async () => {
+    const stub = newStub();
+    await createTask(stub);
+    await report(stub, { role: "writer", exit_code: 0, result_text: PROVIDER_403_RESULT_TEXT });
+
+    const snap = await stub.getSnapshot();
+    expect(kinds(snap!)).not.toContain("route.infra_candidate");
+    expect(kinds(snap!)).not.toContain("route_decision");
+  });
+});
+
+/**
+ * enforce 档**只在这里被端到端钉一次**:拨袋里的 ROUTING_INFRA_MODE 就是 TaskSession
+ * 读到的 `this.env`(与 supervisor-do.test.ts 对 SUPERVISOR_MODE 的手法相同)。不这么做的话,
+ * 「有否决权那一档真能停下返工」就只有纯函数层的证据 —— 而 enforce 恰恰是这棒唯一会改处置的档。
+ */
+function setInfraMode(mode: "off" | "shadow" | "enforce" | undefined) {
+  const bag = env as unknown as Record<string, unknown>;
+  if (mode === undefined) delete bag.ROUTING_INFRA_MODE;
+  else bag.ROUTING_INFRA_MODE = mode;
+}
+
+afterEach(() => setInfraMode(undefined));
+
+describe("路由分流:provider 错误形状(enforce 档,真否决)", () => {
+  it("同一个 2026-09-03 标本:enforce 下不派返工,而是 BLOCKED 转人工", async () => {
+    setInfraMode("enforce");
+    const stub = newStub();
+    await createTask(stub);
+    const attempt_id = await report(stub, {
+      role: "writer",
+      exit_code: 11,
+      result_text: PROVIDER_403_RESULT_TEXT,
+    });
+
+    const snap = await stub.getSnapshot();
+    expect(payloads(snap!, "route.infra_candidate")).toEqual([
+      {
+        attempt_id,
+        role: "writer",
+        exit_code: 11,
+        error_class: "provider_access_denied",
+        is_infra: true,
+        mode: "enforce",
+        action: "blocked",
+      },
+    ]);
+    expect(payloads(snap!, "route_decision")).toEqual([
+      {
+        attempt_id,
+        role: "writer",
+        exit_code: 11,
+        outcome_kind: "provider_infra",
+        rule: "writer_provider_error_shape",
+        action: "blocked",
+        enforced: true,
+      },
+    ]);
+    expect(snap!.task.state).toBe("BLOCKED");
+    expect(snap!.task.awaiting_human).toBe(true);
+    // 白烧返工才是标本的病:enforce 下 writer attempt 数必须停在 1
+    expect(snap!.attempts.filter((a) => a.role === "writer")).toHaveLength(1);
+    expect(kinds(snap!)).not.toContain("writer.rework_scheduled");
+    const reason = blockedReason(snap!);
+    expect(reason).toContain("provider_infra");
+    expect(reason).toContain("provider_access_denied");
+    expect(reason).toContain("不是候选质量失败");
+    // 原文照旧不进链(reason 只有枚举与数值)
+    expect(reason).not.toContain("Access to model denied");
+    chainIntact(snap!.events);
+  });
+
+  it("enforce 不扩大打击面:质量文本照旧返工", async () => {
+    setInfraMode("enforce");
+    const stub = newStub();
+    await createTask(stub);
+    await report(stub, { role: "writer", exit_code: 11, result_text: QUALITY_RESULT_TEXT });
+
+    const snap = await stub.getSnapshot();
+    expect(kinds(snap!)).not.toContain("route.infra_candidate");
+    expect(payloads(snap!, "route_decision")[0]).toMatchObject({
+      outcome_kind: "quality",
+      action: "rework",
+      enforced: true,
+    });
+    expect(snap!.task.state).toBe("RUNNING");
+    expect(kinds(snap!)).toContain("writer.rework_scheduled");
+  });
+
+  it("off 档:整条判据当不存在,连候选事件都不落", async () => {
+    setInfraMode("off");
+    const stub = newStub();
+    await createTask(stub);
+    const attempt_id = await report(stub, {
+      role: "writer",
+      exit_code: 11,
+      result_text: PROVIDER_403_RESULT_TEXT,
+    });
+
+    const snap = await stub.getSnapshot();
+    expect(kinds(snap!)).not.toContain("route.infra_candidate");
+    expect(payloads(snap!, "route_decision")).toEqual([
+      {
+        attempt_id,
+        role: "writer",
+        exit_code: 11,
+        outcome_kind: "quality",
+        rule: "quality_fallback",
+        action: "rework",
+        enforced: true,
+      },
+    ]);
+    expect(kinds(snap!)).toContain("writer.rework_scheduled");
   });
 });
 

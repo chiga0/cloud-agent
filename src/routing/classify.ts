@@ -16,7 +16,14 @@
  * - `env_transient` 的 enforce 与 `retry_verifier` 分支 —— 错误文本启发式有误报面,
  *   样本未攒够;不写半截的 retry 分支。
  * - 改 exit 53/55 的产生侧(qwen 自己的预算机制,平台不动)。
+ *
+ * §13.23 给这条轴补的是 `provider_infra` 一档:writer 的终态文本整串就是 provider 错误时
+ * (2026-09-03 标本:三个 attempt 全 403 AccessDenied,被当成质量失败烧光返工额度),
+ * 成因判读在 `src/routing/error-class.ts`(与 reviewer 共用词表),本模块只负责把它
+ * 映射成路由主张。强制力由 `ROUTING_INFRA_MODE` 运行时决定,缺省 shadow。
  */
+
+import { classifyProviderError, type ErrorClass } from "./error-class";
 
 /**
  * qwen-code `--max-session-turns` 超限的退出码。
@@ -32,13 +39,25 @@ export const EXIT_SESSION_TURNS_LIMIT = 53;
  */
 export const EXIT_BUDGET_ABORT = 55;
 
-/** 失败性质。一次分类恰好命中一个,`quality` 是兜底档。 */
-export type RouteKind = "budget_turns" | "budget_abort" | "env_transient" | "quality";
+/**
+ * 失败性质。一次分类恰好命中一个,`quality` 是兜底档。
+ *
+ * `provider_infra`(§13.23):provider 侧确定性错误 —— 端点拒绝了这个模型/这把 key/这份额度。
+ * 它与候选质量零相关,返工只是把同一个失败买贵一次;`quality` 与它的区别就是「重做有没有
+ * 可能不一样」。
+ */
+export type RouteKind =
+  | "budget_turns"
+  | "budget_abort"
+  | "provider_infra"
+  | "env_transient"
+  | "quality";
 
 /** 触发的判据名。进事件链,是「为什么这么判」的可审计答案,也是模式表的键。 */
 export type RouteRule =
   | "writer_exit_53_session_turns"
   | "writer_exit_55_budget_abort"
+  | "writer_provider_error_shape"
   | "verifier_env_network_signature"
   | "quality_fallback";
 
@@ -54,11 +73,46 @@ export type RouteAction = "blocked" | "rework" | "none";
 
 export type RouteRuleMode = "enforce" | "shadow";
 
+/**
+ * `writer_provider_error_shape` 这条判据的强制力档位(§13.23)。三档,不是两档:
+ * - `off`:整条判据当不存在 —— 不分类、不落事件、不改路由。逐字段等于本棒之前。
+ * - `shadow`(缺省):照分类、照落 `route.infra_candidate` 事件,**路由动作一字不改**
+ *   (仍走 quality → rework)。攒的就是这些事件。
+ * - `enforce`:确定性 provider 错误不再派返工,直接 BLOCKED 转人工。
+ *
+ * 为什么不进 `ROUTE_RULE_MODES` 那张编译期表:这条的档位是**运行时由操作员拨的旋钮**
+ * (`ROUTING_INFRA_MODE`),表里的值是写死在二进制里的。两处各存一份等于让「事件里写的
+ * enforced」和「实际有没有强制力」可能各说各话。
+ */
+export const ROUTING_INFRA_MODES = ["off", "shadow", "enforce"] as const;
+export type RoutingInfraMode = (typeof ROUTING_INFRA_MODES)[number];
+
+/**
+ * 读 `ROUTING_INFRA_MODE`。缺省 shadow;非法值同样落 shadow —— 与 `EGRESS_MODE`
+ * 「有否决权的开关先观测再启用」同一取向:写错一个字母的后果是多记一条事件,
+ * 绝不是悄悄开始有否决权。
+ */
+export function routingInfraMode(env: { ROUTING_INFRA_MODE?: string }): RoutingInfraMode {
+  const raw = env.ROUTING_INFRA_MODE;
+  return raw === "off" || raw === "enforce" ? raw : "shadow";
+}
+
 /** 分类器的输入:一次**失败**的 attempt 回报要素。成功回报不经此处。 */
 export interface AttemptFailureSignals {
   /** reviewer 不在本判据范围内:它的 reject 由 gates.ts 的证据契约处置。 */
   role: "writer" | "verifier";
+  /**
+   * 终态退出码。**只有既有的两条预算判据读它的数值**(53/55 是平台自己下发的语义);
+   * §13.23 的 provider 判据刻意不读 —— 11 只是 `adjudicateCliExit` 上翻的产物,不是成因。
+   */
   exit_code: number;
+  /**
+   * 末条 result 事件的文本(writer 侧)。provider 成因按它的**整串形状**判定;
+   * 缺省/空串 = 无可判读文本,判据不命中。
+   */
+  result_text?: string | null;
+  /** provider 判据的档位。缺省 `off`(= 本棒之前的行为),由调用方从 env 读入。 */
+  infra_mode?: RoutingInfraMode;
   /**
    * verifier 的结构化验证报告(schema v2,见 `src/exec/verify.ts`)。
    * 只在 verifier 路径上被读;writer 恒为 undefined。
@@ -75,6 +129,11 @@ export interface RouteDecision {
   kind: RouteKind;
   rule: RouteRule;
   action: RouteAction;
+  /**
+   * 命中的成因。**只在形状命中时存在**(缺省而非 null —— 既有的 `toEqual` 断言因此
+   * 一字不改)。事件 payload 只取这个枚举值,绝不带原始错误文本。
+   */
+  error_class?: ErrorClass;
 }
 
 /**
@@ -99,6 +158,10 @@ export const ROUTE_RULE_MODES = {
   writer_exit_53_session_turns: "enforce",
   writer_exit_55_budget_abort: "enforce",
   verifier_env_network_signature: "shadow",
+  // 表里写 shadow 只是「编译期默认无否决权」的占位:这条判据的真实档位是运行时的
+  // `ROUTING_INFRA_MODE`(见 routingInfraMode)。route_decision 的 `enforced` 字段对这条
+  // 规则一律按注入档位算,不读这里 —— 读这里会把 enforce 模式下的实际处置记成假的。
+  writer_provider_error_shape: "shadow",
   // 兜底档不是新规则,它就是既有语义:机械硬门禁历来有否决权,不经任何启发式。
   quality_fallback: "enforce",
 } as const satisfies Record<RouteRule, RouteRuleMode>;
@@ -176,6 +239,20 @@ export function classifyAttemptFailure(args: AttemptFailureSignals): RouteDecisi
     if (args.exit_code === EXIT_BUDGET_ABORT) {
       return { kind: "budget_abort", rule: "writer_exit_55_budget_abort", action: "blocked" };
     }
+    // provider 形状判读排在两条预算判据之后、质量兜底之前:53/55 与 provider 错误同框时
+    // 两条都主张 blocked,但人在 BLOCKED 那头要调的旋钮不是同一个(预算 vs 端点资格)。
+    const infra = providerInfraCandidate(args);
+    if (infra?.is_infra && args.infra_mode === "enforce") {
+      return {
+        kind: "provider_infra",
+        rule: "writer_provider_error_shape",
+        action: "blocked",
+        error_class: infra.error_class,
+      };
+    }
+    // shadow 档:只分类、不落决策 —— 路由动作与 off 逐字段相同,新信息一律走
+    // route.infra_candidate 那条独立事件(由调用方发)。瞬态成因(is_infra=false)即使在
+    // enforce 下也走老路返工:漏报可以,误报不行。
   }
 
   if (args.role === "verifier" && isEnvNetworkFailure(args.verify_report)) {
@@ -184,6 +261,28 @@ export function classifyAttemptFailure(args: AttemptFailureSignals): RouteDecisi
   }
 
   return { kind: "quality", rule: "quality_fallback", action: "rework" };
+}
+
+/**
+ * 一次失败回报里的 provider 成因候选(形状判读,见 `error-class.ts`)。
+ *
+ * 返回 null = 档位为 off(整条判据当不存在)或形状不认识。
+ * 档位为 shadow 时照样返回候选 —— 攒样本要的就是它,只是调用方拿它记事件、不拿它改路由。
+ */
+export function providerInfraCandidate(
+  args: AttemptFailureSignals,
+): { is_infra: boolean; error_class: ErrorClass } | null {
+  if (args.role !== "writer" || args.infra_mode === undefined || args.infra_mode === "off") {
+    return null;
+  }
+  const verdict = classifyProviderError({
+    result_text: args.result_text,
+    exit_code: args.exit_code,
+  });
+  // error_class=null 就是「形状不认识」:不产出候选,而不是产出一个 is_infra=false 的空因。
+  return verdict.error_class === null
+    ? null
+    : { is_infra: verdict.is_infra, error_class: verdict.error_class };
 }
 
 /**

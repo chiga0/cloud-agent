@@ -1456,6 +1456,7 @@ git -C /path/to/repo apply task-$TASK-*.patch
 | Var | `DEFAULT_MAX_SESSION_TURNS` | writer 的 turns 闸,**可选 + 回落** —— 缺配/非法时随墙钟推导(≈8 turns/min,下限 40)。prod 未设,故 `wrangler.jsonc` 里不出现 |
 | Var | `REJECT_EVIDENCE_MODE` = `shadow` | reviewer 证据硬校验模式:`shadow` 只记事件、`enforce` 才降级返工(§13.12) |
 | Var | `BASE_PIN_MODE` = `shadow` | 基线材质化失败的处理:`shadow` 回落已解析的默认分支并记 `base.fallback`、`enforce` 直接 `BLOCKED` 转人工(§13.13)。**两种模式都真实使用冻结基线材质化工作副本**,只在失败路径上分叉;verifier 侧恒为 enforce |
+| Var | `ROUTING_INFRA_MODE` = `shadow` | writer 侧 provider 错误的分流档位,**可选 + 回落**:三档 —— `off`(判据当不存在,逐字段等于没有这一棒)/ `shadow`(照分类并落一条 `route.infra_candidate`,**路由动作一字不改**)/ `enforce`(确定性 provider 错误不派返工,直接 `BLOCKED` 转人工)。缺省与非法值都落 `shadow`(§13.23) |
 | Var | `EGRESS_MODE` = `enforce` | 沙箱出站策略:`shadow` 只记账放行、`enforce` 白名单拒绝(§13.14)。有否决权的策略,先 shadow 取样再翻 |
 | Var | `EGRESS_GIT_HOSTS` = `github.com` | 出站白名单的代码托管主机(逗号分隔);模型主机从 `MODEL_UPSTREAM_BASE` 推导,不经此变量 |
 | Var | `MAX_PATCH_BYTES`(未设,代码默认 `1048576`) | 候选 patch 字节上限,**可选 + 回落**;超限在容器内 `exit 24`、不回传字节(§13.17) |
@@ -1555,12 +1556,12 @@ qwen3.8-flash 带 reasoning,单次调用 tokens 可能很高(内部推理 + 工�
 
 ~~consumer 骨架就绪但上游没有发消息,reviewer 未生效。~~
 
-已接通:候选验证/审查通过后才派 reviewer;reviewer 是**纯 LLM**(直接调百炼 `/chat/completions`,无工具,秒级,天然输出 JSON,不做任何任务执行),裁决经 REPORT_QUEUE 回报 DO,DO 记录 `review.completed` + `decision.recorded`(绑定组合证据,见 §13.9)并 → DONE/REJECTED,再 `notifyWriter` 唤醒 writer workflow。
+已接通:候选验证/审查通过后才派 reviewer;reviewer 是**纯 LLM**(直接调百炼 `/chat/completions`,无工具,天然输出 JSON,不做任何任务执行;~~秒级~~ 这个前提是错的,prod 实测墙钟中位 27.0s、最慢成功 64.6s,详见 §13.23),裁决经 REPORT_QUEUE 回报 DO,DO 记录 `review.completed` + `decision.recorded`(绑定组合证据,见 §13.9)并 → DONE/REJECTED,再 `notifyWriter` 唤醒 writer workflow。
 
 - **repo 任务**:writer 成功 → 独立验证器重放候选(§13.10)→ 验证通过才派 reviewer
 - **reviewer 输入**(M7):review prompt 注入编号的【验收标准】(来自 `spec.acceptance`)、【独立验证结果】与【候选变更摘录】,并要求裁决按 `ReviewVerdict` 结构输出——reject 必须附 `failed_criteria` 索引、可执行的 `fix_instructions` 和喂入材料内可核对的 `evidence.quote`。旧的「验证失败必须 reject」措辞已删除:验证失败根本不会走到 reviewer(硬门禁直接 rework/REJECTED)
 - reviewer 结论经 `parseReviewVerdict` 三阶段解析(JSON.parse → 抽取 JSON 子串 → 结构校验);**全部失败即 `decision:"none"`**,不再用关键词兜底成 reject(M7 前默认 reject 是返工放大器)
-- reviewer 自身基建失败(`exit_code != 0`)→ `review.unavailable` + `awaiting_human`,停在 `AWAITING_APPROVAL` 等人工,**不触发返工**
+- reviewer 自身基建失败(`exit_code != 0`)→ `review.unavailable` + `awaiting_human`,停在 `AWAITING_APPROVAL` 等人工,**不触发返工**。三个 `exit_code=12` 位点(到期 abort / 端点非 2xx / 响应体读不懂)自 §13.23 起各带一个 `error_class` 枚举(与 writer 的 provider 分类同一份词表),`reason` 形如 `reviewer_unavailable:upstream_timeout` —— 处置一字未动,变的是原因可分辨(§13.23)
 - reject 是否真的执行返工由门禁分级决定(§13.12);自动裁决与人工审批互为兜底,先到先决、后到幂等忽略,人工裁决必须携带组合证据(§10、§13.9)
 - 曾用 qwen-code(带工具)跑 reviewer:即使 prompt 禁止也会真的执行任务,且结果经 NDJSON 提取器误解析 → 改为纯 LLM 后稳定
 
@@ -1956,6 +1957,73 @@ r11 向量自检:`factor=1` → 6,949,711,**恰等于 raw total**(「缓存与 f
 **刻意不做**:不改预算/墙钟机制(归 p2)、不改路由分类器判据、不动 Observation 层的 journal/ingest/事件协议(提取的输入是 transcript 与既有事件,只读)、不新增指标/看板/外部告警、不引新依赖。历史行不回填:被杀任务那批旧行的低估留在原地,读端看 §13.20 与本节的取证说明。
 
 验证:`npm run typecheck && npm test` 全绿(30 文件 607 测试;`test/token-ledger.test.ts` 28 条覆盖被杀态/完成态对账/解析卫生/唯一推导处,`test/session-do.test.ts` 新增 2 条钉两口径同源与被击杀 attempt 的台账量级)。
+
+### 13.23 provider 错误与候选质量失败分流(writer 侧补档 / reviewer 侧三因合一)— 已实现,`shadow` 中
+
+**问题(两起标本,同一个病的两个读面)**
+
+1. **writer 侧**(2026-09-03,task `daa8dd44-7a94-43b5-8b49-5cea27e0c050`,base `f8885c8`):三个 writer attempt 全部 `exit_code=11` → `route_decision` 三连判 `outcome_kind=quality / rule=quality_fallback / action=rework` → attempts 耗尽 `BLOCKED`。白烧 2 轮返工(每轮一次克隆 + `npm ci` 的沙箱开销,零产出)。attempt-1 的 transcript(196KB,digest `53f2fe39…`)前 16 轮完全健康,第 17 轮起模型 API 回 403,终态 result 文本整串是
+   `[API Error: 403 Access to model denied. Please make sure you are eligible for using the model.]`(95 字符,`is_error:false` —— **CLI 把 API 错误当成功结果回报**);attempts 2/3 首调即死(`total_tokens=0`,同一份文本)。根因是 token-plan 端点对该模型的购买资格失效(`403 AccessDenied.Unpurchased`),与补丁质量零相关 —— 重开沙箱原规格重做,拿到的是同一个 403。
+2. **reviewer 侧**:`runReviewLLM` 有**三个** `return { exitCode: 12 }` 位点(传输失败/到期 abort、非 2xx、`JSON.parse` 失败),三件事共用一个码。它的路由与 writer **不同轴**:reviewer 的 `exit!=0` 走 `verdict=none` → `review.unavailable` → `holdForHuman`,**不烧返工**,而是把任务钉在人工闸门上。prod 台账(56 次带首尾时刻的 reviewer attempt):墙钟中位 **27.0s**;记到 token 的 50 次最长排到 **64.6s**(另有一次 08-31 的 250s 无法拆解,不计入);**6 次 0 token 的全部落在 67.8–71.1s**(= 旧的 60s abort + 约 8~11s 排队/step 开销)⇒ 6/56 ≈ **11%** 的审查以超时收场,且集中在差量大的候选上 —— 一个纯粹太紧的上限,表现成 11% 的「需要操作员来判定这个候选」的假信号,而 reason 里只有 `exit_code=12`,看不出该改上限还是端点挂了。
+
+同构先例:M9 时 verifier 的平台错误曾被当「修复指令」喂给 writer 重做(烧 137K tokens);§13.21 那一棒修的是 verifier 侧的基建/质量分流。**本棒是 writer 侧的同构补齐**,不发明新机制 —— 用的就是 §13.21 那条 `outcome_kind` 轴,给它补一档。
+
+**判据(`src/routing/error-class.ts` = 唯一的成因词表)**
+
+- `ErrorClass` 六个成员:`provider_access_denied` / `provider_quota_exhausted` / `provider_model_unavailable` / `upstream_error` / `upstream_timeout` / `bad_response_body`。后两个是 reviewer 三个位点带来的;**前四个与 writer 的 provider 分类共用** —— 刻意不立 `reviewer_failure_class` 之类的第二套词汇:两套词表迟早漂移,而漂移的表现是同一个故障在两个读面上叫两个名字。
+- 分类器是纯函数,输入 `{result_text, exit_code}`,输出 `{is_infra, error_class}`。**按形状判读,一处都不读 `exit_code` 的数值**:11 只是 `adjudicateCliExit`(§7.2.1)上翻的产物,拿它当判据是循环论证 —— 测试用同一份文本换 9 个退出码断言结论逐字段相同。`is_error:false` 更说明「CLI 说成功」这件事本身不可信。
+- 三条形状通道,全部**整串匹配**(与 §7.2.1 同一理由:包含即失败那个假设已被 c15 打穿过三次 —— 规格要求 writer 在总结里讨论这些字样):`[API Error: <3 位码> …]` 包壳(状态码必须后面不接数字,`4033` 不读成 `403`)/ 裸 `AccessDenied.*` / 裸定长机器码。与 `src/exec/cli-exit.ts` 那张形状表做**锁步断言**:它认的整串错误形状,这边必须给出非 null 成因,否则两张表分叉会立刻炸测试。
+- `is_infra` 只给「重开沙箱原规格重做必然复现」的四类;**`upstream_error`(5xx / 无码 / 裸 `upstream_error`)刻意 `is_infra:false`** —— 里面混着瞬态。漏报可以(unknown 落 quality 走老路),**误报不行**:把质量失败判成 infra 会吞掉本来该返工的轮次。
+
+**分流(`ROUTING_INFRA_MODE`,三档,缺省 `shadow`)**
+
+| 档 | `route_decision` | 新事件 | 处置 |
+| --- | --- | --- | --- |
+| `off` | 逐字段 = 本棒之前 | 不落 | 照旧 quality → rework |
+| `shadow`(缺省) | 逐字段 = 本棒之前 | `route.infra_candidate` 一条 | **路由动作一字不改**,照旧 rework |
+| `enforce` | `outcome_kind=provider_infra / rule=writer_provider_error_shape / action=blocked` | 照落,`mode=enforce` | 不派返工,`BLOCKED` 转人工 |
+
+- 顺序写死:两条预算判据(53/55)在 provider 形状之前 —— 同框时人在 BLOCKED 那头要调的旋钮是预算,不是端点资格。
+- 这条判据的档位**不进** §13.21 那张编译期模式表:它是运行时旋钮,两处各存一份等于让事件里的 `enforced` 与实际处置各说各话。
+- 事件卫生:`route.infra_candidate` 的 payload 只有枚举与数值(`attempt_id / role / exit_code / error_class / is_infra / mode / action`),**不带原始错误文本** —— 与 c10b 心跳「不带自由文本」同一理由:观测/路由面一旦能带文本,它就成了新的外流面。reviewer 侧同规矩:`review.unavailable` 的 reason 是 `reviewer_unavailable:<ErrorClass>`,响应体原文只留在 `attempts/<id>` 的 transcript 产物里。过去那个 `error` 自由文本位点对 reviewer 恒为 undefined(它只在长命令轮询路径上被赋值),所以改判 reason 不丢既有诊断。
+- reviewer 三个位点**退出码仍是 12**(换码等于悄悄改 `onReviewerReport` 的路由语义),分流靠枚举;`onReviewerReport` 的处置一行未动 —— 既不返工也不放行,照旧交人工,只是原因现在可分辨。
+- 新的 chat 上限是算出来的:`REVIEW_LLM_TIMEOUT_MS = ceil(64_600 × 1.5)` = **97_000ms**(最慢真实成功 × 1.5 余量,向上取整到整秒;样本只有 50 个成功点,最大值之外没有分位数可估,所以不挑整齐的 120s)。**现场核对(abort 必须早于外层预算)**:最坏 = 97s + 11.1s 实测最大开销 = 108.1s;reviewer attempt 的截止 = `resolveBudget(undefined, env).budgetSeconds` = `DEFAULT_MAX_WALL_SECONDS = 3600`(测试环境最紧的配值是 600s)⇒ 余量 33 倍 / 5.5 倍;`runReviewLLM` 自己 catch 掉 abort 从不抛错 ⇒ 不触发 `EXEC_RETRIES` 的 step 重试(否则会 ×3 = 324s);workerd 单条 await 的挂起检测 ≈ 29:48(§13.18)⇒ 余量 16 倍。这组不等式由 `test/review-error-class.test.ts` 钉住:将来把上限改成「一个更大的数」而越过截止,测试会红。
+
+**新事件的形状**(进 DO 权威链,与 `route_decision` 同一通道):
+
+```json
+{"kind": "route.infra_candidate", "payload": {
+  "attempt_id": "…", "role": "writer", "exit_code": 11,
+  "error_class": "provider_access_denied", "is_infra": true,
+  "mode": "shadow", "action": "rework"
+}}
+```
+
+`error_class` / `mode` / `action` 三个字段都是枚举,`exit_code` 是数值,**没有任何自由文本位点**。
+`action` 记的是这条事件落地时本次失败**实际走过**的路由 —— 攒样本要能回答「enforce 会省下几轮返工」,
+而 shadow 期它恒等于 `rework`(那正是标本里白烧的两轮)。`event_kind` 在 D1 里是无约束的 `TEXT`
+(§6.1),新名字不需要迁移;Observation 层那张 `OBS_EVENT_KINDS` 是唯一的硬注册表,只管 journal,
+控制面事件不进那里。
+
+**编号说明**:本节刻意不叫「c15 那一棒」—— `c15` 在本仓已被 §7.2.3 用作**任务规格**的编号
+(`src/exec/cli-exit.ts` 的「c15 三次俱毁」指的是那次跑出来的标本),一名两指正是本节要消掉的漂移。
+新判据一律以 §13.23 引用。
+
+**测试**
+
+```bash
+npm run typecheck && npm test
+timeout 240 npm test                                            # 全量收敛确认
+./node_modules/.bin/vitest run test/routing-error-class.test.ts test/review-error-class.test.ts   # 定向
+```
+
+`test/fixtures/provider-error-report.ts` 按逐字标本收录(95 字符这条事实由断言钉住)。三组判据各钉一面:① 不读数值(同一文本换 `[0,1,11,12,20,53,55,127,-1]` 结论逐字段相同;形状不符的 11 一律 unknown);② 不误报(13 条「像但不算」的散文/多行/半截包壳/四位状态码全部 unknown,`upstream_error` 恒 `is_infra:false`);③ 词表唯一(与 `isCliErrorShape` 双向锁步,枚举无重名,`reviewer_failure_class` 这类第二个词汇不认)。档位三档各一条:off 与 shadow 的决策 `toEqual` 相同、shadow 仍 `writer.rework_scheduled` 且不 BLOCKED、enforce 才 `provider_infra/blocked`。DO 侧 `test/routing-do.test.ts` 把三档全部端到端钉在真事件链上(拨 `env` 袋就是 DO 读到的 `this.env`):缺省档(测试环境不写这个 var ⇒ 就是 shadow)重放 2026-09-03 标本 —— `route.infra_candidate` 整表 `toEqual`(多一个文本字段就红)、`route_decision` 七字段逐字等值于分流之前、仍 `writer.rework_scheduled` 且不 BLOCKED;`enforce` 档同一个标本 → `outcome_kind=provider_infra` + `BLOCKED` + writer attempt 数停在 1 + reason 带枚举而不带原文,且质量文本**照旧返工**(不扩大打击面);`off` 档连候选事件都不落。成功回报不经过分流。reviewer 侧按三个位点逐个注入(`globalThis.fetch` 替身),断言同码不同因、三个成因两两不同、原始响应体不进成因;DO 侧 `test/session-do.test.ts` 钉住 `review.unavailable` 的 reason 只有枚举、三种成因的处置逐字相同。
+
+验证:`npm run typecheck` 干净;`timeout 240 npm test` 全绿(**33 文件 687 测试**,基线 627 + 本棒新增 60:`test/routing-error-class.test.ts` 37 + `test/review-error-class.test.ts` 14 + `test/routing-do.test.ts` 7 + `test/session-do.test.ts` 2)。既有断言无一处判据被改弱:只有两条既有用例**加**了断言(`session-do.test.ts` 的字段映射守卫登记新枚举位点、reviewer 基建失败那条补 reason 只带枚举),其余全绿原样 —— 那就是「off/shadow 不改语义」的回归证据。**prod 未取证**:`provider_infra` 的 enforce 路径只有测试证明可达,真实命中要等下一个撞端点资格的 attempt。
+
+**边界(本棒不做)**:不做模型调用重试、不自动换模型(操作员配置决策);verifier 侧分流不动(§13.21 已修);预算账本口径不动(p2 的域);不加状态机状态、不加 npm 依赖;不动 `DEFAULT_MAX_ATTEMPTS` 与返工次数上限本身的逻辑;不动 `onReviewerReport` 的路由动作。平台不持 push 凭据。
+
+**未解决 / prod 取证(推进条件)**:`provider_infra` 在 prod 的真实命中率为零 —— 这条判据自本版本部署起才开始积累样本,`shadow` 期的 `route_decision` 全部仍是既有取值。切 `enforce` 的判据先写死,以免将来靠感觉:`route.infra_candidate ∧ is_infra=true` 的样本 **≥5 条**、人工复核**误报率 0%**(每条都核对过「这确实不是候选质量失败」,判据是整串形状,所以这一项应当是机械的)、且**没有一条**样本在后续同任务里靠返工自救成功 —— 三条同时成立才谈有否决权(与 §13.21「≥10 条 + 误报率 <10%」同一纪律,这里的门槛更低是因为判据不含启发式:整串形状要么对要么错,没有中间态)。reviewer 侧的 11% 超时率同理要复核:新上限 97s 生效后,`review.unavailable ∧ error_class=upstream_timeout` 的占比应显著下降;若仍有可观命中,说明延迟分布本身变了(不是「再拍一个更大的数」的理由,而是回到台账重量)。
 
 ---
 

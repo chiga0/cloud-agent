@@ -58,6 +58,13 @@ export interface Env {
    */
   CACHE_READ_COST_FACTOR?: string;
   /**
+   * writer 侧 provider 错误的分流档位(§13.23):"off"(判据当不存在,逐字段等于本棒之前) |
+   * "shadow"(照分类、落 route.infra_candidate 事件,路由动作一字不改) |
+   * "enforce"(确定性 provider 错误不再派返工,直接 BLOCKED 转人工)。
+   * 可选,缺省 shadow;非法值同样落 shadow。没有真实样本前不得写 enforce。
+   */
+  ROUTING_INFRA_MODE?: string;
+  /**
    * Supervisor(独立消费者)的启用点:"off"(完全按历史行为跑) | "shadow"(读 journal
    * 判据、只往权威链记 supervisor_finding 事件、不做任何处置)。可选,**代码缺省 off** ——
    * 启用一律靠这里的 vars 显式写,这样「什么时候开始有 Supervisor 在看着」是可审计的。

@@ -10,6 +10,7 @@ import type { ReviewVerdict } from "../src/control/gates";
 import type { TranscriptUsage } from "../src/exec/extract";
 import { compositeEvidenceDigest } from "../src/audit/evidence";
 import { reportArgsFrom, type ReportMessage } from "../src/exec/queue";
+import type { ErrorClass } from "../src/routing/error-class";
 import { applyMigrations } from "./d1";
 
 /**
@@ -178,7 +179,7 @@ async function writerOk(
 
 async function reviewerReport(
   stub: Stub,
-  args: { exit_code: number; error?: string; review?: ReviewVerdict },
+  args: { exit_code: number; error?: string; error_class?: ErrorClass | null; review?: ReviewVerdict },
 ): Promise<string> {
   const { attempt_id } = await stub.startAttempt({
     role: "reviewer",
@@ -238,7 +239,11 @@ describe("TaskSession DO 门禁分级", () => {
     await writerOk(stub);
     expect((await stub.getSnapshot())!.task.state).toBe("AWAITING_APPROVAL");
 
-    await reviewerReport(stub, { exit_code: 12, error: "upstream 502 from model gateway" });
+    await reviewerReport(stub, {
+      exit_code: 12,
+      error: "upstream 502 from model gateway",
+      error_class: "upstream_error",
+    });
 
     const snap = await stub.getSnapshot();
     expect(snap!.task.awaiting_human).toBe(true);
@@ -248,7 +253,48 @@ describe("TaskSession DO 门禁分级", () => {
     // 模型抖动换来的不是新一轮 writer,而是「停下来」
     expect(snap!.attempts.filter((a) => a.role === "writer")).toHaveLength(1);
     expect(kinds(snap!)).not.toContain("decision.recorded");
+    // §13.23:reason 只带枚举。`error` 那段自由文本(以及它带的响应体线索)不进权威链
+    const [unavailable] = payloads(snap!, "review.unavailable");
+    expect(unavailable).toEqual({
+      attempt_id: expect.any(String),
+      reason: "reviewer_unavailable:upstream_error",
+      exit_code: 12,
+      error_class: "upstream_error",
+    });
+    expect(JSON.stringify(unavailable)).not.toContain("model gateway");
     chainIntact(snap!.events);
+  });
+
+  it("三个 exit 12 位点在权威链上可分辨,处置逐字相同(三因合一已拆开)", async () => {
+    for (const cls of ["upstream_timeout", "provider_access_denied", "bad_response_body"] as const) {
+      const stub = newStub();
+      await createTask(stub);
+      await writerOk(stub);
+      await reviewerReport(stub, { exit_code: 12, error_class: cls });
+
+      const snap = await stub.getSnapshot();
+      const [unavailable] = payloads(snap!, "review.unavailable");
+      expect(unavailable.error_class, cls).toBe(cls);
+      expect(unavailable.reason, cls).toBe(`reviewer_unavailable:${cls}`);
+      // 分流只让原因可分辨,不改路由动作:既不返工也不放行,照旧交人工
+      expect(snap!.task.state, cls).toBe("AWAITING_APPROVAL");
+      expect(snap!.task.awaiting_human, cls).toBe(true);
+      expect(kinds(snap!).filter((k) => k === "writer.rework_scheduled"), cls).toHaveLength(0);
+      expect(kinds(snap!), cls).not.toContain("route.infra_candidate");
+    }
+  });
+
+  it("旧样本没有成因时不猜:reason 落 unclassified,处置不变", async () => {
+    const stub = newStub();
+    await createTask(stub);
+    await writerOk(stub);
+    await reviewerReport(stub, { exit_code: 12 });
+
+    const snap = await stub.getSnapshot();
+    const [unavailable] = payloads(snap!, "review.unavailable");
+    expect(unavailable.error_class).toBe("unclassified");
+    expect(unavailable.reason).toBe("reviewer_unavailable:unclassified");
+    expect(snap!.task.awaiting_human).toBe(true);
   });
 
   it("awaiting_human 之后自动裁决只留档,终态只能人工给", async () => {
@@ -632,6 +678,9 @@ describe("exec-report 消息映射", () => {
       attempt_id: "att",
       exit_code: 0,
       error: "none",
+      // §13.23 的枚举位点:执行面按形状判出的失败成因。少映射一行就是这里红 ——
+      // reviewer 的三个 exit 12 会重新糊成一个不可分辨的信号。
+      error_class: "upstream_timeout",
       transcript_digest: "td",
       manifest_key: "mk",
       manifest_digest: "md",
@@ -645,6 +694,7 @@ describe("exec-report 消息映射", () => {
     const args = reportArgsFrom(body);
     expect(args.base).toEqual(body.base);
     expect(args.patch_digest).toBe("pd");
+    expect(args.error_class).toBe("upstream_timeout");
     const forwarded = Object.keys(args).sort();
     const expected = Object.keys(body)
       .filter((k) => !["schema_version", "type", "task_id", "session_id"].includes(k))

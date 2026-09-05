@@ -2,6 +2,7 @@ import type { BaseReport, Env, TaskSpec } from "../types";
 import type { ReviewVerdict } from "../control/gates";
 import { resolveBudget } from "../control/budget";
 import type { TranscriptUsage } from "./extract";
+import type { ErrorClass } from "../routing/error-class";
 import { TaskSession } from "../control/session";
 
 interface ReviewMessage {
@@ -32,6 +33,12 @@ export interface ReportMessage {
   attempt_id: string;
   exit_code: number;
   error?: string;
+  /**
+   * 执行面按形状判出的失败成因(§13.23,枚举;词表见 `src/routing/error-class.ts`)。
+   * 刻意与 `error` 分开:`error` 是自由文本(只进日志/产物),这条只允许枚举 ——
+   * 它会随 `review.unavailable` 进权威事件链。
+   */
+  error_class?: ErrorClass | null;
   transcript_digest?: string | null;
   manifest_key?: string | null;
   manifest_digest?: string | null;
@@ -59,6 +66,7 @@ export function reportArgsFrom(body: ReportMessage): Parameters<TaskSession["rep
     attempt_id: body.attempt_id,
     exit_code: body.exit_code,
     error: body.error,
+    error_class: body.error_class ?? null,
     transcript_digest: body.transcript_digest ?? null,
     manifest_key: body.manifest_key ?? null,
     manifest_digest: body.manifest_digest ?? null,

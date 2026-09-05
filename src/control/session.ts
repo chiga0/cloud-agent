@@ -27,10 +27,13 @@ import {
 import {
   classifyAttemptFailure,
   parseVerifyReport,
+  providerInfraCandidate,
+  routingInfraMode,
   ruleMode,
   type RouteDecision,
   type VerifyReportSignals,
 } from "../routing/classify";
+import { isErrorClass, type ErrorClass } from "../routing/error-class";
 import { readObsAttemptEvents } from "../obs/journal";
 import {
   detectSupervisor,
@@ -314,6 +317,13 @@ function blockedRouteReason(decision: RouteDecision, exitCode: number): string {
         `budget_abort (exit ${exitCode}): qwen 墙钟/工具次数预算到期` +
         `(来源 --max-wall-time / --max-tool-calls,不是 token 预算),不是候选质量失败。` +
         `同规格返工必然再撞同一堵墙 → 转人工(可调 MAX_WRITER_WALL_MINUTES,或拆小任务)`
+      );
+    case "provider_infra":
+      return (
+        `provider_infra (exit ${exitCode}): 终态文本整串是一条 provider 错误` +
+        `(error_class=${decision.error_class ?? "unknown"}),不是候选质量失败。` +
+        `端点资格/额度不是一轮新沙箱能改变的事实,返工只会把同一个 403 买贵一次` +
+        ` → 转人工(操作员侧核对模型购买资格与 key;平台不做重试,也不自动换模型)`
       );
     default:
       throw new Error(`no BLOCKED reason registered for route kind ${decision.kind}`);
@@ -698,6 +708,12 @@ export class TaskSession extends DurableObject<Env> {
     attempt_id: string;
     exit_code: number;
     error?: string;
+    /**
+     * 执行面按形状判读出的失败成因(§13.23,枚举;词表见 `src/routing/error-class.ts`)。
+     * reviewer 的三个 exit 12 位点靠它区分「超时 / 端点非 2xx / 响应体读不懂」。
+     * 只允许枚举值进事件链 —— 原始响应体留在 R2 transcript 产物里。
+     */
+    error_class?: ErrorClass | null;
     transcript_digest?: string | null;
     manifest_key?: string | null;
     manifest_digest?: string | null;
@@ -882,14 +898,39 @@ export class TaskSession extends DurableObject<Env> {
       attempt: AttemptRecord;
       role: "writer" | "verifier";
       exit_code: number;
+      result_text?: string | null;
       verify_report?: VerifyReportSignals | null;
     },
   ): Promise<boolean> {
-    const decision = classifyAttemptFailure({
+    const infraMode = routingInfraMode(this.env);
+    const signals = {
       role: args.role,
       exit_code: args.exit_code,
+      result_text: args.result_text ?? null,
+      infra_mode: infraMode,
       verify_report: args.verify_report ?? null,
-    });
+    };
+    const decision = classifyAttemptFailure(signals);
+
+    // §13.23 shadow 档的全部产出就是这一条事件:形状命中即记,路由动作一字不改。
+    // payload 只有枚举与数值(不带原始错误文本)—— 观测/路由面一旦能带文本,它就成了
+    // 新的外流面(与 c10b 心跳「不带自由文本」同一理由)。
+    if (infraMode !== "off") {
+      const infra = providerInfraCandidate(signals);
+      if (infra) {
+        await this.appendEvent(s, "route.infra_candidate", {
+          attempt_id: args.attempt.id,
+          role: args.role,
+          exit_code: args.exit_code,
+          error_class: infra.error_class,
+          is_infra: infra.is_infra,
+          mode: infraMode,
+          // 这条事件落地时本次失败实际走的路由 —— 攒样本要能回答「enforce 会省下几轮」
+          action: decision.action,
+        });
+      }
+    }
+
     await this.appendEvent(s, "route_decision", {
       attempt_id: args.attempt.id,
       role: args.role,
@@ -897,7 +938,11 @@ export class TaskSession extends DurableObject<Env> {
       outcome_kind: decision.kind,
       rule: decision.rule,
       action: decision.action,
-      enforced: ruleMode(decision.rule) === "enforce",
+      // 这条判据的档位是运行时旋钮,不读编译期模式表(见 ROUTE_RULE_MODES 的注释)
+      enforced:
+        decision.rule === "writer_provider_error_shape"
+          ? infraMode === "enforce"
+          : ruleMode(decision.rule) === "enforce",
     });
 
     if (decision.action !== "blocked") return false;
@@ -973,7 +1018,13 @@ export class TaskSession extends DurableObject<Env> {
       });
       // 分流在返工之前:预算到期(exit 53/55)是同规格返工必然复现的失败,烧掉的是一整轮
       // 沙箱 + clone + 上下文。2026-09-02 标本正是这里没分流,两轮返工各跑满 2400s。
-      if (await this.routeFailure(s, { attempt, role: "writer", exit_code: args.exit_code })) return;
+      if (await this.routeFailure(s, {
+        attempt,
+        role: "writer",
+        exit_code: args.exit_code,
+        result_text: args.result_text,
+      }))
+        return;
       await this.scheduleRework(s, {
         decider: `agent:${attempt.id}`,
         reason: `writer exit_code=${args.exit_code}`,
@@ -1128,9 +1179,15 @@ export class TaskSession extends DurableObject<Env> {
     attempt: AttemptRecord,
     args: ReportArgs,
   ): Promise<void> {
+    // §13.23:三个 exit 12 位点(超时 / 非 2xx / 响应体读不懂)过去共用一个码,reason 里只有
+    // `exit_code=12` —— 操作员分不清「该改 REVIEW_LLM_TIMEOUT_MS」还是「端点挂了」。
+    // 这里只让**原因可分辨**,不改处置:reviewer 拿不出结论照旧既不返工也不放行。
+    const failureClass: ErrorClass | "unclassified" = isErrorClass(args.error_class)
+      ? args.error_class
+      : "unclassified";
     const verdict: ReviewVerdict =
       args.exit_code !== 0
-        ? { decision: "none", reason: `reviewer_unavailable:${(args.error ?? `exit_code=${args.exit_code}`).slice(0, 300)}` }
+        ? { decision: "none", reason: `reviewer_unavailable:${failureClass}` }
         : (args.review ?? { decision: "none", reason: "reviewer 未产出结论" });
     attempt.review = verdict;
 
@@ -1139,6 +1196,10 @@ export class TaskSession extends DurableObject<Env> {
       await this.appendEvent(s, "review.unavailable", {
         attempt_id: attempt.id,
         reason: verdict.reason.slice(0, 500),
+        // 枚举 + 数值。原文线索(状态码、响应体片段)只在 attempts/<id> 的 transcript 产物里
+        ...(args.exit_code !== 0
+          ? { exit_code: args.exit_code, error_class: failureClass }
+          : {}),
       });
       await this.holdForHuman(s, `agent:${attempt.id}`, "reviewer unavailable");
       return;

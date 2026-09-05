@@ -7,6 +7,7 @@ import { writeManifest, type EvidenceManifest } from "../audit/evidence";
 import { collectQwenAttempt, prepareQwenAttempt, qwenDeadlineSeconds } from "./sandbox";
 import { collectVerifyAttempt, prepareVerifyAttempt } from "./verify";
 import { runReviewLLM } from "./review";
+import type { ErrorClass } from "../routing/error-class";
 import { composeAttemptPrompt } from "./prompt";
 import {
   parseReviewVerdict,
@@ -38,6 +39,11 @@ export interface ExecOutcome {
   base?: BaseReport;
   /** reviewer 专用:模型正文(受 max_tokens 约束,体积小,可直接进步骤返回值) */
   reviewText?: string;
+  /**
+   * reviewer 专用:失败成因(§13.23 枚举)。三个 exit 12 位点各自的名字,
+   * 成功时为 undefined。只带枚举,原始响应体留在 R2 产物里。
+   */
+  reviewErrorClass?: ErrorClass;
   tokens?: number;
   /** 用量四元组拆分;undefined = 该角色不产出用量 */
   usage?: TranscriptUsage | null;
@@ -157,7 +163,13 @@ export class AttemptWorkflow extends WorkflowEntrypoint<Env, AttemptParams> {
                 prompt: p.spec.prompt,
                 model: p.model,
               });
-              return { ...slim(r), reviewText: r.transcriptRaw, tokens: r.tokens, usage: r.usage };
+              return {
+                ...slim(r),
+                reviewText: r.transcriptRaw,
+                reviewErrorClass: r.errorClass,
+                tokens: r.tokens,
+                usage: r.usage,
+              };
             } catch (err) {
               console.warn(
                 `exec_step_failed task=${p.task_id} attempt=${p.attempt_id} role=${p.role} ` +
@@ -394,6 +406,9 @@ export class AttemptWorkflow extends WorkflowEntrypoint<Env, AttemptParams> {
         attempt_id: p.attempt_id,
         exit_code: run.exitCode,
         error: execError,
+        // reviewer 的 exit 12 曾同时代表三件事(超时/非 2xx/响应体读不懂),控制面只能
+        // 看到一个码。只转述执行面按形状判出的枚举,不在此处另做判读。
+        error_class: p.role === "reviewer" ? (run.reviewErrorClass ?? null) : null,
         transcript_digest: run.transcript.digest,
         manifest_key: manifestRef.key,
         manifest_digest: manifestRef.digest,
