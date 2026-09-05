@@ -5,6 +5,8 @@ import {
   isSameOrigin,
   mintSessionCookieValue,
   readSessionCookie,
+  sessionClearCookieHeader,
+  sessionCookieExpiryMs,
   sessionSetCookieHeader,
   verifySessionCookieValue,
 } from "./auth/session";
@@ -190,6 +192,55 @@ async function handleSessionLogin(req: Request, env: Env): Promise<Response> {
       status: 200,
       headers: { "cache-control": "no-store", "set-cookie": sessionSetCookieHeader(cookie) },
     },
+  );
+}
+
+/**
+ * POST /api/session/logout —— 清 cookie(docs/product.md §3)。
+ *
+ * 挂在鉴权门**之前**,与 /login 同侧。零存储会话没有服务端登录态可销毁,本端点唯一的作用就是把
+ * 那条过期 Set-Cookie 发回去;放在门后则「没带 cookie 的登出」会得到 401,而 401 与 200 的差
+ * 就是「你手里有没有会话」的探测面 —— 而登出本来就必须幂等:连点两次登出、会话已自然过期、
+ * 服务端已换 token(会话全量失效)这三种形状都必须得到**同一个** 200。因此这里不读 cookie、
+ * 不验签名、不看 Origin:响应与请求带了什么完全无关,也就无从泄露带了什么。
+ *
+ * 代价如实记下:同一形状意味着这条 POST 任何人都能发成功,即「强制登出」在协议上不可拒。
+ * 定级为可接受 —— 服务端零状态,被登出的后果只有「操作员重新登录一次」,攻击者由此拿不到任何
+ * 读面、改不了任何状态;而在这里加 Origin 门就会破坏上一条(无 cookie 的幂等成功)。
+ * 属性同形(同名 + `Path=/` + 无 `Domain`)由 `src/auth/session.ts` 的共享常量保证。
+ */
+function handleSessionLogout(): Response {
+  return Response.json(
+    { ok: true },
+    {
+      status: 200,
+      headers: { "cache-control": "no-store", "set-cookie": sessionClearCookieHeader() },
+    },
+  );
+}
+
+/**
+ * GET /api/session/me —— SPA bootstrap 的「我是谁」(docs/product.md §3)。
+ *
+ * 挂在鉴权门**之后**:未鉴权就是全局那一条 401 `unauthorized`,形状由门保证而不是本端点复刻
+ * (前端的 `beforeLoad` guard 因此只需要认 401,不需要认某一种 401)。GET 免 CSRF 检查,
+ * 与 EventSource 同侧。
+ *
+ * 只回三件事:过没过门、靠什么过关、什么时候到期。**不含 token、不含 cookie 值、不含任何签名
+ * 材料** —— 它是身份探针,不是凭据分发点;`expires_at` 走 `sessionCookieExpiryMs`(只读解析,
+ * 不参与鉴权判定,鉴权在 `checkApiToken` 里已经做完)。它刻意只对「本次过关用的那条 cookie」
+ * 报过期:Bearer 请求顺手带一份合法 cookie 时,过关的不是它,报出一个没参与判定的过期时间
+ * 等于给前端一个会误导刷新策略的数。
+ */
+function handleSessionMe(req: Request, credential: ApiCredential): Response {
+  const exp = credential === "cookie" ? sessionCookieExpiryMs(readSessionCookie(req) ?? "") : null;
+  return Response.json(
+    {
+      authenticated: true,
+      credential,
+      expires_at: exp === null ? null : new Date(exp).toISOString(),
+    },
+    { status: 200, headers: { "cache-control": "no-store" } },
   );
 }
 
@@ -1244,7 +1295,15 @@ export default {
       return handleSessionLogin(req, env);
     }
 
-    // 鉴权门位置保持不变:在 /healthz、GET /、登录之后,一切 /api/* 与 /live 之前。
+    // 登出同样在门前,理由与登录相反且互不兼容:它必须**无条件幂等**(见 handleSessionLogout
+    // 上方注释),而门后那条 401 恰好是这里唯一不能出现的形状。两条门前的分支到此为止,
+    // 且都是 POST —— /me 在门后,不在这个区里。
+    if (url.pathname === "/api/session/logout" && req.method === "POST") {
+      return handleSessionLogout();
+    }
+
+    // 鉴权门位置保持不变:在 /healthz、GET /、门前那两条会话分支(login/logout)之后,
+    // 一切 /api/* 与 /live 之前。
     const credential = await checkApiToken(req, env);
     if (!credential) return unauthorized();
 
@@ -1255,6 +1314,12 @@ export default {
     // GET 全免:跨站 GET 写不了状态(全部写端点是 POST),而 EventSource 正是 GET。
     if (credential === "cookie" && req.method !== "GET" && !isSameOrigin(req)) {
       return invalidOrigin();
+    }
+
+    // SPA bootstrap 的探针:门后第一条,因为它的全部意义就是「门认不认我」(§3)。
+    // credential 此刻必非 null —— 未鉴权的请求已经在上一行得到那一条 401。
+    if (url.pathname === "/api/session/me" && req.method === "GET") {
+      return handleSessionMe(req, credential);
     }
 
     // API 一律挂 /api/*:w2 起本 Worker 挂 Static Assets 并配 single-page-application

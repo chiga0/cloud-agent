@@ -161,16 +161,36 @@ export function sessionCookieExpiryMs(value: string): number | null {
 }
 
 /**
- * 完整的 Set-Cookie 串。属性顺序与 docs/product.md §3 逐字一致,一个都不多一个都不能少:
- * 没有 `Domain=` 是 `__Host-` 的硬要求(带 Domain 即不合规,浏览器直接丢这条 cookie);
- * `Path=/` 同理(必须是根);`Secure` 不能省(`wrangler dev` 的 http://localhost 属可信上下文,
- * 因此本地也发得出去、收得回来)。Max-Age 与 payload 里的 exp 同源同值,浏览器据此自己清 cookie。
+ * 会话 cookie 的属性串,**登录与登出共用同一个常量**。
+ *
+ * 为什么不能各写一份:清 cookie 的判据是「同名 + 同路径 + 同域」,浏览器按这三元组定位要覆盖
+ * 哪条 cookie。登出那份只要属性漂一点(`Path=/api`、多了 `Domain=`),它就是对**另一条** cookie
+ * 说的 —— 响应 200、控制台无警告、页面上的 cookie 原地不动,表现是「登出按钮登不掉」。
+ * 漂移在测试里也可能绿(两边各自断言自己的字面串),所以这里从结构上消灭「两份」这件事。
+ *
+ * 顺序与 docs/product.md §3 逐字一致,一个都不多一个都不能少:没有 `Domain=` 是 `__Host-` 的
+ * 硬要求(带 Domain 即不合规,浏览器直接丢这条 cookie);`Path=/` 同理(必须是根);`Secure`
+ * 不能省(`wrangler dev` 的 http://localhost 属可信上下文,因此本地也发得出去、收得回来)。
  */
+const SESSION_COOKIE_ATTRIBUTES = "HttpOnly; Secure; SameSite=Strict; Path=/";
+
+/** 登录用的完整 Set-Cookie 串。Max-Age 与 payload 里的 exp 同源同值,浏览器据此自己清 cookie。 */
 export function sessionSetCookieHeader(value: string): string {
   return (
-    `${SESSION_COOKIE_NAME}=${value}; HttpOnly; Secure; SameSite=Strict; Path=/;` +
+    `${SESSION_COOKIE_NAME}=${value}; ${SESSION_COOKIE_ATTRIBUTES};` +
     ` Max-Age=${SESSION_MAX_AGE_SECONDS}`
   );
+}
+
+/**
+ * 登出用的过期 Set-Cookie:`Max-Age=0` + **空值**,其余属性与登录逐字节同形状(见上)。
+ *
+ * 只发这一条,不带任何服务端动作 —— 本会话零存储,「清 cookie」能清的就只有浏览器手里那份。
+ * 因此它是**客户端撤销**:拿走一份 cookie 副本的人不受本次登出影响,全量撤销的唯一手段仍是
+ * 换 `WORKER_API_TOKEN`(§3 定稿的取舍,口径见 docs/architecture.md §10.5)。
+ */
+export function sessionClearCookieHeader(): string {
+  return `${SESSION_COOKIE_NAME}=; ${SESSION_COOKIE_ATTRIBUTES}; Max-Age=0`;
 }
 
 /** 从请求里取会话 cookie 值;没有则 null。只认 `__Host-cas`,不做前缀/子串匹配。 */

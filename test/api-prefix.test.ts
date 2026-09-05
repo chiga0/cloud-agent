@@ -95,14 +95,18 @@ function apiEndpoints(
     { method: "GET", path: "/api/admin/tasks" },
     { method: "GET", path: "/api/admin/attempts" },
     { method: "GET", path: "/api/admin/events" }, // 缺 task_id → 400,同样命中分发
-    // preauth = 这条端点**故意**在鉴权门之前(w1b 登录:拿凭据换凭据,无凭据也得答)。
-    // 它照样挂在 /api 之下 —— 前缀分区与鉴权门是两件事,漏挂一样会被 SPA fallback 静默吞掉。
+    // 会话三端点(docs/product.md §3)。`preauth` = 这条**故意**挂在鉴权门之前:login 是
+    // 「无凭据也要答」(拿凭据换凭据),logout 是「必须无条件幂等」(见 src/index.ts 的分支注释)。
+    // /me 在门后,与其余端点同口径。三者照样都挂 /api 之下 —— 前缀分区与鉴权门是两件事,
+    // 漏挂一样会被 SPA fallback 静默吞掉。
+    { method: "GET", path: "/api/session/me" },
     {
       method: "POST",
       path: "/api/session/login",
       body: { token: "wrong-on-purpose" }, // → 401 invalid_credentials,分发命中
       preauth: true,
     },
+    { method: "POST", path: "/api/session/logout", preauth: true }, // → 200 清 cookie
   ];
 }
 
@@ -127,8 +131,11 @@ describe("/api 前缀契约", () => {
       { method: "GET", path: "/admin/attempts" },
       { method: "GET", path: "/admin/events" },
       { method: "POST", path: "/session/login" }, // w1b 新增:同样只认 /api 前缀,门前的分支不给旧路径开后门
+      { method: "POST", path: "/session/logout" }, // 同上:门前那条分支也不给旧路径开口子
+      { method: "GET", path: "/session/me" },
     ];
     for (const { method, path } of dead) {
+      // 清单里的请求一律带 Bearer,因此这里的 404 来自「没有分发」而不是「没过门」。
       const res = await request(path, { method });
       expect(res.status, `${method} ${path} 必须 404`).toBe(404);
       expect(await isNotFound(res), `${method} ${path} 必须落到全局 not_found`).toBe(true);

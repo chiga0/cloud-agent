@@ -1071,6 +1071,8 @@ that your Worker's code had hung
 
 ### 已知的部署侧前提:EventSource 带不了 Authorization 头(401 与断连**可区分**)
 
+> **⚠️ w1b 起本小节的「前提」已解除(2026-09-05),以下正文按历史口径保留。**「`EventSource` 带不了 `Authorization` 头」这句至今成立,不再成立的是它依赖的另一半 —— §9.6 那条流除了 Bearer 还认同源会话 cookie,而 cookie 由浏览器自动带、`EventSource` 不例外。登录后的浏览器直开 `/live/<task_id>` 拿到的是 200 与事件流,**前端零代码**;401 只在未登录 / 会话过期 / 服务端换过 token 时出现。所以凡下文说「prod 无凭据直开得到 401」「浏览器自己连不上 prod」的,都是 w1b 前的现场描述 —— **而那套 `readyState` 分枝规则至今有效且仍然必要**(401 只是从「恒发生」变成「会话过期时会发生」)。现行鉴权口径与实测边界见 §10.5。
+
 必须写清,不能靠实现蒙过去:**`EventSource` 按规范不能携带自定义请求头**,而 §9.6 那条流只认 `Authorization: Bearer`。所以 prod 无凭据直开 `/live` 会得到 **401**,页面停在「连接已关闭」那一支提示上。
 
 **这个 401 是预期,不是回归**:全局那一条 `checkApiToken` 有意覆盖这个出口(理由见上一小节:要守的是任务存在性本身),而页面里不含任何凭据出口。**浏览器可达性由后续产品化会话方案统一解决,本期刻意不引入任何临时方案** —— 本地代理、登录壳、query token、cookie 会话、平台 ticket 铸发一律不做(方向已定,先搭临时桥等于给下一棒留要拆的桥);把 `WORKER_API_TOKEN` 塞进 URL 尤其不做(凭据会进浏览器历史、访问日志与 Referer,是拿观测面换一个泄露面)。本期硬约束同样包含**不改 SSE 端点的一个字节(含它的鉴权)**。
@@ -1367,14 +1369,111 @@ red 档留给「连心跳都没了」这种形状,阈值 180s + 一个 tick ≈ 
 
 ---
 
+## 10.5 鉴权与会话 —— 全局那一条门与三个会话端点(w1b)
+
+§11 全表的「鉴权」列写的是 API 客户端的形状。w1b 起同一批端点还认**第二条凭据**:浏览器不复制 token,而是用 `POST /api/session/login` 换一条自签名的会话 cookie。本节把「谁在什么条件下过关」一次说清 —— 判定顺序、CSRF 的两层、三条会话端点各自的门位,以及 HMAC key 复用 `WORKER_API_TOKEN` 的理由与代价。
+
+实现只有两个文件:`src/auth/session.ts`(原语,零存储)与 `src/index.ts` 的 `checkApiToken` + 三条 `handleSession*`(编排)。cookie 值格式(`<b64url(payload)>.<b64url(HMAC-SHA256)>`)、b64url 严格解码、定长比较这些原语级取舍在 `session.ts` 的文件头注释里,本节不重复。
+
+### 判定顺序(自上而下,第一条命中即返回)
+
+| # | 位置 | 判据 | 结果 |
+|---|---|---|---|
+| 1 | 门前 | `GET /healthz`、`GET /` | 公开,不鉴权 |
+| 2 | 门前 | `POST /api/session/login` | 常数时间比 `WORKER_API_TOKEN` → 发 cookie;失败恒 401 `invalid_credentials` |
+| 3 | 门前 | `POST /api/session/logout` | **无条件** 200 + 过期 Set-Cookie(理由见「登出为什么必须在门前」) |
+| 4 | 门 | `Authorization: Bearer` 等于 `WORKER_API_TOKEN` | 过关,凭据种类 = `bearer`,**立即返回** |
+| 5 | 门 | `__Host-cas` cookie:签名有效**且**未过期 | 过关,凭据种类 = `cookie` |
+| 6 | 门 | 以上皆不成立(含 `WORKER_API_TOKEN` 未配) | 401 `unauthorized` |
+| 7 | 门后 | 凭据种类 == `cookie` 且方法 != `GET` 且 `Origin` 不同源 | 403 `invalid_origin` |
+| 8 | 门后 | 其余分发(`/api/session/me`、`/api/tasks*`、`/api/admin/*`、`/live/*`) | 按各端点语义 |
+
+三条不可动的定序纪律:
+
+- **Bearer 优先,且命中即返回**。第 4 步不查 cookie、不做任何密码学运算 —— 这是 land.mjs 与全部 API 客户端零回归的根据(§7 风险登记把「Bearer 零回归」列为 w1b 第一验收)。反过来若让 cookie 先判,一条过期 cookie 就能把合法 Bearer 请求拖进密码学分支并有机会改变响应形状。
+- **未配 `WORKER_API_TOKEN` 时整道门 fail-closed**(第 6 步的括号),登录也一样(第 2 步走失败分支)。一个没配凭据的部署必须是「谁都进不去」,而不是「谁都进得去」。
+- **过期即当作没有凭据**,不做宽限期;先验签、后解析 payload(顺序理由见 `verifySessionCookieValue` 上方注释:未签名的 JSON 是攻击者任意可控的输入,不在它上面做任何判断)。
+
+`checkApiToken` 返回的是**凭据种类**而不是布尔值,因为第 7 步的判据是「这条请求靠什么过关」,不是「有没有过关」。
+
+### CSRF 是两层,不是一层
+
+| 层 | 机制 | 覆盖 | 兜不住什么 |
+|---|---|---|---|
+| 主防 | `SameSite=Strict`(cookie 属性) | 跨站请求根本带不上 cookie | 旧浏览器实现、顶层导航的 form POST |
+| 兜底 | `Origin` 必须同源(`isSameOrigin`,**缺失即 false**) | 上面那两种形状 | 只作用在 **cookie 鉴权的非 GET** |
+
+两道都不管 Bearer:land.mjs 的落地通道是 `Authorization` + **不带 Origin**,给 Bearer 加这道门等于断粮。GET 全免:跨站 GET 写不了状态(全部写端点是 POST),而 `EventSource` 正是 GET。
+
+`403 invalid_origin` 与 `401 unauthorized` 刻意分两个码:401 说的是「凭据不成立」,而这里凭据成立、被拒的是**请求的来源**。混成一个 401,前端就会在源配错时把用户踢回登录页 —— 一个反复登录的死循环;403 说的是「你已登录,但这条请求不该出现在这里」。
+
+### 会话三端点:门前两条、门后一条
+
+| 端点 | 门位 | 成功形状 | 失败形状 | 为什么这样放 |
+|---|---|---|---|---|
+| `POST /api/session/login` | 前 | 200 `{ok:true}` + `Set-Cookie: __Host-cas=<v>; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=21600` | **只有一个** 401 `invalid_credentials`(不发 cookie) | 拿凭据换凭据,无凭据也得答。失败面合并成一个形状,是为了不给「这台部署配了 token 吗」留 oracle;代价(登录侧可调试性变差)由服务端日志承担 |
+| `POST /api/session/logout` | 前 | 200 `{ok:true}` + 同名、**空值**、`Max-Age=0`、其余属性与登录同形的 Set-Cookie | 无 —— 任何输入形状都 200 | 见下 |
+| `GET /api/session/me` | 后 | 200 `{authenticated, credential, expires_at}` + `cache-control: no-store` | 401 `unauthorized`,与全局门**逐字节同形状** | SPA `beforeLoad` 的探针,全部意义就是「门认不认我」。未鉴权必须先过门,前端的 guard 才只需要认一种 401 |
+
+**登出为什么必须在门前。** 零存储会话没有服务端登录态可销毁,登出唯一的作用就是把那条过期 Set-Cookie 发回去。挂在门后,「没带 cookie 的登出」就会得到 401,而 401 与 200 的差正是「你手里有没有会话」的探测面;而登出本就必须幂等 —— 连点两次登出、会话已自然过期、服务端已换 token(会话全量失效)三种形状都必须拿到**同一个** 200。所以 `handleSessionLogout` 不读 cookie、不验签名、不看 Origin:响应与请求带了什么完全无关,也就无从泄露带了什么。
+
+**这条设计的代价,如实登记**:同一形状意味着任何人都能把这条 POST 发成功,即「强制登出」在协议上不可拒 —— SameSite 管的是请求带不带 cookie,管不了响应里的 Set-Cookie 被一次顶层导航接受。定级为可接受:服务端零状态,被登出的后果只有「操作员重新登录一次」,攻击者既拿不到读面也改不了任何状态;反过来在这里补一道 Origin 门,就会把上面那条幂等契约弄坏(非浏览器客户端不带 Origin)。
+
+**登出是客户端撤销,不是服务端撤销。** 它清掉的只有当前这个浏览器手里那份 cookie;被抄走的第二份副本不受本次登出影响,直到自然过期(21600s)。真正的撤销只有换 `WORKER_API_TOKEN`。`test/session-logout-me.test.ts` 里有一条用例专门钉着这个边界 —— 它钉的是**边界**而不是缺陷:哪天会话加了服务端记录,那条会红,届时该改判据而不是删用例。
+
+**「属性同形」由构造保证,不靠两处各写一遍。** 浏览器定位「要覆盖哪条 cookie」的判据是同名 + `Path` + `Domain`,不是「谁发的」。登出那份只要漂一点(如 `Path=/api`),它就是对**另一条** cookie 说话的 —— 响应 200、控制台无警告、页面上的 cookie 原地不动,表现是「登出按钮登不掉」。`session.ts` 因此把属性串收进 `SESSION_COOKIE_ATTRIBUTES` 单一常量,登录与登出共用;测试除了逐属性断言,还把两条 Set-Cookie 的属性**字面序列**并排比(去掉值与 Max-Age 后必须逐字符相同)—— 属性表看不出顺序漂移,字面序列看得出。
+
+`/me` 的 `expires_at` 只在凭据种类是 `cookie` 时有值,取 payload 里那个 `exp`(`sessionCookieExpiryMs` 是只读解析,不参与鉴权判定)。Bearer 请求即使顺手带一份合法 cookie 也报 `null`:过关的不是它,报出它的过期时间等于给前端一个会误导刷新策略的数。`/me` **绝不发 Set-Cookie** —— 发凭据的出口按 §3 只有 `/login` 一条,多一条就多一个可被利用的铸凭据点。`/me` 响应里也不得出现 token 值、cookie 原值或签名段(测试按子句逐条否掉)。
+
+### HMAC key 复用 `WORKER_API_TOKEN`:理由与代价
+
+**不新增 secret** —— 会话签名的 key 就是 `WORKER_API_TOKEN` 本身(§3 与 §7 定稿)。四条理由:
+
+1. **撤销语义与既有运维模型同构**。本平台的模型是「单 token 操作员」,换 token 是唯一的撤销动作。会话挂同一个 key,「换 token 即全量撤销会话」就是同一件事的第二个说法,不需要第二个撤销入口。
+2. **secret 面不增**。每多一份 secret 就多一份泄露面、一条轮换流程、一处 `wrangler secret put` 与 prod 配置漂移的可能(§12 的 binding 核查就要多看一项)。
+3. **零存储的前提**。会话不写 D1/DO/R2 的一个字节;存了就得依赖那张表做撤销,而本方案的全部意义是不依赖它。key 复用是「不建第二份状态」这条纪律的必然结果。
+4. **两条凭据本来就不该互相独立**。会话凭据的强度就是 token 的强度(它是 token 的 HMAC 签名)。换成独立 key 只会制造「会话可与 token 分别撤销」的错觉,而撤销路径实际同一条。
+
+代价同样登记在册:
+
+- **撤销粒度只有全量**。换 token 会把 API 客户端与所有浏览器会话一起打断,需要操作员协调窗口(与 §7「land.mjs 断粮窗口」同一类纪律)。做不到「只踢掉某一个人」—— 系统里没有「某一个人」这个概念(§1 非目标:不是多租户平台)。
+- **cookie 是 token 的离线可验证函数**。payload 只有 `exp`(公开可猜的形状),签名 `HMAC-SHA256(token, payload)`,于是拿到任意一份 cookie(含已过期、已登出的)的人都能离线穷举候选 token 并逐条验证。反方向不成立:拿到 cookie 不等于拿到 token(签名不可逆,payload 不含 token),但**这条等价关系使 token 的熵成为会话的熵**。派生要求(运维项,不是代码项):`WORKER_API_TOKEN` 必须是高熵随机串 —— `.dev.vars.example` 里那句中文示例串只能用于本地,拿它上 prod 等于把「爆破 cookie」降级成「爆破一句人话」。
+- **无滑动过期、无续签**。6 小时到了就重新登录。加一处续签就多一处服务端判断与一个可探测的状态,而操作员的一次登录覆盖得住一个 writer 的墙钟(§7.2.2 的平台安全上限 25 分钟量级)。
+
+### EventSource 自此带同源 cookie 直连(c9b 的「401 页面」问题终结)
+
+`EventSource` 按规范不能携带自定义请求头,而 `/api/tasks/:id/events/stream` 在 w1b 之前只认 `Authorization: Bearer` —— 浏览器直开 `/live/...` 恒得 401。§9.7 把这条写成「已知的部署侧前提」,并明确「本期刻意不引入 cookie 会话等临时方案,浏览器可达性由后续产品化会话方案统一解决」。**w1b 就是那个「后续方案」,前提已解除**:
+
+- cookie 由浏览器**自动**随同源请求发出,`EventSource` 不例外 → 登录后的浏览器直连 SSE 与 `/live` 页面拿到 200 与事件流,**前端零代码**;把 token 塞进 URL 那条路依旧否决(凭据会进浏览器历史、访问日志与 Referer);
+- SSE 是 GET,CSRF 兜底层对 GET 全免 → 这道门不会把事件流挡在 403 上;
+- 未登录(无 cookie / 已过期 / 服务端已换 token)照旧 401。**§9.7 那套 `readyState` 分枝规则仍然有效且仍然必要**(401 → `2/CLOSED` 且永不重连,拒连 → `0/CONNECTING` 且每 3s 重连)。作废的只是「浏览器自己连不上 prod」这个结论,不是分枝逻辑:连不上的场景从「恒发生」变成「会话过期时发生」。
+
+⚠ **需浏览器实测**,单测钉不住:workerd/miniflare 侧没有 cookie jar。测试钉的是两头契约 —— 「带 `Cookie:` 头的请求能过门」与「Set-Cookie 的字节形状」,中间那截「浏览器会不会存下这条 cookie、会不会在 `EventSource` 上带出来」只有真实浏览器能答(`__Host-` 前缀的四条硬要求正是为它准备的:不合规的表现是静默丢 cookie,登录 200、下一秒 401,且不留任何错误日志)。操作员冒烟序列:浏览器 `/api/session/login` → 直开 `/live/<task_id>` → 事件持续出现且顶部 pill 走动 → 登出后再开应回到 CLOSED 分支。
+
+**同批文案尚未随动(不在本棒范围,如实披露)**:`src/obs/live.ts` 的空态说明块与 `LIVE_CONN_RULES` 里「浏览器自己连不上 prod」的说法、以及 README 的 `/live` 条目,仍是 w1b 前的口径。它们现在不再准确(§9.7 已就地更正并指向本节),收哪几处属文案随动 —— 本棒守 §3 的鉴权面,不改第④层页面的一个字节。
+
+### 这一节刻意不做什么
+
+- **不做会话黑名单 / 单点登出 / 按人撤销**:零存储的必然结果,见上面「撤销粒度只有全量」。
+- **不做 refresh token 与滑动过期**:同上,续签带来的服务端状态比 6 小时重登一次更贵。
+- **不做同步器令牌(CSRF token)**:SameSite + Origin 两层已覆盖威胁模型,再加一道就要给 SPA 发一个可写进 DOM 的 token —— 那是新的泄露面,而 §3 要求这套防线**前端零代码**。
+- **不做多用户 / 角色 / 审计到个人**:§1 非目标。`actor` 仍是 `human:api`(§10),会话不带身份。
+
+---
+
 ## 11. API 参考
 
 所有路径前缀为 Worker 的 public URL(`wrangler.jsonc` 的 `PUBLIC_URL`,当前 `https://cloud-agent.aflow.workers.dev`)。
+
+「鉴权」列写 `Bearer $WORKER_API_TOKEN` 的行,指的是 API 客户端的形状;w1b 起**同一批端点**也认浏览器那条同源 `__Host-cas` 会话 cookie(判定顺序与例外见 §10.5)。带 cookie 的非 GET 另需同源 `Origin`,401/403 的分工同见该节。
 
 | 方法 | 路径 | 鉴权 | 说明 |
 |---|---|---|---|
 | GET | `/` | 无 | 落地页(环境 + 端点列表) |
 | GET | `/healthz` | 无 | `{ ok: true, env }` |
+| POST | `/api/session/login` | **无(鉴权门之前)** | 拿 token 换会话 cookie(§10.5)。body `{token}` → 常数时间比 `WORKER_API_TOKEN` → 200 `{ok:true}` + `Set-Cookie: __Host-cas=<b64url({exp})>.<sig>; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=21600`。**零存储**:不写 D1/DO/R2 的一个字节,换 token 即全量撤销。失败面只有一个形状 —— JSON 畸形 / 缺字段 / token 错 / 服务端未配 token 一律 401 `invalid_credentials` 且**绝不发 cookie**(不给「这台部署配了 token 吗」留 oracle) |
+| POST | `/api/session/logout` | **无(门前,恒 200)** | 清 cookie:`Set-Cookie: __Host-cas=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0`(值空,其余属性与登录**同形状**且由同一常量保证)。**无条件幂等**:带合法会话 / 带过期或伪造 cookie / 什么都不带,都得到逐字节相同的 200 `{ok:true}` —— 形状与请求带了什么无关,因此也不泄露会话存在性。是**客户端撤销**:被抄走的 cookie 副本不受影响(§10.5) |
+| GET | `/api/session/me` | `Bearer $WORKER_API_TOKEN` 或会话 cookie | **SPA bootstrap 探针**:200 `{authenticated:true, credential:"bearer"\|"cookie", expires_at:<ISO\|null>}` + `cache-control: no-store`。`credential` 说的是**本次过关靠什么**,`expires_at` 只在该凭据是 cookie 时有值(Bearer 为 `null`)。不含 token、不含 cookie 值、不含签名材料,**且绝不发 Set-Cookie**(发凭据的出口只有 `/login` 一条)。未鉴权 → 与全局门逐字节同形状的 401 `unauthorized`(前端 guard 只认一种 401) |
 | POST | `/api/tasks` | `Bearer $WORKER_API_TOKEN` | 创建 task + 首个 attempt,启动 workflow;`spec.acceptance[]`(可选,≤8 项、每项 3–500 字符,非法 → 400 `invalid_acceptance`)、`spec.base_sha`(可选,全长度小写 hex;非法 → 400 `invalid_base_sha`,不落库、不起沙箱)、顶层 `review_evidence_mode`(可选 `shadow`/`enforce`,覆盖环境变量);返回 `{ task_id, attempt_id, workflow }` |
 | GET | `/api/tasks/:id` | `Bearer $WORKER_API_TOKEN` | 返回 `{ task, attempts[], events[] }`,含 `task.result_text` 与 `task.base` |
 | GET | `/api/tasks/:id/result` | `Bearer $WORKER_API_TOKEN` | `text/plain` 直出 agent 最终答案;尚未提取到返回 404 `{ error: "no_result_yet" }` |
@@ -1387,7 +1486,7 @@ red 档留给「连心跳都没了」这种形状,阈值 180s + 一个 tick ≈ 
 | GET | `/api/tasks/:id/events` | `Bearer $WORKER_API_TOKEN` | **在途事件流**(§9.5):直接读 R2 的 `obs/` 段文件 journal,**不经 D1 终态归档**,所以任务 `RUNNING` 期间就有内容。返回 `{ task_id, state, events: AgentEventV1[], count, total, next_cursor, unreadable_attempts }`;按 attempt 创建序、attempt 内按 `generation`/`seq` 升序。`?after=`(扁平流上已读的条数,缺省 0)、`?limit=`(缺省 500,上限 2000;非法 → 400 `invalid_after`/`invalid_limit`)。任务不存在 → 404;从未摄取过 → 空列表 |
 | GET | `/api/tasks/:id/events/stream` | `Bearer $WORKER_API_TOKEN` | **在途事件的 SSE 投影**(§9.6):`text/event-stream`,与 `/events` 同一份 journal、同一个位置游标的两种读法(推/拉),互为恢复源。帧 `id` = **该帧之后已读的条数**(扁平序 1-based 位置),与 `?after=` 完全同口径 → 断线带 `Last-Event-ID: <id>` 续传不重发也不漏读(header 缺省 = 0 = 从头回放;值为空或畸形 → 400 `invalid_last_event_id`)。每拍 3s 尾读增量,零新增发 `: ping` 注释帧;任务离开 `RUNNING` 且增量推完 → 一帧 `event: end`(id = 总条数,`data` 带 `unreadable_attempts`)后关流。某 attempt 的 journal 读不到只列进 `unreadable_attempts`,**不杀流**。任务不存在 → 404(在建流之前判定)。**只读投影:不写任何权威状态** |
 | GET | `/api/tasks/:id/attempts/:aid/transcript` | `Bearer $WORKER_API_TOKEN` | 流式透传 R2 里的 transcript 原文 |
-| GET | `/live/:taskId` | `Bearer $WORKER_API_TOKEN` | **Live UI**(§9.7):第④层投影的人眼端。返回 `text/html`(`cache-control: no-store`),CSS/JS **全内联**、零外部依赖、无构建步骤;页面自己用 `EventSource` 连上一条端点(浏览器按标准重连并回传 `Last-Event-ID`,与帧 `id` 同口径 → 续传不需要 UI 侧代码)。顶部 = 任务 id + state 徽章;主体 = 事件时间线按到达序渲染 `seq`/`kind` 徽章(清单派生自 `OBS_EVENT_KINDS`)/`ts`/`payload.text` 摘要(>200 字符截断并标注全文长度),`tool_use` 附 `tool_names`、`raw` 附 `raw_type`、`result`/`error` 视觉强调。**核心价值 = 停滞检测**:显著位置一条 pill 每秒自增,c10b 起是**两条时间源、三个说法** —— 平时「最后事件 Ns 前」,心跳停止 >180s 转红并改口「心跳停止 Ns(runner 停了)」,模型静默 >900s 转黄并改口「模型静默 Ns(runner 活着)」;静默那一档**永不转红**(两个阈值的推导与理由只在 §9.8 出现一次,页面只是它的读者)。收到 `event: end` → 显示「流已结束」并停止计时。前端防御性解析:坏帧跳过并计数,`onerror` 有**分枝**的可见提示(401 不承诺重连)。鉴权与 `/api/tasks/:id/events*` 同源(无凭据 401、任务不存在 404,均在生成 HTML 之前判定 —— 要守的是**任务存在性**本身,不只是 payload);`taskId` 按上下文分两套转义(HTML 文本节点 / JS 字面量)。**只被动显示:不做任何判定、不做任何处置**(Supervisor 是独立消费者层,下一期)。⚠️ `EventSource` 不能携带 `Authorization` 头 → prod 无凭据直开得到 **401(预期:全局鉴权门有意覆盖这个出口)**;而 401 与网络断连按 `es.readyState` **可区分**(401 → 2/CLOSED 且永不重连,拒连 → 0/CONNECTING 且每 3s 重连),页面据此分分支提示,401 下如实写「不会自动重连」并指向带凭据的 API 客户端。浏览器可达性等后续产品化会话方案统一解决,**本期不引入任何临时凭据出口**(详见 §9.7「已知的部署侧前提」) |
+| GET | `/live/:taskId` | `Bearer $WORKER_API_TOKEN` | **Live UI**(§9.7):第④层投影的人眼端。返回 `text/html`(`cache-control: no-store`),CSS/JS **全内联**、零外部依赖、无构建步骤;页面自己用 `EventSource` 连上一条端点(浏览器按标准重连并回传 `Last-Event-ID`,与帧 `id` 同口径 → 续传不需要 UI 侧代码)。顶部 = 任务 id + state 徽章;主体 = 事件时间线按到达序渲染 `seq`/`kind` 徽章(清单派生自 `OBS_EVENT_KINDS`)/`ts`/`payload.text` 摘要(>200 字符截断并标注全文长度),`tool_use` 附 `tool_names`、`raw` 附 `raw_type`、`result`/`error` 视觉强调。**核心价值 = 停滞检测**:显著位置一条 pill 每秒自增,c10b 起是**两条时间源、三个说法** —— 平时「最后事件 Ns 前」,心跳停止 >180s 转红并改口「心跳停止 Ns(runner 停了)」,模型静默 >900s 转黄并改口「模型静默 Ns(runner 活着)」;静默那一档**永不转红**(两个阈值的推导与理由只在 §9.8 出现一次,页面只是它的读者)。收到 `event: end` → 显示「流已结束」并停止计时。前端防御性解析:坏帧跳过并计数,`onerror` 有**分枝**的可见提示(401 不承诺重连)。鉴权与 `/api/tasks/:id/events*` 同源(无凭据 401、任务不存在 404,均在生成 HTML 之前判定 —— 要守的是**任务存在性**本身,不只是 payload);`taskId` 按上下文分两套转义(HTML 文本节点 / JS 字面量)。**只被动显示:不做任何判定、不做任何处置**(Supervisor 是独立消费者层,下一期)。⚠️ `EventSource` 不能携带 `Authorization` 头 —— 但 **w1b 起它自动带的同源会话 cookie 就是凭据**:登录后的浏览器直开本页面并连上流,**前端零代码**(§10.5);未登录 / 会话过期 / 服务端换过 token 时仍是 **401**,而 401 与网络断连按 `es.readyState` **可区分**(401 → 2/CLOSED 且永不重连,拒连 → 0/CONNECTING 且每 3s 重连),页面据此分分支提示,401 下如实写「不会自动重连」并指向带凭据的 API 客户端。**历史口径更正**:c 系列那句「浏览器连不上 prod、本期不引入临时凭据出口」已随 w1b 解除(详见 §9.7 顶部的注记);页面内联文案本身尚未随动,记在 §10.5 |
 
 ### 典型调用序列
 
@@ -1429,6 +1528,29 @@ curl -sS -OJ "$BASE/api/tasks/$TASK/candidate?format=patch" -H "Authorization: B
 git -C /path/to/repo fetch origin "$BASE_SHA" && git -C /path/to/repo checkout --detach "$BASE_SHA"
 git -C /path/to/repo apply task-$TASK-*.patch
 ```
+
+### 会话三端点冒烟(curl 带 cookie jar = 浏览器那条路的等价物)
+
+上面全部步骤都用 `Authorization`。这一组打的是浏览器实际走的那条路:凭据只在 `Cookie` 头里,
+一个 `authorization` 都不带 —— 它同时是「Bearer 与 cookie 两条凭据互不干扰」(§10.5)的最小对照。
+
+```bash
+JAR=$(mktemp)
+curl -sS -X POST $BASE/api/session/login -H 'content-type: application/json' \
+  -d "{\"token\":\"$WORKER_API_TOKEN\"}" -c "$JAR" -w '%{http_code}\n'  # 200 + Set-Cookie: __Host-cas=…; Max-Age=21600
+curl -sS $BASE/api/session/me -b "$JAR"                                # {"authenticated":true,"credential":"cookie","expires_at":"…"}
+curl -sS $BASE/api/admin/tasks -b "$JAR" -o /dev/null -w '%{http_code}\n'   # 200 —— 门认这条 cookie
+curl -sS -X POST $BASE/api/session/logout -b "$JAR"                    # {"ok":true} + 同名空值 Max-Age=0 的过期 cookie
+curl -sS $BASE/api/session/me -b "$JAR" -o /dev/null -w '%{http_code}\n'   # 401(登出后 jar 里已无凭据)
+# 全程不带 Origin:GET 免 CSRF 检查,而 /api/session/logout 在门前且无条件幂等(§10.5)。
+```
+
+⚠ 两处 curl 与浏览器的差异,别把它们读成缺陷:`Secure` cookie 由 curl 的 cookie 引擎遵守,
+**非 https 的 `$BASE` 下第 2 步可能直接 401**(那是 curl 不发 Secure cookie,而 `wrangler dev` 的
+`http://localhost` 在浏览器里属可信上下文,同一份 cookie 发得出去 —— §3);而 curl 也没有真正的
+cookie jar 隔离,`__Host-` 前缀的三条硬要求(Secure / `Path=/` / 无 `Domain`)**只有浏览器会执行**,
+写错时 curl 照样绿。所以「EventSource 带同源 cookie 直连 SSE/`/live`」这一条红利必须用浏览器验收,
+序列与判据见 §10.5 的「需浏览器实测」。
 
 ---
 
