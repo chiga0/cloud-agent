@@ -448,12 +448,12 @@ Durable Workflow 把一次 attempt 切成若干独立幂等 step,崩溃后从最
 3. `setEnvVars` — 注入 `OPENAI_BASE_URL = MODEL_UPSTREAM_BASE`、`OPENAI_API_KEY = SANDBOX_MODEL_API_KEY`(**沙箱专用低权 key**,§13.14)、`OPENAI_MODEL`,qwen-code 直连百炼。该 secret 未配置时回落到 `DASHSCOPE_API_KEY` 并打一条 `credential_fallback` 告警——降权是配置层增强,刻意不阻塞基线冻结与候选交付这两个主交付物。
 4. 写 `/workspace/task.txt` = prompt(镜像由 `sandbox/Dockerfile` 预装 qwen-code,不再现场 `npm install`;缺二进制即 `exit 127` 直接失败并落证据,不做兜底 shim)。repo 任务的 prompt 前置【基线约束】:工作副本已 detach 到 `<sha>`,禁止 `git fetch/pull/switch/checkout` 与改写历史 —— 不写清这一点,writer 会自作主张「同步到最新」,把候选做进另一个世界。
 5. `exec` 跑 `qwen -p "$(cat task.txt)" --output-format stream-json --auth-type openai --yolo --max-session-turns 12 --max-wall-time 5m`
-6. 软失败检测:qwen 在 API 错误时仍 exit=0,但最后一条 `type=result` 的 `result` 字段会含 `[API Error:...]`。识别后上翻 exit_code=11
+6. 软失败检测:qwen 在 API 错误时仍 exit=0,但最后一条 `type=result` 的 `result` 字段**整个就是**那条错误(`[API Error: ...]` 包壳或裸机器码)。裁决交给 `src/exec/cli-exit.ts` 的纯函数,命中即上翻 exit_code=11 —— 判据是**整串**而非**包含**,动机见 §7.2.3
 7. transcript / stderr 写 R2(内容寻址);**成功或预算到期**且为 repo 任务时导出工作树差量(到期那一支的产物自称不完整,见 §7.2.1)—— **断言式**:`cat-file -e` 确认基线对象在 → `git add -A` → `git diff '<base_sha>' --binary`,正常路径任一步非零即 `exit 23` 且**不产出半成品补丁**(宁可失败,也不交出一张不知道对谁有效的补丁)
 8. 返回 `{ exitCode, transcript, stderr, patch, base }`,`base = { sha, source }` 随证据链上翻到控制面
 9. **验证语义不在此执行**:`verify_command` 由独立 verifier 在另一沙箱**同一基线**上重放(见 §13.10);非 repo 任务无验证
 
-**软失败检测的意义**:qwen-code 把 API 错误嵌入 stream-json 的 result 事件而不是反映在退出码,如果不识别会把"401/限流"当成"任务成功"。
+**软失败检测的意义**:qwen-code 把 API 错误嵌入 stream-json 的 result 事件而不是反映在退出码,如果不识别会把"401/限流"当成"任务成功"。但这个检测**本身也是一台误判机器**:它改写退出码,而退出码决定 §7.2.1 那张表里差量导不导 —— 判错的代价不是「多一个失败任务」,而是丢掉一份已完成的工作。判据的形状因此单独成节(§7.2.3),而不是留在 `collectQwenAttempt` 的一个内联正则里。
 
 ### 7.2.1 预算到期时的产物语义(exit 55 / 53)
 
@@ -538,6 +538,39 @@ c12 只走通了执行面那一半:差量导出来了、自称不完整了,但�
 **入口 fail-closed**:`POST /api/tasks` 校验 `budget.max_wall_seconds` 的形状 —— 必须是 JSON 正整数;负数 / 0 / 小数 / 字符串 / NaN / Infinity 一律 `400 invalid_budget` 并带原因,**不建任务、不起 attempt**(非法值过去能落进 `TaskRecord`,于是 `attemptDeadline` 排出一个过去的 alarm,而沙箱侧的 `max(1, …)` 又把它掩盖成「1 分钟预算」)。这与配置侧的纪律刻意不对称:环境变量缺配 → 静默回落;给了非法值 → 回落 + `budget_default_invalid` 告警留痕(旧行为是 `Number("abc") = NaN` 一路流到命令行,变成 `--max-wall-time NaNm`)。理由是**请求方拿得到 400 并改正,配置方拿不到**;而对非法请求值做静默修正,产出的是与请求不符且无人报告的静默行为。
 
 > 时间账口径示例:`max_wall_seconds = 1800` 在 `MAX_WRITER_WALL_MINUTES=40`(prod)下 → 有效墙钟 **28 分钟**(扣掉 120s 导出预算),不夹钳、无事件;同一预算在无覆盖值的环境里 → **25 分钟**,链上必有一条 `budget.clamped`。历史形状注一句以免误读:§7.2 第 5 步里的 `--max-session-turns 12 --max-wall-time 5m` 是 Fix C 之前的字面量,那两个数现在由 `resolveBudget` 推导。
+
+### 7.2.3 CLI 退出码裁决:整串 vs 包含(c16)
+
+qwen-code 的 API 错误不反映在退出码上,而以末条 `type=result` 事件的 `result` 文本形态出现(§7.2 第 6 步)。识别这件事曾经写在 `collectQwenAttempt` 的一个内联正则里:`/\[API Error:|upstream_error|model_not_found/` —— **在文本里找到**就把 exit 0 上翻为 11。这个「包含即失败」的假设在 c15 被打穿,而且是以最体面的方式打的:
+
+writer 那三次都成功收尾(`is_error=false`),而任务规格**要求**它在总结里讨论这些错误形状 —— 于是被讨论的字样必然出现在成功文本里。三次俱毁的链路是:字样出现 → 0 改写成 11 → 11 不属于 §7.2.1 那张表里「可就地取回差量」的退出码集合 → 补丁导出整支跳过 → 已完成的工作按失败作废。
+
+**病灶不是词表,是匹配位置。** 这条判据的输入是**散文**,而散文的天性就是引用它所讨论的一切;把「字样出现过」读成「错误发生过」,等于让任务的措辞决定任务的成败 —— 一个规格写得越要求解释错误处理的任务,越必然被判为失败。
+
+因此判据搬进 `src/exec/cli-exit.ts` 的纯函数 `adjudicateCliExit({ nativeExit, isError, resultText })`。**词一个没删**(c10b 认的那些形状全部保留),收紧的是位置:`resultText` 去首尾空白后必须**整串**是一条错误。裁决顺序:
+
+| 序 | 输入 | 结果 | 为什么排在这里 |
+|---|---|---|---|
+| 1 | `nativeExit === null` | `-1`(`EXIT_UNKNOWN_NATIVE`) | 终态不可知时不做任何文本判读:进程可能死在写一半的时刻,那一刻的 result 文本说明不了成败 |
+| 2 | `nativeExit !== 0` | **原样返回** | 进程自己喊了失败,平台既不改判成功,也不改写它的码 —— 预算类的 55/53 尤其要原封,否则同一次死亡从 `route_decision(budget_abort)` 改轨到别处 |
+| 3 | `isError === true` | `11`(`EXIT_CLI_API_ERROR`) | CLI 自认失败,不必再看文本 |
+| 4 | `resultText` **整串**命中错误形状 | `11` | 见下两条形状;这一步与 `isError` 在场与否、是真是假**无关** |
+| 5 | 其余 | `0` | 成功文本里**引用**错误形状是 writer 的正当工作 |
+
+第 4 步认的两类整串形状:
+
+- **方括号包壳**:`^\[API Error:[^\]]*\]$` —— 方括号开头、内部不再出现 `]`、整串到 `]` 结束;
+- **裸机器码**:整串就是一个 token —— `AccessDenied.` 家族(子码不固定,故按前缀认)或 `model_not_found` / `upstream_error` / `insufficient_quota` 之一。**要求整串不含空白**,是因为「裸」才是机器码的形状:`AccessDenied. 后面接的是人写的散文` 不是错误本身。
+
+**为什么 `isError === false` 不给免疫**:c10b 那批真失败的标本形状就是 `exit 0` + CLI 没置 `is_error` + result 整串是错误。让 `false` 免疫等于把这批真失败重新放成成功 —— 那是拿一个已知缺陷换一个未知缺陷。`isError` 缺失时同样走第 4 步。
+
+**精度换召回,是刻意的**。漏判的方向(带上下文的错误文本落回 0)代价是「一次失败被当成成功」:差量照常导出,而那份候选会撞独立验证(§13.10)与 reviewer 的证据契约,有下游兜住。误判的方向代价是**销毁一份已完成的工作**,不可逆,而且下游永远不知道它存在过。两者不对称,所以判据偏向「宁可漏判形状,不可误判散文」。若将来真攒出「带上下文的失败」标本,加法是**再补一条整串形状**(或改读 `subtype` / `stop_reason` 这类枚举字段),不是回到子串。
+
+**一字未动的部分**:末行不是 JSON 或不是 result 事件 → 忽略(与旧行为同);补丁导出的条件、`exitCode === 0` 那支的字节行为、预算类(55/53)差量自称不完整那一整支,全部原样;11 这个数字及其「非预算类失败」的路由归属也没动 —— 本棒改的是**什么时候**产出 11,不是产出之后走哪条路。
+
+**为什么单独成文件**:纯函数才能整表穷举(裁决不必为一次判读起一个容器),也才能被将来的外圈(§9.8 Supervisor、重放工具)共用同一口径,而不是让第二份判据在调用点长出来。`collectQwenAttempt` 侧只剩「取末条 result 事件 + 喂三个事实」,接线与判据分开。
+
+**测试**:`test/cli-exit.test.ts` 双向钉 —— 同一批形状,整串必须 11、嵌进散文必须 0,逐形状成对出现;并走真实入口 `collectQwenAttempt` 钉住两件:c15 标本(`exit 0` + 讨论错误形状的成功总结)必须仍是 0 **且差量照常导出**,c10b 标本必须仍是 11 且不导。值得记一笔的背景:内联正则时代**没有任何测试钉过这条判据**,所以同一个形状错了三次。
 
 ### 7.3 答案提取与记账 (src/exec/extract.ts)
 

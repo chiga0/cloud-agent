@@ -12,6 +12,7 @@ import {
   pinWorkspace,
 } from "./base";
 import { LONGRUN_SCRIPT, collectLongRunOutput, longRunScript } from "./longrun";
+import { adjudicateCliExit } from "./cli-exit";
 import type { BudgetEnv } from "../control/budget";
 import { resolveBudget } from "../control/budget";
 
@@ -37,6 +38,24 @@ export interface SandboxRunResult {
  */
 function isBudgetExit(code: number): boolean {
   return code === EXIT_BUDGET_ABORT || code === EXIT_SESSION_TURNS_LIMIT;
+}
+
+/**
+ * 从 stream-json 的 stdout 里取末条 `type=result` 事件的两个裁决要素。
+ * 末行不是 JSON、或不是 result 事件时返回 `undefined` —— 那时只剩进程退出码这一个
+ * 事实,裁决器据此原样返回(与内联正则时代的「忽略非 JSON 末行」同一行为)。
+ */
+function lastResultEvent(
+  stdout: string,
+): { is_error?: boolean; result?: string } | undefined {
+  const lastLine = stdout.trim().split("\n").filter(Boolean).pop() ?? "";
+  if (!lastLine) return undefined;
+  try {
+    const evt = JSON.parse(lastLine) as { type?: string; is_error?: boolean; result?: string };
+    return evt.type === "result" ? evt : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -195,21 +214,14 @@ export async function collectQwenAttempt(
   const { stdout, stderr } = await collectLongRunOutput(sandbox);
 
   // qwen stream-json 在遇到 API 错误时仍以 exit=0 返回,把错误嵌入最后一条
-  // type=result 事件的 result 字段。在此识别并上翻为 exitCode != 0,避免误判成功。
-  let exitCode = outcome.exitCode ?? -1;
-  if (exitCode === 0 && stdout) {
-    const lastLine = stdout.trim().split("\n").filter(Boolean).pop() ?? "";
-    if (lastLine) {
-      try {
-        const evt = JSON.parse(lastLine) as { type?: string; is_error?: boolean; result?: string };
-        if (evt.type === "result" && (evt.is_error === true || /\[API Error:|upstream_error|model_not_found/.test(evt.result ?? ""))) {
-          exitCode = 11;
-        }
-      } catch {
-        // 非 JSON 最后一行,忽略
-      }
-    }
-  }
+  // type=result 事件的 result 字段。判据在 exec/cli-exit.ts:整串才是错误,包含不算
+  // (c15 的三次俱毁正是「包含即失败」把 writer 讨论错误形状的成功总结读成了失败)。
+  const evt = lastResultEvent(stdout);
+  const exitCode = adjudicateCliExit({
+    nativeExit: outcome.exitCode,
+    isError: evt?.is_error,
+    resultText: evt?.result,
+  });
 
   const transcript = await putArtifact(env.ARTIFACTS, stdout, `attempts/${args.attemptId}`);
   const stderrRef = await putArtifact(env.ARTIFACTS, stderr, `attempts/${args.attemptId}`);
