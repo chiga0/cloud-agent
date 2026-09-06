@@ -97,7 +97,7 @@ export function TasksIndexPage() {
   // router-core 把原始 search 与校验输出按 `{ ...原始, ...校验输出 }` 合并成
   // match.search,URL 上的坏值/空串会原样存活(2026-09-06 prod 实测:坏值曾被
   // 原样发到服务端吃 400,而页面口供说「按全部读取」);而校验器返回裸 {} 正是
-  // 为了把坏值留在地址栏给回落说明用。钉子在 test/web-tasks-page.test.ts。
+  // 为了把坏值留在地址栏给回落说明用。钉子在 test/web-frontend-contract.test.ts。
   const filter = parseTasksFilter(location.searchStr);
   const state = filter.state;
   const rejected = filter.rejected;

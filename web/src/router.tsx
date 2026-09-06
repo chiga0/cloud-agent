@@ -92,7 +92,7 @@ const indexRoute = createRoute({
   // TasksSearch 的类型在这一处是谎报。所以「无过滤」返回裸 {} 是**故意的**:坏值必须
   // 留在地址栏(回落说明的「地址栏保留原值」才为真),而防线挪到了取数点 ——
   // TasksIndexPage 的 state 一律取自 parseTasksFilter,绝不读 useSearch 的 state
-  // (钉子:test/web-tasks-page.test.ts「取数判据只许是 parseTasksFilter」)。
+  // (钉子:test/web-frontend-contract.test.ts「取数判据只许是 parseTasksFilter」)。
   validateSearch: (search): TasksSearch => {
     const filter = parseTasksFilter(search);
     return filter.state === null ? {} : { state: filter.state };
