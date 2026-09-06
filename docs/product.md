@@ -104,22 +104,40 @@ GET  /admin/{tasks,attempts,events,chain-check}      → GET /api/admin/…
 | 路由 | 棒 | 数据源 | 要点 |
 |---|---|---|---|
 | `/login` | w2 | `POST /api/session/login` | token 粘贴框；错误提示不区分「token 错」与「网络错」（不泄露探测面） |
-| `/` 任务列表 | w3 | `GET /api/admin/tasks`（**已有端点，零后端改动**） | TanStack Table；state 过滤（search param + zod）；30s refetchInterval |
+| `/` 任务列表 | w3 | `GET /api/admin/tasks`（**已有端点，零后端改动**） | TanStack Table；state 过滤（search param + zod）；30s refetchInterval。**读取口径见下方 w3 注记**（取代本页旧文案里的「游标『加载更多』」与「RUNNING 置顶」） |
 | `/tasks/$taskId` 详情 | w4 | `GET /api/tasks/:id` + `/events` + `/events/stream`（全部已有） | 头部（state 徽章/budget/base sha/digest/attempts）+ **事件时间线**（SSE 直连 + Last-Event-ID 续传，与 `?after=` 拉取互为恢复源）+ attempts + result/evidence/candidate 区。**逐条迁移 c9b/c9c 实测经验**：kind 徽章全值、200 字符截断、停滞三色 >90s 黄 >300s 红（`Date.now()` 差值）、坏帧跳过并计数（绝不让一条坏帧停更整页）、end 帧停表、**readyState 双文案（401→CLOSED「不会自动重连」）** |
 | `/approvals` | w5 | `GET /api/admin/tasks?state=AWAITING_APPROVAL` + `POST /api/tasks/:id/approve`（已有；缺 state 过滤参数则小补） | 证据视图（result_text / binding digest / manifest）+ candidate patch 预览 + approve 确认弹层（原因必填）。**人工门的一等公民化** |
 | `/audit` | w6 | `GET /api/admin/events` + `GET /api/admin/chain-check`（已有） | 跨任务事件流 + **digest 链可视化**（prev→cur 链接图形化，chain-check 状态置顶）+ `supervisor_finding` 流（消费 c10 产出） |
 
-- **w3 注记（2026-09-06 派单前核实，取代上行与旧版两处设想）**：① 服务端 `GET /api/admin/tasks`
-  是纯 `LIMIT` 投影（limit∈[1,200] 缺省 50），**无游标分页**——旧设想的「游标加载更多」移出 w3，
-  登记为候选（服务端加 `?before=` 游标，随 w5 小补或独立微棒）；UI 不得用 limit 递增伪装页码。
-  ② 归档投影看不到未终态任务（D1 `tasks` 行只在归档时落），**无 RUNNING 行可置顶**——排序沿用
-  服务端 `updated_at DESC`。③ 响应 `count` 是**本次返回条数**（受 limit 截断）而非匹配总数，
-  UI 不得渲染成「共 N 条」。
 - **预算注记（2026-09-06）**：墙钟杠杆（MAX_WRITER_WALL_MINUTES=90）落地后，w 系列派单
   `max_wall_seconds` 一律 6000（writer 实际拿 min(98,90)=90min 上限）；§6 表内 2400/3000 是
   杠杆前旧账，w2/w2a/w2b 三连 exit55@41min 已证旧预算是死区。
 
 - w4 验收通过后**退役 `/live/:taskId`**（页面 + 路由删除；SSE 数据端点保留）；过渡期 301 到 `/tasks/$taskId`。
+- **w3 注记（2026-09-06，取代上表 `/` 那一行的原「要点」）**：落地前对 `src/index.ts` 的
+  `handleAdminTasks` 逐字核对，响应体只有 `{tasks:[{id,state,created_at,updated_at,version}], count}`，
+  SQL 是 `SELECT … [WHERE state = ?] ORDER BY updated_at DESC LIMIT ?`。三条事实与两条旧设想相冲：
+  1. **没有游标** —— 没有 `next_cursor`、没有 `after`、没有 `total`。`LIMIT` 只能从头扫，所以
+     「加载更多」需要的续读位点根本不存在（旧文案写的是「服务端是 cursor 分页」，那是错的断言）。
+     落地形态：不放任何翻页控件；`limit` 固定取服务端上限 200 且**不进 URL**（它不是过滤器，
+     调过 200 服务端回 400）；读满时由文案说「已到上限、后面有没有更多本页不知道」。
+     游标分页若将来要做，登记为候选（服务端加 `?before=` 游标，随 w5 小补或独立微棒）；
+     UI 不得用 limit 递增伪装页码。
+  2. **`count` 是本次返回条数**（服务端源码注释原话：「不是表里的总匹配数」）⇒ 页面永不渲染
+     「共 N 条」；唯一能说的是「未读满 `limit` ⇒ 该过滤条件下的行确实已读完」（这条是从 `LIMIT n`
+     的语义推得出的，不是猜的）。
+  3. **RUNNING 置顶作废**：数据源只有 D1 归档表，而归档只在任务进终态时发生（`archiveWithRetry`
+     挂在 `BLOCKED`/`DONE`/`REJECTED` 的收敛路径上），所以这一页**拿不到 RUNNING 的行**，
+     置顶一个读不到的东西无从谈起。实时状态仍是 `GET /api/tasks/:id`（w4 那一页）。
+     ⚠️ 同一条事实对 w5 有直接后果（不是 w3 的范围，w3 只记录不处置）：`ensureAwaitingApproval` /
+     `holdForHuman` 都不触发归档 ⇒ 归档表里通常没有 `AWAITING_APPROVAL` 的行 ⇒
+     `GET /api/admin/tasks?state=AWAITING_APPROVAL` 实测恒为空列表。它同时是 w2b 那个 Approvals
+     角标不显示的原因，而 w5 的整页数据源写的就是这一条 —— **w5 派单前必须先定夺**（后端补归档时机、
+     还是换数据源），不要等到那一棒在页面上找补。
+  防线：`test/web-tasks-page.test.ts`（真跑判定函数：任意脏输入 → 合法值或干脆不带、四种失败
+  四种说法、空态与失败态分开、count 那句话的措辞、`TASKS_LIST_LIMIT` 与服务端 `MAX_ADMIN_LIMIT` 对表）
+  与 `test/web-frontend-contract.test.ts`（反向钉子：分页/无限查询那套 API 与「共 N 条」这类总数断言
+  一律不许出现在读层与列表页）。工程事实见 docs/architecture.md §12.7。
 - 后端在四层可观测架构里已经基本完工（admin/events、chain-check、approve、candidate 全部现成）——
   w 系列本质是**前端工程**，这决定预算分布。
 

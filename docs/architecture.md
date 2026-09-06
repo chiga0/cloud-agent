@@ -1714,7 +1714,7 @@ w2b 交的是 §4 剩下的那一半:路由、服务端状态、表格、SSE 封
 | guard | `beforeLoad` 全站**只有一处**,判据是 `lib/auth.ts` 的 `probeSession`;走 `queryClient.ensureQueryData`,与壳上的会话状态位共用同一次请求 | 同上 + `test/web-data-layer.test.ts` |
 | 服务端状态 | Query v5;`queryClient` 与 `router` 各一个模块级单例,同一个实例经 **router context**(loader/guard)与 **Provider**(组件)两条路交付 | `test/web-frontend-contract.test.ts`(构造点恰好一处) |
 | 运行时校验 | zod 管两处:API 响应与 search 参数。`validateSearch` **不抛** —— 它在每次导航上被调,抛出等于把一个打错的链接变成白屏 | `test/web-data-layer.test.ts` |
-| 表格 | react-table **v8** headless:逻辑在实例里(页面自己 `useReactTable`),`components/DataTable.tsx` 只画 markup;没有页码器(§5 定的是游标「加载更多」) | 同上(反向钉子:markup 层不许出现 state→色的映射) |
+| 表格 | react-table **v8** headless:逻辑在实例里(页面自己 `useReactTable`),`components/DataTable.tsx` 只画 markup;没有页码器(服务端只有 `LIMIT`,续读位点不存在 —— 见 §5 的 w3 注记与 §12.7) | 同上(反向钉子:markup 层不许出现 state→色的映射) |
 | SSE | 原生 `EventSource` + 纯协议层;停滞用 `Date.now()` 差值;**不进 Query 缓存**(增量流不是快照) | `test/web-stream-protocol.test.ts` |
 | 样式 | 一套体系(§12.5 那三份文件);**不引 Tailwind、不引 shadcn/ui**;radix 原语随用随加 | `test/web-build-base.test.ts`(依赖面的反向钉子)+ `test/web-theme-tokens.test.ts`(源文件硬名单) |
 | 退役 | `landingHtml` 定义与装配点整体删除,不留兼容层 | `test/api-prefix.test.ts`、`test/assets-routing.test.ts`、`test/web-frontend-contract.test.ts` |
@@ -1747,6 +1747,36 @@ w2b 交的是 §4 剩下的那一半:路由、服务端状态、表格、SSE 封
 得 401 → 连接位显示「不会自动重连」而不是「正在自动重连」;③ 两套主题下 `/login` 的输入框、
 错误提示、Approvals 的 warn 角标都可读(重点是浅色面的描边对比度);④ 顶导航三格的 active 态
 只在当前页,`/live/:taskId` 与 SPA 并存不互相抢路径。四项都由部署后操作员冒烟复查。
+
+## 12.7 任务列表页(w3)
+
+`/` 从 w2b 的占位组件换成真页面。零后端改动:数据源就是 §11 那条 `GET /api/admin/tasks`,
+响应形状照 `src/index.ts` 的 `handleAdminTasks` 逐字转写(不发明字段)。四条交付面:
+
+| 面 | 事实 | 钉它的地方 |
+|---|---|---|
+| 列表 | TanStack Table **v8** headless:列定义与 `useReactTable` 实例在 `routes/TasksIndexPage.tsx`(五列 = id/state/created_at/updated_at/version,顺序即列序),markup 仍走 w2b 的 `components/DataTable.tsx`;列定义是**模块级常量**(每次渲染换身份 = 每帧重建列树) | `test/web-frontend-contract.test.ts`(accessor 序列逐列比对 + `<DataTable` 在场) |
+| 过滤器 | `?state=` 是唯一 search 参数,值域 = `lib/view.ts` 的 `TASK_STATE_VALUES`(与色调表同一个键域)。`validateSearch` 与页面读的是**同一个** `parseTasksFilter`;非法值 → 回落到「全部」**且把原值钉在页面上**(地址栏保留原串不动,便于核对贴过来的链接);改过滤才写 URL,写入之前同样过一次 `parseTasksFilter` | `test/web-tasks-page.test.ts`(逐例 + 一批脏输入的「产物必是合法值或不带」不变式)、`test/web-frontend-contract.test.ts`(路由/页面共用同一解析器) |
+| 取数 | Query v5:`queryKey` 含 state(`["admin","tasks","list",<state\|all>]`),换条件即换缓存;`refetchInterval: 30_000` 与 w2b 角标同拍;`retry: false`。**取数在组件 `useQuery`,不在路由 loader** —— 这一页的「还在读/读到空/读失败」三种状态都是页面内容,搬进 loader 等于让失败绕过页面自己的诊断去渲染错误边界(与 §12.6 那条路由纪律不冲突:那条讲的仍是 guard) | `test/web-tasks-page.test.ts`(key/节拍/URL 真跑)、`test/web-frontend-contract.test.ts`(`refetchInterval: 30_000` 恰两处) |
+| 诚实呈现 | ① `count` 是**本次返回条数**(服务端 `rows.results.length`),页面只说「本次读取 N 条」;未读满 `limit` 才推「该条件下的行已读完」—— 这是 `LIMIT n` 语义推得出的,不是总数断言。② 服务端**没有游标也没有总数** ⇒ 不放「加载更多」、不放页码、不引 `useInfiniteQuery`/分页 row model;读满 200 时由文案说出读满并指向 state 过滤。③ 空态与失败态分开:读失败时空表格那句必须换成「结论此刻不成立」(react-query 失败留着上次数据,0 行 + 失败会被读成「筛出来是空的」)。④ 归档口径写在页头:只读 D1 归档投影,不含仍在 DO 里跑的任务 | `test/web-tasks-page.test.ts`(措辞与四种失败各自的文案)、`test/web-frontend-contract.test.ts`(反向钉子:分页 API 与 `共 N 条`/`总计`/`第 N 页` 一律不许出现在读层与列表页) |
+| 截断 | id 列显首段 8 个 hex,完整值进 `title`(截断是排版手段,不是信息删除 —— 操作员要能拿 id 去 curl);时间列**原样**呈现服务端字符串,不做本地化(`…Z` 与 `datetime('now')` 两种格式里后者会被 `Date.parse` 按本地时区解释,这里不猜) | `test/web-tasks-page.test.ts`(`truncateTaskId` 逐例) |
+| 样式 | 组件只认变量名;新增的 class 只有一个 —— `base.css` 的 `.ca-input--inline`(把 `.ca-input` 的 `width:100%` 收回 auto,给工具条里的 `<select>` 用),**必须排在 `.ca-input` 之后**:两条特异度相同,覆盖靠源码顺序 | `test/web-theme-tokens.test.ts`(两个新源文件已登记进硬名单;名单双向闭合,漏登记即红) |
+
+**这一棒新抄的一份副本**:`TASK_STATE_VALUES`(状态集)。不 import `src/control/statemachine.ts`
+的理由与 §12.6 那段一致(不为七个字符串把整条状态机拖进 bundle),防线同一条:
+`test/web-tasks-page.test.ts` 拿 `Object.keys(TASK_TRANSITIONS)` 逐值比对,缺值/多值/重复都红。
+它同时是配色键域与过滤器值域 —— 一份清单管两件事,不会出现「能筛出来但整列没配色」的状态。
+
+**一条记录而不处置的事实**(它同时解释了 w2b 那个角标为什么不显示):`ensureAwaitingApproval` /
+`holdForHuman` 都不触发归档,而 `finishApproval` 是先 `setState(DONE|REJECTED)` 再归档 ⇒
+归档表里通常没有 `AWAITING_APPROVAL` 的行 ⇒ `GET /api/admin/tasks?state=AWAITING_APPROVAL` 恒为空列表。
+w5 的整页数据源写的就是这一条,**派单前必须先定夺**(补归档时机,还是换数据源);w3 零后端改动,不碰。
+
+**需浏览器实测(单测钉不住,§7 的 qwen 视觉边界纪律)**:① 直接访问 `/?state=BLOCKED` 与
+`/?state=BAD`,后者须显示回落提示且下拉停在「全部」;② 换过滤条件后地址栏随动,浏览器前进/后退
+能重放过滤状态;③ 悬停预取(`defaultPreload: "intent"`)与 30s 节拍叠加不打成请求风暴;
+④ `<select>` 的原生下拉面板在两套主题下都可读(靠 `color-scheme`,组件不带样式);
+⑤ 窄屏下五列表格的横向溢出与 `--row-height` 的密度是否还能读。
 
 ---
 

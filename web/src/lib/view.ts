@@ -7,9 +7,10 @@
  * 散着写的代价是「同一个 DONE 在列表页绿、在详情页蓝」,而观测面互相矛盾时人会不再相信任何一面
  * (docs/product.md §7 设计语言的原话)。
  *
- * 两个取值清单都不许在这里重列:`src/control/statemachine.ts`(状态集)与 `lib/kinds.ts`
- * (kind 集,它自己由测试钉回 worker 权威)。漏一个值的表现是「新状态静默变中性」,
- * 那是比红屏更难发现的故障。
+ * 取值清单本身**不**在这一份里重列权威:`src/control/statemachine.ts`(状态集)与
+ * `lib/kinds.ts`(kind 集,它自己由测试钉回 worker 权威)。下面的 `TASK_STATE_VALUES` 是
+ * 前端为「配色 + 过滤器取值」抄的一份副本(带防漂钉子),不是第二份权威。
+ * 漏一个值的表现是「新状态静默变中性」,那是比红屏更难发现的故障。
  */
 
 import { EVENT_KINDS, HEARTBEAT_KIND, type EventKind } from "./kinds";
@@ -21,8 +22,38 @@ import { EVENT_KINDS, HEARTBEAT_KIND, type EventKind } from "./kinds";
 export const TONES = ["", "ok", "run", "warn", "err"] as const;
 export type Tone = (typeof TONES)[number];
 
-/** 状态色调的唯一来源:这张表之外没有任何地方决定颜色。 */
-const STATE_TONE_BY_STATE: Readonly<Record<string, Tone>> = {
+/**
+ * 任务状态取值集(**前端唯一的枚举点**)。
+ *
+ * 权威是 `src/control/statemachine.ts` 的 `TASK_TRANSITIONS` 键。这里不 import 它:那份源码在
+ * `src/`(worker 侧),拉进前端 bundle 就会连带拖进整条状态机与它的依赖,只为读七个字符串
+ * (与 `lib/kinds.ts` 对 `OBS_EVENT_KINDS` 的处理同一条理由、同一套防漂机制:
+ * test/web-tasks-page.test.ts 拿 worker 权威逐值比对,缺值/多值都红)。
+ *
+ * 顺序 = 状态机的推进顺序:过滤器下拉照它排,读的人是从「还没开始」一路看到「已经停下」。
+ *
+ * w3 起这份键域同时管两处:下面的色调表、`/` 任务列表的 state 过滤取值(`lib/schema.ts` 的
+ * zod 枚举)。共用一份是刻意的 —— 「能过滤的状态」与「有配色的状态」必须是同一件事,
+ * 否则就会出现一个筛出来整列没配色的状态。
+ */
+export const TASK_STATE_VALUES = [
+  "PENDING",
+  "RUNNING",
+  "VERIFYING",
+  "AWAITING_APPROVAL",
+  "DONE",
+  "REJECTED",
+  "BLOCKED",
+] as const;
+
+export type TaskStateValue = (typeof TASK_STATE_VALUES)[number];
+
+/**
+ * 状态色调的唯一来源:这张表之外没有任何地方决定颜色。
+ * 键域是 `TaskStateValue` 而不是 `string`:补一个状态而这里少一条会**编译期**红,
+ * 不用等到线上发现「某个新状态静默没有配色」(那正是本文件顶部说的那类最难发现的故障)。
+ */
+const STATE_TONE_BY_STATE: Readonly<Record<TaskStateValue, Tone>> = {
   PENDING: "run",
   RUNNING: "run",
   VERIFYING: "run",
@@ -40,7 +71,10 @@ const STATE_TONE_BY_STATE: Readonly<Record<string, Tone>> = {
  * 若它算 run,「审批积压」在视觉上就和「正在跑」混为一谈 —— 而积压正是那一页存在的理由(w5)。
  */
 export function stateTone(state: string): Tone {
-  return STATE_TONE_BY_STATE[state] ?? "";
+  // 先按 `Record<string, Tone>` 读再判空:状态值是后端给的字符串(未知状态必须照样渲染,
+  // 只是落中性色),而色调表按 TaskStateValue 收紧了键域,直接用 string 索引在严格模式下不成立。
+  const tone = (STATE_TONE_BY_STATE as Readonly<Record<string, Tone | undefined>>)[state];
+  return tone ?? "";
 }
 
 export function stateBadgeClass(state: string): string {

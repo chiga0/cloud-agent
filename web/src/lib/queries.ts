@@ -21,6 +21,7 @@ import {
   type LoginResult,
   type SessionView,
 } from "./schema";
+import type { TaskStateValue } from "./view";
 
 /** 会话查询的 key。guard 的 ensureQueryData 与壳上的状态位共用它。 */
 export const SESSION_KEY = ["session", "me"] as const;
@@ -56,12 +57,18 @@ export const AWAITING_APPROVAL_LIMIT = 200;
 export const AWAITING_APPROVAL_STATE = "AWAITING_APPROVAL";
 export const APPROVALS_KEY = ["admin", "tasks", AWAITING_APPROVAL_STATE] as const;
 
+/**
+ * 归档任务列表的端点路径。角标(w2b)与列表页(w3)共用这一份字面量 ——
+ * 两处各写一遍,迟早有一处少掉 `/api` 前缀,而那正是 §2 分区表最怕的那类漂移。
+ */
+const ADMIN_TASKS_PATH = "/api/admin/tasks";
+
 export function awaitingApprovalQueryOptions() {
   return queryOptions({
     queryKey: APPROVALS_KEY,
     queryFn: () =>
       apiGet(
-        `/api/admin/tasks?state=${AWAITING_APPROVAL_STATE}&limit=${AWAITING_APPROVAL_LIMIT}`,
+        `${ADMIN_TASKS_PATH}?state=${AWAITING_APPROVAL_STATE}&limit=${AWAITING_APPROVAL_LIMIT}`,
         archivedTasksSchema,
       ),
     // 30s:§5 给任务列表定的节拍。角标是那一页的摘要,两套刷新率必然出现「角标 0 而列表有货」
@@ -85,6 +92,62 @@ export function awaitingBadgeLabel(tasks: ArchivedTasks | undefined): string | n
   if (tasks.count <= 0) return null;
   if (tasks.count >= AWAITING_APPROVAL_LIMIT) return `${AWAITING_APPROVAL_LIMIT}+`;
   return String(tasks.count);
+}
+
+/**
+ * `/` 任务列表(w3)的查询。
+ *
+ * 三条与角标同源的纪律,加两条只有列表才会踩的:
+ * - **key 含 state**:换过滤条件就是换一份缓存。少了这一位,筛 BLOCKED 会直接读到 DONE
+ *   那一份缓存里的行 —— 那是「筛了但没筛」,比慢更糟。
+ *   `rejected`(URL 上被拒收的原值)**不进** key:两个不同的坏链接指向的是同一份「全部」,
+ *   各算一份缓存就等于按输入字符串给同一数据开分号(钉在 test/web-tasks-page.test.ts)。
+ * - **不复用角标那一条 key**:两者的生命周期不同 —— 角标挂在壳上跨页常驻,列表只在 `/`
+ *   存在。合并成一条会让其中一方的 staleTime 说了算。共同前缀 `["admin","tasks"]` 保住,
+ *   要整体清的时候一次清得掉。
+ * - **30s refetchInterval**(§5 给这一页定的节拍,角标抄的就是它)。这是一页轮询而不是
+ *   实时:数据源是归档表,不是事件流(增量流不进 Query 缓存,§4)。
+ * - `retry: false`:与 session 查询同一条理由 —— 401 不会因为重试变 200,而失败文案
+ *   (`lib/tasks-page.ts` 的 `tasksFailureText`)本来就说得出四种失败,早三秒说比转圈好。
+ */
+export const ADMIN_TASKS_KEY = ["admin", "tasks"] as const;
+
+/**
+ * 列表的读取上限 = 服务端 `parseAdminLimit` 的上限 200(再大直接 400)。
+ * 与角标同一个数不是巧合,是同一条边界;两处各写一遍迟早一个是 500。
+ */
+export const TASKS_LIST_LIMIT = 200;
+
+export function adminTasksQueryKey(state: TaskStateValue | null) {
+  return [...ADMIN_TASKS_KEY, "list", state ?? "all"] as const;
+}
+
+/**
+ * 实际请求的 URL。`state` 为 `null` 时**一个 `state=` 都不带** ——
+ * 服务端对 `state=""` 回 400(空串不在状态机取值里),所以「全部」必须是缺键,不能是空值。
+ */
+export function adminTasksUrl(state: TaskStateValue | null): string {
+  const query = state === null ? `limit=${TASKS_LIST_LIMIT}` : `state=${state}&limit=${TASKS_LIST_LIMIT}`;
+  return `${ADMIN_TASKS_PATH}?${query}`;
+}
+
+/**
+ * 一次列表读取。与 `readSession` 同一条理由单独抽出来:注入点是一个函数而不是 QueryClient,
+ * 于是 test/web-tasks-page.test.ts 可以直接调它并断言真正发出去的 URL(不带 state 那一支
+ * 只能这样测出来 —— 那是「全部」与「400」的分界)。
+ */
+export function fetchAdminTasks(state: TaskStateValue | null): Promise<ArchivedTasks> {
+  return apiGet(adminTasksUrl(state), archivedTasksSchema);
+}
+
+export function adminTasksQueryOptions(state: TaskStateValue | null) {
+  return queryOptions({
+    queryKey: adminTasksQueryKey(state),
+    queryFn: () => fetchAdminTasks(state),
+    refetchInterval: 30_000,
+    staleTime: 10_000,
+    retry: false,
+  });
 }
 
 /**

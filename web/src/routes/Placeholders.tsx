@@ -3,26 +3,17 @@ import { useParams } from "@tanstack/react-router";
 import { PagePlaceholder } from "../components/PagePlaceholder";
 
 /**
- * w3–w6 页面的占位组件(w2b 交付 ①的范围栅栏)。
+ * 还没接入的页面共用的形状说明件(w3 起剩三条)。
  *
- * 四条路由都只到「能导航过去、能过 guard、能显示自己还没实现」为止。把任何一页真的填上
- * 都是越界:§5 的拆棒是按数据源与验收边界切的,提前实现的那一半没人验收,
+ * `/` 任务列表原本也在这里,已由 w3 换成真页面(`routes/TasksIndexPage.tsx`)——
+ * 范围栅栏对剩下那三页仍然有效:每一页都只到「能导航过去、能过 guard、能显示自己还没实现」
+ * 为止,把任何一页真的填上都是越界:§5 的拆棒是按数据源与验收边界切的,提前实现的那一半没人验收,
  * 也不会在它那一棒的预算里被复查。
  *
  * 唯一的「数据」是路由参数本身:`/tasks/$taskId` 的 id 来自 TanStack 的类型化 params,
  * 显示它是为了钉住一件事 —— 参数确实按名解出来了,而不是被 SPA fallback 兜成整页 HTML
  * (§2 的分区动机)。w4 会读同一条 params,不需要再解一次 URL。
  */
-
-export function TasksIndexPage() {
-  return (
-    <PagePlaceholder
-      title="任务列表"
-      wave="w3"
-      sources={["GET /api/admin/tasks"]}
-    />
-  );
-}
 
 export function TaskDetailPage() {
   const { taskId } = useParams({ from: "/_auth/tasks/$taskId" });

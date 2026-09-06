@@ -7,9 +7,12 @@ import loginPageRaw from "../web/src/routes/LoginPage.tsx?raw";
 import authedLayoutRaw from "../web/src/components/AuthedLayout.tsx?raw";
 import dataTableRaw from "../web/src/components/DataTable.tsx?raw";
 import placeholdersRaw from "../web/src/routes/Placeholders.tsx?raw";
+import tasksIndexPageRaw from "../web/src/routes/TasksIndexPage.tsx?raw";
+import tasksPageLibRaw from "../web/src/lib/tasks-page.ts?raw";
 import useEventStreamRaw from "../web/src/lib/use-event-stream.ts?raw";
 import queryClientRaw from "../web/src/lib/query-client.ts?raw";
 import queriesRaw from "../web/src/lib/queries.ts?raw";
+import schemaLibRaw from "../web/src/lib/schema.ts?raw";
 import apiRaw from "../web/src/lib/api.ts?raw";
 import workerIndexRaw from "../src/index.ts?raw";
 import viteConfigRaw from "../web/vite.config.ts?raw";
@@ -171,8 +174,14 @@ describe("authed 壳", () => {
   });
 
   it("Approvals 计数读的是现成端点(零后端改动)", () => {
-    expect(queriesRaw).toMatch(/\/api\/admin\/tasks\?state=AWAITING_APPROVAL/);
-    expect(queriesRaw).toMatch(/refetchInterval: 30_000/);
+    // 这条原先拿 `queriesRaw` 直接比 `/api/admin/tasks?state=AWAITING_APPROVAL`,
+    // 命中的其实是一句 JSDoc(代码里那串是模板的 `${AWAITING_APPROVAL_STATE}`)——
+    // 一份只被注释满足的钉子等于没有(HEAD 那棒刚修过同类的 M5 假钉)。改成先剥注释,
+    // 再比代码里真正拼 URL 的那一处。
+    expect(codeOnly(queriesRaw)).toMatch(
+      /\$\{ADMIN_TASKS_PATH\}\?state=\$\{AWAITING_APPROVAL_STATE\}&limit=\$\{AWAITING_APPROVAL_LIMIT\}/,
+    );
+    expect(codeOnly(queriesRaw)).toMatch(/refetchInterval: 30_000/);
   });
 });
 
@@ -239,5 +248,104 @@ describe("表格 headless 分工", () => {
     expect(codeOnly(dataTableRaw)).not.toMatch(/stateTone|AWAITING_APPROVAL|DONE/);
     // 没有页码器:§5 定的是游标「加载更多」
     expect(codeOnly(dataTableRaw)).not.toMatch(/nextPage|previousPage|pageCount/);
+  });
+});
+
+/**
+ * w3 交付的四件事(列表、过滤、取数、诚实呈现)里,凡是**跨文件才成立**的部分。
+ *
+ * 判据本身(合法 state 的取值、count 怎么说、失败怎么分)由 test/web-tasks-page.test.ts
+ * 真跑函数钉住;这里只补那些「搬错一个位置就坏、而函数测试看不见」的装配事实 ——
+ * 与本文件其余部分的分工一致。反向钉子(不许出现翻页 API、不许把 count 渲染成总数)
+ * 是本节的全部重点:它们防的不是写不出来,而是下一棒顺手加一个看起来无害的「共 N 条」。
+ */
+describe("/ 任务列表页(w3)", () => {
+  it("首页不再是占位组件:真页面有自己的文件,占位那份不再挂 w3", () => {
+    expect(codeOnly(routerRaw)).toContain('from "./routes/TasksIndexPage"');
+    expect(codeOnly(routerRaw)).toMatch(/component:\s*TasksIndexPage/);
+    expect(codeOnly(placeholdersRaw)).not.toMatch(/TasksIndexPage/);
+    expect(codeOnly(placeholdersRaw)).not.toContain("w3");
+  });
+
+  it("search 走 zod,且路由与页面共用同一个纯解析器(两份判据必漂)", () => {
+    expect(codeOnly(routerRaw)).toMatch(/validateSearch:\s*\(search\):\s*TasksSearch\s*=>/);
+    expect(codeOnly(routerRaw)).toContain("parseTasksFilter(search)");
+    expect(codeOnly(tasksPageLibRaw)).toContain("tasksSearchSchema.safeParse");
+    expect(codeOnly(schemaLibRaw)).toContain("z.enum(TASK_STATE_VALUES)");
+  });
+
+  it("过滤变化同步回 URL,写入之前先过同一个校验器", () => {
+    expect(codeOnly(tasksIndexPageRaw)).toContain('useSearch({ from: "/_auth/" })');
+    expect(codeOnly(tasksIndexPageRaw)).toMatch(/navigate\(\{ to: "\/", search:/);
+    expect(codeOnly(tasksIndexPageRaw)).toMatch(/parseTasksFilter\(\{ state: value \}\)/);
+    // 被拒收的原值只做旁注:它不许被写进 search(否则 URL 多出一个像过滤器参数的键)
+    expect(codeOnly(routerRaw)).not.toMatch(/rejected/);
+    expect(codeOnly(tasksIndexPageRaw)).toMatch(/parseTasksFilter\(location\.searchStr\)\.rejected/);
+  });
+
+  it("表格逻辑在 headless 层:列定义在模块级,markup 交给 DataTable", () => {
+    const code = codeOnly(tasksIndexPageRaw);
+    expect(code).toMatch(/^const TASK_COLUMNS = \[/m);
+    expect(code).toContain("useReactTable({");
+    expect(code).toContain("getCoreRowModel: getCoreRowModel()");
+    expect(code).toContain("getSortedRowModel: getSortedRowModel()");
+    expect(code).toMatch(/<DataTable\b/);
+    expect([...code.matchAll(/columnHelper\.accessor\("([\w_]+)"/g)].map((m) => m[1])).toEqual([
+      "id",
+      "state",
+      "created_at",
+      "updated_at",
+      "version",
+    ]);
+  });
+
+  it("配色只有一个出口:组件里不出现状态类名字面量,也不自带第二套映射", () => {
+    const code = codeOnly(tasksIndexPageRaw);
+    expect(code).toContain("stateTone(");
+    expect(code).toContain("<StatusBadge");
+    expect(code).not.toMatch(/ca-state--|ca-kind--/);
+  });
+
+  /**
+   * 不伪装分页。
+   *
+   * 只禁**实现手段**(v8 的分面 API、v5 的无限查询、以及一个凭空缺出来的 cursor 参数),
+   * 不禁「加载更多」这四个字 —— 读满上限时那一格文案恰恰要说「所以这里不放加载更多」
+   * (`tasksReadNote`,由 test/web-tasks-page.test.ts 正向钉住)。说清楚为什么没有,
+   * 与默默没有,是两种不同的页面。
+   */
+  it("不伪装分页:翻页要用的那套 API 在读层与列表页一个都不许出现", () => {
+    const banned =
+      /useInfiniteQuery|fetchNextPage|hasNextPage|getPaginationRowModel|getFilteredRowModel|pageIndex|pageSize|nextPage|previousPage|pageCount|next_cursor|\bcursor\b|offset=/;
+    for (const [name, source] of Object.entries({
+      tasksIndexPageRaw,
+      tasksPageLibRaw,
+      dataTableRaw,
+      queriesRaw,
+      schemaLibRaw,
+    })) {
+      expect(codeOnly(source), name).not.toMatch(banned);
+    }
+  });
+
+  it("count 不许被渲染成总数", () => {
+    for (const [name, source] of Object.entries({ tasksIndexPageRaw, tasksPageLibRaw, dataTableRaw })) {
+      const code = codeOnly(source);
+      expect(code, name).not.toMatch(/共\s*[\d{]/);
+      expect(code, name).not.toMatch(/总计|总条数|第\s*\d+\s*页/);
+    }
+  });
+
+  it("30s 节拍只有一份出处:角标与列表同拍(两套刷新率必然互相矛盾)", () => {
+    expect((codeOnly(queriesRaw).match(/refetchInterval: 30_000/g) ?? []).length).toBe(2);
+  });
+
+  it("范围栅栏:只读 admin/tasks 一条端点,不碰 w4 的流、w5 的审批、w6 的审计面", () => {
+    const code = codeOnly(tasksIndexPageRaw) + codeOnly(tasksPageLibRaw);
+    expect(code).not.toMatch(/\/api\/admin\/(events|attempts|chain-check)/);
+    expect(code).not.toMatch(/useMutation|approve|\/api\/session\//);
+    expect(code).not.toMatch(/new EventSource|useEventStream|fetch\(/);
+    // 反向:整条链上只有这一处列表 URL,拼第二处就会开始与角标那条漂移
+    expect((codeOnly(queriesRaw).match(/\/api\/admin\/tasks/g) ?? []).length).toBe(1);
   });
 });

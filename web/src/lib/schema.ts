@@ -14,6 +14,8 @@
 
 import { z } from "zod";
 
+import { TASK_STATE_VALUES } from "./view";
+
 /** GET /api/session/me(src/index.ts `handleSessionMe`)。`expires_at` 仅 cookie 凭据时有值。 */
 export const sessionSchema = z.object({
   authenticated: z.literal(true),
@@ -89,6 +91,23 @@ export const loginSearchSchema = z.object({
   next: z.string().optional(),
 });
 export type LoginSearch = z.infer<typeof loginSearchSchema>;
+
+/**
+ * `/` 任务列表(w3)的 search 契约:只有 `state` 一条。
+ *
+ * 值域直接取 `lib/view.ts` 的 `TASK_STATE_VALUES`,与色调表同一个键域(那份注释写了为什么
+ * 共用一份)。这条枚举不是装饰:`handleAdminTasks` 对不认识的 state 直接回 400,
+ * 而一个能被 URL 决定的 400 就是一个可以被分享出去的坏链接 —— 门在这里关,
+ * 而不是把猜测的串转给服务端去拒。
+ *
+ * `limit` **刻意不是** search 参数:它是本页的读取上限(固定在
+ * `lib/queries.ts` 的 `TASKS_LIST_LIMIT`),写进 URL 等于向操作员承诺一个可以自己调大的
+ * 读取面,而调过 200 服务端就回 400。服务端也没有游标可读 —— 见 `lib/tasks-page.ts` 顶部。
+ */
+export const tasksSearchSchema = z.object({
+  state: z.enum(TASK_STATE_VALUES).optional(),
+});
+export type TasksSearch = z.infer<typeof tasksSearchSchema>;
 
 /**
  * 从未知输入里取出**合法**的 search。签名接受 `URLSearchParams` 与 Record 两种:

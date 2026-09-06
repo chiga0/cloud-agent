@@ -16,8 +16,11 @@ import { flexRender, type Table as TanStackTable } from "@tanstack/react-table";
  * `state` 这个字都不认识 —— 认识它就等于把「表格」与「任务列表」焊死,而审批表、审计表
  * 还要各用一次它。
  *
- * 没有分页器:§5 定的是**游标「加载更多」**。服务端是 cursor 分页,把它伪装成页码就是
- * 承诺一个「第 7 页」而服务端只会从头扫。那个按钮由 w3 放在本组件外面。
+ * 这里不放任何翻页控件,一整个原因是服务端根本没有可翻的东西:`/api/admin/tasks` 只有一句
+ * `LIMIT ?`,响应体里只有 `{tasks, count}` —— 没有游标可以续读,也没有总数可以算页数。
+ * 伪装一个「加载更多」就是承诺一个做不到的动作,伪装页码更是拿一个不存在的总数做分母。
+ * 读满上限时怎么说,由页面侧的 `lib/tasks-page.ts` 的 `tasksReadNote` 负责(§5 的 2026-09-06
+ * w3 注记已把旧的「游标『加载更多』」设想作废,理由同上)。
  */
 export function DataTable<TData>({
   table,

@@ -13,11 +13,18 @@
  *    这条预取的取舍要写清 —— **loader 只用于「页面渲染的前置条件」**:Approvals 角标的
  *    计数不是前置条件,所以它走壳上的 useQuery 而不是这里的 loader。把非必要的查询放进
  *    loader 的后果是「角标那个端点 500 了 → 整页进错误边界」,而它明明只是少一个数字。
- *    w3/w4 的列表与详情是前置条件(没有数据就没东西可渲染),那一棒的 loader 长这样:
+ *    **w3 落在同一侧**:任务列表的取数也留在组件里(`useQuery`)。这一页的「还在读 /
+ *    读到空 / 读失败」三种状态都是**页面内容**(§5 要求失败态与空态各有文案),把它们搬进
+ *    loader 就等于让失败绕过页面自己的诊断去渲染错误边界;而 `defaultPreload: "intent"`
+ *    已经让悬停开始解析与预取,gate 一次只多一道吞掉诊断的关卡。
+ *    仍然算前置条件的是 guard 那一条(没登录就没有页面)。w4 详情若要把预取搬进 loader,
+ *    那一棒的 loader 长这样:
  *    `loader: ({ context: { queryClient }, params }) => queryClient.ensureQueryData(taskDetailQueryOptions(params.taskId))`
  * 2. **只有 unauthenticated 才 redirect**。`unreachable`(网络/形状/5xx)放行到壳里,由右上角
  *    那一位说「会话状态未知」。判据在 lib/auth.ts 的 probeSession,理由写在那儿。
- * 3. **search 参数一律 zod 校验后交付**(`loginSearchSchema`)。URL 是用户可编辑输入,
+ * 3. **search 参数一律 zod 校验后交付**。/login 用 `loginSearchSchema`(经 `parseSearch`),
+ *    `/` 用 `tasksSearchSchema`(经 `parseTasksFilter`,它额外把被拒收的原值报给页面 —— 理由在
+ *    `lib/tasks-page.ts`)。URL 是用户可编辑输入,
  *    而组件按校验后的类型写代码 —— 打错的链接要能正常落到缺省,而不是白屏。
  */
 
@@ -27,15 +34,11 @@ import type { QueryClient } from "@tanstack/react-query";
 import { AuthedLayout } from "./components/AuthedLayout";
 import { isInternalNextPath, LOGIN_PATH, probeSession } from "./lib/auth";
 import { sessionQueryOptions } from "./lib/queries";
-import { loginSearchSchema, parseSearch, type LoginSearch } from "./lib/schema";
+import { loginSearchSchema, parseSearch, type LoginSearch, type TasksSearch } from "./lib/schema";
+import { parseTasksFilter } from "./lib/tasks-page";
 import { LoginPage } from "./routes/LoginPage";
-import {
-  ApprovalsPage,
-  AuditPage,
-  NotFoundPage,
-  TaskDetailPage,
-  TasksIndexPage,
-} from "./routes/Placeholders";
+import { TasksIndexPage } from "./routes/TasksIndexPage";
+import { ApprovalsPage, AuditPage, NotFoundPage, TaskDetailPage } from "./routes/Placeholders";
 
 /** 路由 context 的契约:目前只有 QueryClient(§4:router context 携 queryClient)。 */
 export interface RouterContext {
@@ -78,6 +81,14 @@ const indexRoute = createRoute({
   getParentRoute: () => authedRoute,
   path: "/",
   component: TasksIndexPage,
+  // w3:任务列表的 state 过滤器就住在这条 search 上。校验器与页面读的是同一个纯函数
+  // (`lib/tasks-page.ts` 的 parseTasksFilter),差别只在这一份**不**把被拒收的原值带进
+  // search:validateSearch 的返回是下一次导航要写回地址栏的东西,把旁注写进 URL 就等于
+  // 承诺一个谁都会以为是过滤器一部分的参数。被拒的值由页面自己从 searchStr 里取。
+  validateSearch: (search): TasksSearch => {
+    const filter = parseTasksFilter(search);
+    return filter.state === null ? {} : { state: filter.state };
+  },
 });
 
 const taskDetailRoute = createRoute({

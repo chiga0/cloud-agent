@@ -361,6 +361,14 @@ code {
   border-color: var(--err-border);
 }
 
+/* 工具条里的控件(w3 的 state 下拉):配方与 .ca-input 完全同一条(surface-2 底 + border 描边),
+   只把 width 从 100% 收回 auto —— 表单里输入框该占满一行,工具条里它该只占自己那份。
+   单开一个修饰类而不是在组件里写字面尺寸:组件不许知道像素(见 test/web-theme-tokens.test.ts)。
+   必须排在 .ca-input 之后:两条特异度相同(各 0,1,0),覆盖全靠源码顺序赢。 */
+.ca-input--inline {
+  width: auto;
+}
+
 /* 错误提示用 err 字色(不用 err 三件套:那是一块红底,会把「一句提示」渲染成「一个状态」)。 */
 .ca-error-text {
   color: var(--err-fg);
