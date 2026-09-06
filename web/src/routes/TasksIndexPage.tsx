@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { Link, useLocation, useNavigate, useSearch } from "@tanstack/react-router";
+import { Link, useLocation, useNavigate } from "@tanstack/react-router";
 import {
   createColumnHelper,
   getCoreRowModel,
@@ -89,15 +89,18 @@ const TASK_COLUMNS = [
 ];
 
 export function TasksIndexPage() {
-  // state 一律从「路由校验后的 search」读:组件不第二遍解 URL,否则两份判据必然漂移。
-  const search = useSearch({ from: "/_auth/" });
   const location = useLocation();
   const navigate = useNavigate();
-  const state = search.state ?? null;
-
-  // 被拒收的原值只能从**校验前**的串里取(zod 已经把它抹掉了)。它是旁注,不参与取数:
-  // adminTasksQueryKey 只吃 state,所以两种坏链接指向同一份缓存。
-  const rejected = parseTasksFilter(location.searchStr).rejected;
+  // 取数值与被拒旁注出自**同一个纯函数**(parseTasksFilter):它也是 validateSearch
+  // 内部用的那份判据,所以这里再解一遍 URL 不会产生第二份结论 —— 会漂移的是两份
+  // 不同代码,不是同一个函数的两次调用。**不能**改读 useSearch 的 search.state:
+  // router-core 把原始 search 与校验输出按 `{ ...原始, ...校验输出 }` 合并成
+  // match.search,URL 上的坏值/空串会原样存活(2026-09-06 prod 实测:坏值曾被
+  // 原样发到服务端吃 400,而页面口供说「按全部读取」);而校验器返回裸 {} 正是
+  // 为了把坏值留在地址栏给回落说明用。钉子在 test/web-tasks-page.test.ts。
+  const filter = parseTasksFilter(location.searchStr);
+  const state = filter.state;
+  const rejected = filter.rejected;
 
   const query = useQuery(adminTasksQueryOptions(state));
   const rows = query.data?.tasks ?? NO_ROWS;

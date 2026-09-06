@@ -275,12 +275,24 @@ describe("/ 任务列表页(w3)", () => {
   });
 
   it("过滤变化同步回 URL,写入之前先过同一个校验器", () => {
-    expect(codeOnly(tasksIndexPageRaw)).toContain('useSearch({ from: "/_auth/" })');
     expect(codeOnly(tasksIndexPageRaw)).toMatch(/navigate\(\{ to: "\/", search:/);
     expect(codeOnly(tasksIndexPageRaw)).toMatch(/parseTasksFilter\(\{ state: value \}\)/);
     // 被拒收的原值只做旁注:它不许被写进 search(否则 URL 多出一个像过滤器参数的键)
     expect(codeOnly(routerRaw)).not.toMatch(/rejected/);
-    expect(codeOnly(tasksIndexPageRaw)).toMatch(/parseTasksFilter\(location\.searchStr\)\.rejected/);
+  });
+
+  it("取数判据只许是 parseTasksFilter:useSearch 的 state 被 router 合并过原始值,类型是谎报", () => {
+    // router-core 以 `{ ...原始, ...校验输出 }` 合并出 match.search:校验器对坏值返回
+    // 裸 {} 盖不掉 URL 上的 state=BAD / ?state=,原始串会原样流进 useSearch ——
+    // 2026-09-06 prod 实测,组件读它曾把坏值原样发到服务端吃 400(invalid_state),
+    // 而页面口供说「按全部读取」。取数值与旁注都必须出自组件与 validateSearch 共用的
+    // 那份纯函数;校验器也因此刻意维持裸 {}:坏值留在地址栏,回落说明的承诺才为真。
+    const code = codeOnly(tasksIndexPageRaw);
+    expect(code).toContain("parseTasksFilter(location.searchStr)");
+    expect(code).toContain("const state = filter.state;");
+    expect(code).not.toContain("useSearch");
+    expect(code).not.toContain("search.state");
+    expect(codeOnly(routerRaw)).toContain("filter.state === null ? {} : { state: filter.state }");
   });
 
   it("表格逻辑在 headless 层:列定义在模块级,markup 交给 DataTable", () => {
