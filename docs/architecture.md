@@ -1610,6 +1610,83 @@ cookie jar 隔离,`__Host-` 前缀的三条硬要求(Secure / `Path=/` / 无 `Do
 
 ---
 
+## 12.5 前端工程基座与主题语义(w2a)
+
+§1 的「同 worker 全栈」到 w2a 才真的有一个前端可托管。本节记构建基座的事实与主题的权威等级 ——
+页面清单(§5 / product.md §5)逐页接入时不必再讨论这些,它们已经定死。
+
+### 构建基座事实
+
+| 面 | 事实 | 钉它的地方 |
+|---|---|---|
+| 构建 | Vite,`root = web/`,`outDir = ../dist`,`emptyOutDir: true` | `test/web-build-base.test.ts` |
+| 类型 | 两份 tsconfig 各管一侧:`tsconfig.worker.json`(src+test,WebWorker lib)/ `web/tsconfig.json`(web/src,DOM lib + `jsx: react-jsx`);`npm run typecheck` 用 `&&` 双跑,两侧都必须过 | 同上 |
+| 产物 | `dist/index.html` + `dist/assets/index-<hash>.js` + `dist/assets/index-<hash>.css`;`dist/` 在 `.gitignore` 里(否则 land-gate 的 build 前后快照比对判 `tests_ok` 不过) | 同上 |
+| 资产 | `wrangler.jsonc`:`directory: "dist"` + `binding: ASSETS` + `not_found_handling: "single-page-application"` + `run_worker_first: ["/api/*", "/live", "/live/*", "/healthz"]` | `test/assets-routing.test.ts`(配置面 + 覆盖面 + 行为面三段) |
+| dev | `npm run dev:web`(5173)的 proxy 清单是 `run_worker_first` 的镜像;两边不一致 = 只在本地出现的「API 返回 index.html」假故障 | `test/web-build-base.test.ts` 断言两份清单同源 |
+| verify | `npm run typecheck && npm test && npm run build` 三步(product.md §4) | 每棒守门 |
+
+依赖全在仓库根的 `package.json` + lockfile(`npm ci` 一次),`web/` 不是独立包。
+
+### `/` 的归属变了(代码还在,线上不再可达)
+
+`src/index.ts` 里 `GET /` → `landingHtml` 那个分支**代码原样保留**(退役排在 w2b),但资产一挂上,
+`/` 就由资产层的 HTML 路由应答 `dist/index.html`,压根不进 worker —— 与 `/login`、`/tasks/<uuid>`
+这些深链走的是同一套机制(`test/assets-routing.test.ts` 的资产段钉「未匹配 / 目录路径拿 200 + 含
+`id="root"` 的 HTML」)。所以**部署冒烟看的是壳,不是旧落地页**:`curl /` 拿回 `landingHtml` 才是异常。
+
+### 主题语义(三条规则,按权威等级排)
+
+色值的唯一定义处是 `web/src/styles/theme.css`(操作员按签字规格表逐字落盘,writer 不改);
+`web/src/lib/theme.ts` 只决定「哪一套生效」,它的全部动作就是**置 / 移** `<html data-theme="light">`
+这一个属性:
+
+1. **手动选择是权威** —— localStorage 键 `ca-theme`,值域就是 `"light"`/`"dark"` 两个字面量。
+   有合法值就照它渲染,并**退订**系统偏好监听(不退订就会出现「手动选了却被 OS 改回去」)。
+   回到「跟随系统」的唯一动作是删掉这个键。
+2. **没有手动选择才跟随 `prefers-color-scheme`**,并订阅它的变化实时跟随。
+3. **暗色是 `:root` 的缺省**,所以渲染是「置 / 移」二值而不是「写两个值」;非法存储值(旧键名、
+   别的标签页写坏的值)一律当「没有手动选择」处理,而不是照抄一个渲染不出来的值。
+
+两条工程后果,不是风格偏好:
+
+- **`initTheme()` 必须排在 `createRoot().render()` 之前**(见 `web/src/main.tsx`)。React 的第一帧
+  就得带着最终 `data-theme`,否则偏好与缺省不一致时用户先看到一帧另一套配色。这条顺序由单测读
+  源码位置钉住 —— 挪进组件或改回 `render(null)` 都会红。
+  **如实记一个残余窗口**:「暗为缺省」保证了暗色偏好用户任何时刻都不会闪一帧浅色(规格点名的故障
+  方向),而**浅色**偏好在 JS 执行前那一段空页仍按 `:root` 渲成暗底。要消掉它就得在 `index.html`
+  内联一小段预选脚本,那会把「读 localStorage 决定属性」复制成两处(w2b 若要消,应当消成「脚本只读
+  不写、逻辑仍只有一份」的形状,而不是复制逻辑)。
+- **浏览器禁存储时,连读 `localStorage` 这个 getter 本身都会抛**(Safari 无痕、企业策略)。让它抛在
+  挂载前的路径上等于首页红屏,所以读写各裹一层 try/catch,代价降为「本次会话内可切换、不落盘」。
+
+### 契约钉与实测边界
+
+`test/web-theme-tokens.test.ts`(36 条)读 `__WEB_STYLE_SOURCES__`(vitest.config.ts 构建期内联的
+CSS **原文** —— Workers 运行时没有 fs,而 `.css` 的 `?raw` 在 worker 池里恒为空串)与壳的 `?raw` 源码,
+钉五类跨文件纪律:两套主题**变量名集合逐字一致(同序同数量)** + **浅色块排在暗色块之后**(两者特异度
+相同,覆盖全靠源码顺序)、关键色值逐字抽查、`base.css` 工具类间距 ⊆ `{4,8,12,16,24,32,48}px` 且所引
+变量都有定义处、**色值的唯一出口是 theme.css**(组件与另两份样式表出现字面色值即红)且组件只挂
+`base.css` 里存在的 class。这五类违反的现场全都是「只有暗色是对的」「某两块看着不齐」「浅色主题整体
+失效」—— 都只在另一套主题或另一次改动后才显现,靠 review 抓不住。这 36 条另配 11 个变异(把每条纪律
+逐条破坏一遍再跑)验过都会红,钉子不是装饰。
+
+**需浏览器实测(单测钉不住,§7 的 qwen 视觉边界纪律)**:① 暗色偏好系统下首帧不闪另一套配色;
+② 切换后刷新保持(落盘成功),清掉 `ca-theme` 回到跟随系统;③ 跟随态下操作系统改色,页面实时跟着变;
+④ 两套主题下壳都可读(重点是 `--fg-muted` 的字与 `--border` 的描边在浅色面上够不够看见)。
+本棒只交「源码形状 + 运行时语义」两级证据 —— 后者用桩 globals 跑过 23 条断言:初始跟随、手动权威、
+切换后退订、非法存储值回落、禁存储不崩、订阅 / 退订。
+
+### w2a 刻意不做的
+
+不引 Tailwind / TanStack / shadcn/ui(排在 w2b,与 `web/src/styles/*` 一起成套引入 ——
+现在混用两套样式体系只会得到「同一页面两种手感」);不做 `/login` 与 authed 布局壳(product.md §4
+的 w2 交付里那部分归 w2b);不动 `landingHtml`、不动 `/live/:taskId`、不动 `/api/*` 的任何行为。
+`index.html` 里也没有内联主题脚本:那会把「读 localStorage 决定属性」复制成两处,而 w2b 之后组件也要
+读同一份状态 —— 一个键两个读者就是两个权威。
+
+---
+
 ## 13. 已知缺陷与改进方向
 
 ### 13.1 events hash chain 并发分叉 — 已修复(0003 + seq CAS)

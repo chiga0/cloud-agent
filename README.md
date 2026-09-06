@@ -158,6 +158,44 @@ curl -s "localhost:8787/api/admin/chain-check?task_id=<task_id>" -H "authorizati
 # (`sandbox_destroy timeout`),它曾是终态回报 exceededWallTime 的触发因。见 §6.2。
 ```
 
+## 前端(`web/`,w2a 基座)
+
+同一个 Worker 既发 API 也发页面([docs/product.md](docs/product.md) §1):Vite 产物落仓库根的 `dist/`,
+由 Workers Static Assets 托管 —— `not_found_handling: "single-page-application"` 让客户端路由直接成立,
+`run_worker_first: ["/api/*", "/live", "/live/*", "/healthz"]` 把 worker 拥有的路径留在自己手里。
+**同源 → 无 CORS**,w1b 的会话 cookie 与 `EventSource` 都直接可用。技术栈与页面清单见
+[`docs/product.md`](docs/product.md) §4/§5,工程事实与主题语义见
+[`docs/architecture.md`](docs/architecture.md) §12.5。
+
+```bash
+npm ci             # lockfile 在仓库根,web/ 不是独立包
+npm run build      # vite build → dist/(npm run deploy 前的 predeploy 自动跑)
+npm run dev        # worker(8787):API 走这里
+npm run dev:web    # 页面(5173):与上面并跑。proxy 清单是 run_worker_first 的镜像,API 转给 8787
+npm run preview:web # 只看构建产物(这条路没有 API 代理)
+```
+
+w2 起的验收线 = `npm run typecheck && npm test && npm run build` 三步全绿(typecheck 双跑两份 tsconfig)。
+
+w2a 交的是**壳**:产品名、一句状态说明、主题切换按钮 —— 部署后 `/` 的真实首页,不是空白页。
+注意 `/` 的归属变了:`src/index.ts` 里 `landingHtml` 那个分支代码原样保留(退役排在 w2b),但 `/`
+现在由资产层应答 `dist/index.html`,不再进 worker,所以冒烟该看到壳;看到旧落地页反而说明 `dist/`
+没构建或没部署上。
+
+主题(`web/src/lib/theme.ts`,规则按权威等级排):
+
+1. **手动选择是权威**:localStorage 键 `ca-theme`,值域 `light`/`dark`。有合法值就照它渲染,此后
+   操作系统改色不再影响页面;**删掉这个键 = 回到跟随系统**。
+2. **没有手动选择才跟随 `prefers-color-scheme`**,并实时跟随其变化。
+3. **暗色是缺省**:`theme.css` 的 `:root` 就是暗色,所以 JS 的全部动作是「置 / 移
+   `<html data-theme="light">`」,不复制第二套变量。`initTheme()` 排在 React 挂载之前,防暗色系统下
+   闪一帧浅色。
+
+色值的唯一出口是 `web/src/styles/theme.css`(两套主题的变量名集合逐字一致、浅色块排在暗色块之后),
+组件不写字面色值、间距只走 4px 栅格的 `--space-*`;这两类跨文件纪律由 `test/web-theme-tokens.test.ts`
+钉住。**需浏览器实测**(单测钉不住):暗色系统下首帧不闪、切换后刷新保持、跟随态下 OS 改色实时生效、
+两套主题下壳都可读。
+
 ## 候选落地(`scripts/land.mjs`)
 
 平台侧只读、不持任何 push 凭据;落地端是唯一能写远端的地方,所以它把「人工取证据 → 核 digest → 干净树 apply → 本地验证 → commit → push」写成一条**先证明再动手**的链。守门判定全在 `scripts/land-gate.mjs`(纯函数 + 依赖注入,由 `test/land-gate.test.ts` 钉不变量),`land.mjs` 只是接 git/npm/HTTP 的薄壳。
