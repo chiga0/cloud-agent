@@ -585,7 +585,7 @@ writer 那三次都成功收尾(`is_error=false`),而任务规格**要求**它�
 - **逐事件累加**:遍历该 attempt 的全部 `type === "assistant"` 事件,把每次调用的 `usage` 按字段相加(input / cache_read / output / total)。`total_tokens` 缺失时由 `input + output` 推出(上游恒等式,不是猜)。
 - **完成态与被杀态走同一条路径**。旧实现是「有 result 用 result、没 result 取有效 total 最大的一条 assistant」—— 被墙钟击杀的任务没有 result,于是记成单次调用的量级(r2 实测 input 漏 48.4×、加权漏 54.5×,见 §13.22)。**「最后一次调用」不是合法回落**:它与「会话累计量」是两个不同的量,补过去的误差由「还剩多少调用没被读到」决定,也就是由被杀位置决定。
 - **`type === "result"` 只做对账基准,绝不参与累加**(它已经是累计值,加进去就是双计)。完成态若累加值 ≠ result 累计值 → 抛 `TranscriptLedgerMismatchError`,消息里给出两侧数值、逐字段差值与差异来源候选(不带 usage 的 assistant 条数、部分调用漏报的字段、多条 result、未知类型带 usage 的事件)。**两个候选值都不取**:格式正常时这两个量本该相等,不等说明我们对 transcript 的理解错了(重复/缺失的 usage 事件),取任一侧都是编一个来源不明的数。
-- 字段只在**每次调用都上报**时才进累加结果;部分上报的字段整体留空(部分和是伪装成总量的欠计)。一个 usage 事件都没有 → `usage: null`(=「未记录」,与 0 严格区分)。
+- 字段只在**每次调用都上报**时才进累加结果;部分上报的字段整体留空(部分和是伪装成总量的欠计)。「每次调用」的计数基准是**真实调用**,零消耗壳帧(input/output 全 0 的 thinking 占位帧,w2b 实测一次会话 134 条)不算调用、计入 `zeroConsumptionEvents` 诊断量 —— 不排除它们会把在场判定稀释到 cache_read 整列丢弃、成本口径塌回全价(C17 实测:98.9% 缓存命中被记成 23.7M 全价,真实 5.05M)。排除边界是「全零」:input=0 但 output>0 仍是真实调用。一个 usage 事件都没有 → `usage: null`(=「未记录」,与 0 严格区分)。
 - 产出 `AttemptUsageLedger`:`usage`(累加的四元组)与 `total`(raw total,恒 = `totalFromUsage(usage)`)。**`totalFromUsage()` 是 raw total 的唯一推导处** —— 台账两处消费它(DO 快照 `result.captured.total_tokens`、D1 `attempts.tokens_used`),两处各算一遍就是两套口径(§13.22 第 4 条)。
 - 写入链:workflow extract step 调一次,`tokens` 与 `usage` 都从同一个 ledger 上取 → `REPORT_QUEUE` → DO → `attempts`(成本口径另见 `costWeightedFromUsage`,fresh + output + 0.2×cache,口径不变)。
 
@@ -2151,7 +2151,7 @@ r11 向量自检:`factor=1` → 6,949,711,**恰等于 raw total**(「缓存与 f
 4. **两条口径同源**:DO 快照的 `result.captured.total_tokens` 与 D1 归档四元组由同一个累加产物给出 —— workflow 调一次累加、`tokens` 与 `usage` 都从它身上取;DO 侧用 `totalFromUsage(usage)` 重算而不信消息里那个冗余的 `tokens`,两者不一致时喊 `ledger_total_drift`(不静默改)。这与 p2 的 `resolveBudget` 同一条教训:**两处各算一遍,缺陷就会以新形状复活**。顺带修掉 reviewer 侧同样的形状(`tokens` 不再独立取 `usage.total_tokens`,改从同一规范化对象派生)。
 5. **被杀态钉死在测试里**:r2 向量(3 次调用、无 result、会话合计与取证逐字段相等)断言提取值 = 全部调用之和,且既不等于末次调用也不等于最大一次调用;成本口径仍是 fresh+output+0.2×cache = 2,495,488(旧值 45,818)。C8 向量钉完成态:累加值与 result 累计值同时命中同一组数(14,954,778 / 14,737,154 / 75,677 / 加权 3,240,732)。
 
-**口径澄清**(旧文档靠约定维持、现在由代码保证):单次调用的 `usage.total_tokens = input_tokens + output_tokens`(input 含 cache_read)是**单次值不是累计值**;累加侧的 `total_tokens` 只有在每次调用都可得(直接给或由 input+output 推出)时才进结果,否则留空 —— 部分和不是总量。
+**口径澄清**(旧文档靠约定维持、现在由代码保证):单次调用的 `usage.total_tokens = input_tokens + output_tokens`(input 含 cache_read)是**单次值不是累计值**;累加侧的 `total_tokens` 只有在每次调用都可得(直接给或由 input+output 推出)时才进结果,否则留空 —— 部分和不是总量。「每次调用」以真实调用计:零消耗壳帧(input/output 全 0)不计入(C17,见 §13.24)。
 
 **刻意不做**:不改预算/墙钟机制(归 p2)、不改路由分类器判据、不动 Observation 层的 journal/ingest/事件协议(提取的输入是 transcript 与既有事件,只读)、不新增指标/看板/外部告警、不引新依赖。历史行不回填:被杀任务那批旧行的低估留在原地,读端看 §13.20 与本节的取证说明。
 
@@ -2223,6 +2223,16 @@ timeout 240 npm test                                            # 全量收敛�
 **边界(本棒不做)**:不做模型调用重试、不自动换模型(操作员配置决策);verifier 侧分流不动(§13.21 已修);预算账本口径不动(p2 的域);不加状态机状态、不加 npm 依赖;不动 `DEFAULT_MAX_ATTEMPTS` 与返工次数上限本身的逻辑;不动 `onReviewerReport` 的路由动作。平台不持 push 凭据。
 
 **未解决 / prod 取证(推进条件)**:`provider_infra` 在 prod 的真实命中率为零 —— 这条判据自本版本部署起才开始积累样本,`shadow` 期的 `route_decision` 全部仍是既有取值。切 `enforce` 的判据先写死,以免将来靠感觉:`route.infra_candidate ∧ is_infra=true` 的样本 **≥5 条**、人工复核**误报率 0%**(每条都核对过「这确实不是候选质量失败」,判据是整串形状,所以这一项应当是机械的)、且**没有一条**样本在后续同任务里靠返工自救成功 —— 三条同时成立才谈有否决权(与 §13.21「≥10 条 + 误报率 <10%」同一纪律,这里的门槛更低是因为判据不含启发式:整串形状要么对要么错,没有中间态)。reviewer 侧的 11% 超时率同理要复核:新上限 97s 生效后,`review.unavailable ∧ error_class=upstream_timeout` 的占比应显著下降;若仍有可观命中,说明延迟分布本身变了(不是「再拍一个更大的数」的理由,而是回到台账重量)。
+
+---
+
+### 13.24 零消耗壳帧稀释在场判定,98.9% 缓存命中被记成全价(C17)— 已实现
+
+**问题(w2b 取证,2026-09-06)**:w2b attempt(`e0c5baa5`/`a5bb791e`,exit 55 墙钟击杀)的 transcript 893KB 里,带 usage 的 assistant 事件 267 条:133 条真实调用 + **134 条 `{input_tokens:0, output_tokens:0}` 的 thinking 占位壳帧**。§13.22 的在场判定以 `calls` 为分母,而壳帧计入 `calls` ⇒ `present.cache_read(133) ≠ calls(267)` ⇒ **cache_read 整列被判「部分上报」丢弃** ⇒ `costWeightedFromUsage` 塌回全价档。实测后果:input 23,608,470(其中 cache_read 23,351,731 = **98.9%**)被记成加权 **23.7M**,真实成本 `(23,608,470−23,351,731)+118,282+round(23,351,731×0.2)` = **5,045,367** —— 虚增 4.7×,且被杀任务(最需要成本可见性的那批)漏记方向与 §13.22 相反:那次是低估,这次是**高估**。两个设计的冲突点:p3 的在场判定(p3 语义:部分和不是总量,不能放松)与缓存折扣系数(C5 引入,0.2 因子)各自正确,但「调用」的定义没有排除零消耗帧 —— 两个正确的设计在 `calls` 这个计数上相撞。
+
+**修法**:壳帧不计入「调用」。`accumulateUsageFromTranscript` 在 assistant 分支对「所有出现字段全为 0 或缺失」的 usage 帧跳过累加与 `calls += 1`,计入新诊断量 `AttemptUsageLedger.zeroConsumptionEvents`(workflow 的 catch 兜底字面量同步补 0)。排除边界是**全零**:`input=0` 但 `output>0` 仍是真实调用(有产出就不是空转)。p3 在场判定本身一字未动 —— 真实调用缺报 cache_read 时整列照旧丢弃、成本照旧保守全价。
+
+**测试**(`test/token-ledger.test.ts` +5,29→34 条):壳帧不进 calls 且 cache_read 保留折扣 15,800(对照旧实现的 70,200 全价)/ 真实调用缺报 cache_read 仍整列留空 70,255(p3 判定存活的负向钉)/ `output>0` 边界 / 全壳帧 → `usage:null` / 完成态对账不受壳帧影响。变异 3/3 红:M1 恢复壳帧计入 → 4 红;M2 零判定只看 input → output 边界 1 红;M3 在场判定弱化为「至少一次出现」→ p3 钉与 C17 负向钉 2 红。**操作员值级钉**:修复后对 w2b 真实 transcript 实测 `calls=133 / zeroConsumptionEvents=134 / input 23,608,470 / cache_read 23,351,731 / output 118,282 / 加权 5,045,367` —— 与取证预测逐字段一致,`underreportedFields` 空(cache 列救回)。
 
 ---
 

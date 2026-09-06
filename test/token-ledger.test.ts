@@ -141,6 +141,64 @@ describe("accumulateUsageFromTranscript —— 被杀态(r2:没有 result 也记
   });
 });
 
+describe("零消耗壳帧不计入在场判定(C17: w2b 一次会话 134 壳帧把 98.9% 缓存命中记成全价)", () => {
+  /**
+   * w2b 取证实测:267 条带 usage 的 assistant 事件里 134 条是 {input:0,output:0}
+   * 的 thinking 占位壳帧,133 条才是真实调用(全部带 cache_read)。旧实现 calls=267,
+   * 在场判定 present.cache_read(133)≠calls(267) → cache_read 整列丢弃 →
+   * 成本口径塌回全价 23.7M(真实 ≈5.05M,虚增 4.7×)。
+   */
+  const SHELL = { type: "assistant", message: { role: "assistant", usage: { input_tokens: 0, output_tokens: 0 } } };
+  const C17_CALL = call(70_000, 68_000, 200);
+
+  it("壳帧不计入 calls:真实调用全报 cache_read → 整列保留,成本按 0.2 系数折扣", () => {
+    const ledger = accumulateUsageFromTranscript(ndjson(SHELL, SHELL, C17_CALL, SHELL));
+    expect(ledger.calls).toBe(1);
+    expect(ledger.zeroConsumptionEvents).toBe(3);
+    expect(ledger.usage).toEqual({ input_tokens: 70_000, cache_read_input_tokens: 68_000, output_tokens: 200, total_tokens: 70_200 });
+    // 2,000 fresh + 200 output + 0.2×68,000 = 15,800;旧实现(cache 列被丢)记 70,200 全价
+    expect(costWeightedFromUsage(ledger.usage!, 0.2)).toBe(15_800);
+  });
+
+  it("p3 在场判定不受壳帧排除影响:真实调用缺报 cache_read → 整列仍留空,成本保守全价", () => {
+    const t = ndjson(
+      SHELL,
+      C17_CALL,
+      { type: "assistant", message: { usage: { input_tokens: 50, output_tokens: 5, total_tokens: 55 } } },
+    );
+    const ledger = accumulateUsageFromTranscript(t);
+    expect(ledger.calls).toBe(2);
+    expect(ledger.usage!.cache_read_input_tokens).toBeUndefined();
+    expect(ledger.underreportedFields).toEqual(["cache_read_input_tokens"]);
+    expect(costWeightedFromUsage(ledger.usage!, 0.2)).toBe(70_255);
+  });
+
+  it("input=0 但 output>0 → 仍是真实调用(排除边界是「全零」,不是「input 为零」)", () => {
+    const t = ndjson({ type: "assistant", message: { role: "assistant", usage: { input_tokens: 0, output_tokens: 30, total_tokens: 30 } } });
+    const ledger = accumulateUsageFromTranscript(t);
+    expect(ledger.calls).toBe(1);
+    expect(ledger.zeroConsumptionEvents).toBe(0);
+    expect(ledger.usage).toEqual({ input_tokens: 0, output_tokens: 30, total_tokens: 30 });
+  });
+
+  it("全部是壳帧 → usage=null(「未记录」),零消耗与无用量仍严格区分", () => {
+    const ledger = accumulateUsageFromTranscript(ndjson(SHELL, SHELL));
+    expect(ledger.usage).toBeNull();
+    expect(ledger.total).toBe(0);
+    expect(ledger.calls).toBe(0);
+    expect(ledger.zeroConsumptionEvents).toBe(2);
+  });
+
+  it("完成态对账不受壳帧影响:排除壳帧后累加值与 result 累计值照常相等", () => {
+    const ledger = accumulateUsageFromTranscript(
+      ndjson(SHELL, ...C8_CALLS, SHELL, { type: "result", subtype: "success", usage: C8_RESULT }),
+    );
+    expect(ledger.usage).toEqual(C8_RESULT);
+    expect(ledger.zeroConsumptionEvents).toBe(2);
+    expect(costWeightedFromUsage(ledger.usage!, 0.2)).toBe(C8_COST_WEIGHTED);
+  });
+});
+
 describe("accumulateUsageFromTranscript —— 完成态对账(r2 的同源测试)", () => {
   it("C8 实测向量:累加值 == result 累计值,两个口径同时命中", () => {
     const ledger = accumulateUsageFromTranscript(

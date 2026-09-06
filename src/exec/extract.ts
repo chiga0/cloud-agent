@@ -125,6 +125,12 @@ export interface AttemptUsageLedger {
   assistantWithoutUsage: number;
   /** 只有部分调用上报、因此整体留空的字段(部分和是伪装成总量的欠计,不如不记)。 */
   underreportedFields: (keyof TranscriptUsage)[];
+  /**
+   * input/output 全为 0 的 usage 壳帧数(thinking 占位的空转帧,w2b 实测 134 条)。
+   * 它们不是调用:计入 calls 会把「每次调用都上报」的在场判定稀释到 cache_read 整列丢弃,
+   * 成本口径随之塌回全价 —— 这正是 C17(w2b 把 98.9% 缓存命中记成 23.7M 全价)的根因。
+   */
+  zeroConsumptionEvents: number;
 }
 
 /**
@@ -152,6 +158,18 @@ function accumulatedUsage(
     if (present[field] === calls) out[field] = sums[field] as number;
   }
   return out;
+}
+
+/**
+ * 零消耗壳帧:所有出现的字段都是 0(或缺失)。qwen CLI 在 thinking/占位时也会写
+ * assistant 事件,usage 形如 {input_tokens:0,output_tokens:0} —— 它没有消耗任何
+ * token,不是一次调用。注意 output>0 就是真实调用(哪怕 input=0),不能一起排除。
+ */
+function isZeroConsumptionUsage(u: TranscriptUsage): boolean {
+  return USAGE_FIELDS.every((f) => {
+    const v = u[f];
+    return v === undefined || v === 0;
+  });
 }
 
 function fmtUsage(u: TranscriptUsage | null): string {
@@ -253,6 +271,7 @@ export function accumulateUsageFromTranscript(transcript: string): AttemptUsageL
   const present: Partial<Record<keyof TranscriptUsage, number>> = {};
   let calls = 0;
   let assistantWithoutUsage = 0;
+  let zeroConsumptionEvents = 0;
   let resultUsage: TranscriptUsage | null = null;
   let resultEvents = 0;
   let otherUsageEvents = 0;
@@ -284,6 +303,10 @@ export function accumulateUsageFromTranscript(transcript: string): AttemptUsageL
         assistantWithoutUsage += 1;
         continue;
       }
+      if (isZeroConsumptionUsage(usage)) {
+        zeroConsumptionEvents += 1;
+        continue;
+      }
       calls += 1;
       for (const field of USAGE_FIELDS) {
         const value = perCallField(usage, field);
@@ -307,6 +330,7 @@ export function accumulateUsageFromTranscript(transcript: string): AttemptUsageL
     calls,
     assistantWithoutUsage,
     underreportedFields: USAGE_FIELDS.filter((f) => present[f] !== undefined && present[f] !== calls),
+    zeroConsumptionEvents,
   };
   // 被杀态没有 result 可比:累加值是此刻唯一可主张的口径,不报错也不编基准。
   if (resultUsage) reconcileWithResult(ledger, resultUsage, { resultEvents, otherUsageEvents, otherUsageTotal });

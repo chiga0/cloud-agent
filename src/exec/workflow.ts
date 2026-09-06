@@ -385,6 +385,7 @@ export class AttemptWorkflow extends WorkflowEntrypoint<Env, AttemptParams> {
             calls: 0,
             assistantWithoutUsage: 0,
             underreportedFields: [],
+            zeroConsumptionEvents: 0,
           };
         }
         return {
