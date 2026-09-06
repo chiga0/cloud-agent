@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="zh">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <!-- 缺省主题 = CSS 里 `:root` 那套暗色 token(docs/product.md §7 设计语言)。
+         主题选择不在这个文件里做:全部逻辑在 web/src/lib/theme.ts,由 main.tsx 在挂载前落定。 -->
+    <meta name="color-scheme" content="dark light" />
+    <title>cloud-agent</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

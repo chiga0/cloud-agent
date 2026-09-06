@@ -1,14 +1,7 @@
+// 根 tsconfig 只做一件事:把 worker 侧配置挂在使用者默认会找到的文件名上。
+// vitest 的 esbuild 转换与编辑器 TS server 都按「文件向上找最近的 tsconfig.json」取编译选项,
+// 真正的项目定义在 tsconfig.worker.json(worker/test)与 web/tsconfig.json(浏览器侧)两份里 ——
+// `npm run typecheck` 显式双跑那两份,不跑这里。
 {
-  "compilerOptions": {
-    "target": "ES2022",
-    "module": "ES2022",
-    "moduleResolution": "bundler",
-    "lib": ["ES2022", "WebWorker"],
-    "types": ["@cloudflare/workers-types", "@cloudflare/vitest-pool-workers"],
-    "strict": true,
-    "noEmit": true,
-    "skipLibCheck": true,
-    "allowJs": true
-  },
-  "include": ["src", "test", "vitest.config.ts"]
+  "extends": "./tsconfig.worker.json"
 }

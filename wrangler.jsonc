@@ -4,6 +4,23 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-08-28",
   "compatibility_flags": ["nodejs_compat"],
+  // 前端资产与路由分区(docs/product.md §1/§2/§4,w2a)。
+  //
+  // 同一个 Worker 既是 API 也是静态站点:Vite 产物落仓库根 `dist/`(`npm run build`),
+  // 同源部署 → 无 CORS、SameSite=Strict cookie 与 EventSource 直接可用。
+  //
+  // `run_worker_first` 是**分区表的可执行副本**:列到的路径先给 worker,其余全给资产。
+  // 漏一条的故障形状极阴 —— API 不会 404,而是被 `single-page-application` 兜底吞成
+  // 200 + index.html:curl 看着正常(它本来就拿到过 JSON),浏览器拿到一坨 HTML,
+  // 且只在挂上资产之后才开始坏。所以 §7 把它列为头号风险,由
+  // test/assets-routing.test.ts 钉住「每个 API 路径都被某条 run_worker_first 规则覆盖」。
+  // 清单要与 src/index.ts 的分发、web/vite.config.ts 的 dev proxy 同步(规格表 §2)。
+  "assets": {
+    "directory": "dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*", "/live", "/live/*", "/healthz"]
+  },
   "vars": {
     "ENVIRONMENT": "prod",
     "PUBLIC_URL": "https://cloud-agent.aflow.workers.dev",

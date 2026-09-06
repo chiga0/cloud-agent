@@ -1,0 +1,109 @@
+/**
+ * 设计 token —— 双主题色彩面(docs/product.md §4/§7 设计语言,规格表经用户签字)。
+ *
+ * 三条纪律,都由 test/web-theme-tokens.test.ts 钉成可执行事实:
+ * 1. **本文件是唯一允许出现字面色值的地方**。组件与其余样式表只认变量名。
+ * 2. 两套主题的**变量名集合逐字一致**(同序、同数量)—— 少一个名字,组件在该主题下
+ *    会静默拿到 `unset`(边框消失、文字变透明),线上表现为「只有暗色是对的」。
+ * 3. 浅色块必须排在深色块**之后**:两者选择器特异度相同(`[data-theme="light"]` 与
+ *    `:root` 都是 0,1,0),主题的覆盖完全靠源码顺序赢。
+ *
+ * 缺省主题 = 暗色(`:root` 无需属性即生效);浅色靠 `<html data-theme="light">`,
+ * 属性读写全部在 web/src/lib/theme.ts,本文件不假设它是怎么被设上的。
+ */
+
+:root {
+  color-scheme: dark;
+
+  /* 面 */
+  --bg: #0d1117;
+  --surface: #161b22;
+  --surface-2: #21262d;
+  --border: #30363d;
+  --border-strong: #6e7681;
+
+  /* 字 */
+  --fg: #e6edf3;
+  --fg-muted: #8b949e;
+  --fg-faint: #6e7681;
+
+  /* 四态:底 / 描边 / 字 三件套成组出现,不许单换字色(可读性靠整组对比度) */
+  --ok-bg: #0f1d13;
+  --ok-border: #2a5b3a;
+  --ok-fg: #7ee787;
+  --run-bg: #0d1a2d;
+  --run-border: #21548f;
+  --run-fg: #79b8ff;
+  --warn-bg: #3d2f00;
+  --warn-border: #9c6d00;
+  --warn-fg: #ffd866;
+  --err-bg: #4b0d0d;
+  --err-border: #d1242f;
+  --err-fg: #ff9b9b;
+
+  /* 点缀 */
+  --accent-purple: #d2a8ff;
+  --accent-teal: #73d3d3;
+  --accent-blue: #a9c1d9;
+  /* result 徽章是反白件:底取 ok 的字色,文字取 bg。二者不成组出现在状态三件套里,单独命名 */
+  --ok-on: #0d1117;
+  /* err 方向的强调文字(闪烁动画的边框色同源) */
+  --err-fg-emph: #ffb3ad;
+
+  /* kind 描边。assistant 复用 --ok-border、tool_use 复用 --run-border,故不另设变量 */
+  --kind-system-border: #3d4b5c;
+  --kind-user-border: #5b3a75;
+  --kind-tool-result-border: #1f5f5f;
+
+  /* primary 按钮 */
+  --primary-bg: #1f6feb22;
+  --primary-border: #1f6feb66;
+  --primary-fg: #79b8ff;
+}
+
+[data-theme="light"] {
+  color-scheme: light;
+
+  /* 面 */
+  --bg: #ffffff;
+  --surface: #f6f8fa;
+  --surface-2: #eaeef2;
+  --border: #d0d7de;
+  --border-strong: #8c959f;
+
+  /* 字 */
+  --fg: #1f2328;
+  --fg-muted: #57606a;
+  --fg-faint: #8c959f;
+
+  /* 四态 */
+  --ok-bg: #dafbe1;
+  --ok-border: #4ac26b;
+  --ok-fg: #116329;
+  --run-bg: #ddf4ff;
+  --run-border: #54aeff;
+  --run-fg: #0969da;
+  --warn-bg: #fff8c5;
+  --warn-border: #d4a72c;
+  --warn-fg: #7d4e00;
+  --err-bg: #ffebe9;
+  --err-border: #ff8182;
+  --err-fg: #cf222e;
+
+  /* 点缀 */
+  --accent-purple: #8250df;
+  --accent-teal: #1b7c83;
+  --accent-blue: #57606a;
+  --ok-on: #ffffff;
+  --err-fg-emph: #a40e26;
+
+  /* kind 描边 */
+  --kind-system-border: #57606a66;
+  --kind-user-border: #8250df66;
+  --kind-tool-result-border: #1b7c8366;
+
+  /* primary 按钮 */
+  --primary-bg: #ddf4ff;
+  --primary-border: #54aeff;
+  --primary-fg: #0969da;
+}

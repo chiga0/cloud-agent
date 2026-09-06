@@ -1,0 +1,33 @@
+/**
+ * 尺寸/排印/动效 token —— 与主题无关的一套(规格表「两主题通用」段)。
+ * 放在 theme.css 之外正是为了让「两套主题变量名集合逐字一致」这条钉子保持单纯:
+ * 主题块里只有色彩,这里只有尺子。
+ */
+
+:root {
+  /* 4px 栅格。名字里的数字 = 值是 4 的几倍,与 Tailwind 缺省刻度同名同值,
+     w2b 接 Tailwind 时这两套不会互相矛盾。 */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-12: 48px;
+
+  /* 字号三档,一律等宽:台账里对齐的数字比好看重要 */
+  --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  --text-xs: 12px;
+  --text-sm: 13px;
+  --text-md: 15px;
+
+  /* 表格行高(任务列表/事件时间线的密度基准) */
+  --row-height: 36px;
+
+  /* 圆角:徽章 999px(胶囊),其余 6px */
+  --radius-badge: 999px;
+  --radius-base: 6px;
+
+  /* err 方向的闪烁周期(见 base.css 的 .ca-blink) */
+  --blink-period: 1.2s;
+}

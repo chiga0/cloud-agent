@@ -5,10 +5,15 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
+    "dev:web": "vite --config web/vite.config.ts",
+    "preview:web": "vite preview --config web/vite.config.ts",
+    "prebuild": "node scripts/ensure-deps.mjs",
+    "build": "vite build --config web/vite.config.ts",
+    "predeploy": "npm run build",
     "deploy": "wrangler deploy",
     "ensure-deps": "node scripts/ensure-deps.mjs",
     "pretypecheck": "node scripts/ensure-deps.mjs",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit -p tsconfig.worker.json && tsc --noEmit -p web/tsconfig.json",
     "pretest": "node scripts/ensure-deps.mjs",
     "test": "vitest run",
     "db:migrate:local": "wrangler d1 migrations apply cloud-agent --local",
@@ -16,12 +21,19 @@
   },
   "dependencies": {
     "@cloudflare/containers": "^0.3.7",
-    "@cloudflare/sandbox": "^0.8.14"
+    "@cloudflare/sandbox": "^0.8.14",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.22.0",
     "@cloudflare/workers-types": "^5.20260828.1",
+    "@types/node": "^26.4.1",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.7",
+    "@vitejs/plugin-react": "^6.1.1",
     "typescript": "^5.9.2",
+    "vite": "^8.2.2",
     "vitest": "^4.1.11",
     "wrangler": "^4.33.0"
   }

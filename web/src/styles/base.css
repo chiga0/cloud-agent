@@ -1,0 +1,275 @@
+/**
+ * 基座工具类:把设计 token 变成可直接挂上去的 class,组件里不出现任何字面色值/尺寸。
+ * 全部加 `ca-` 前缀(w2b 会引 Tailwind + shadcn/ui,无前缀的 `.row`/`.badge` 这类
+ * 通用名迟早与工具类撞名,撞了就是「样式随机失效」)。
+ *
+ * 这里只交**色彩/尺寸的形状**,不交业务映射:state→色、kind→徽章的对应关系
+ * (DONE=ok、RUNNING=run、停滞>90s=warn、>300s=err;c9b 已验收的 kind 全集)由 w2b 的
+ * 数据层产出 class 名,因为它依赖后端权威(src/supervisor/detect.ts 的阈值、状态机)。
+ */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  min-height: 100%;
+}
+
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  line-height: 1.5;
+  /* 台账数字一律等宽对齐:非等宽时 1e6 与 9e5 谁大都看不出来 */
+  font-variant-numeric: tabular-nums;
+}
+
+a {
+  color: var(--accent-blue);
+  text-decoration: none;
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+/* UA 的 h1/h2/p 外边距是 em 制(0.67em/1em…),与 4px 栅格无关:一律清零,
+   留白只由 .ca-stack/.ca-cluster 的 gap 决定。 */
+h1,
+h2,
+h3,
+h4,
+p,
+figure {
+  margin: 0;
+  font-weight: normal;
+}
+
+code {
+  background: var(--surface-2);
+  border-radius: var(--radius-base);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  padding: 0 var(--space-1);
+}
+
+/* ── 排印 ─────────────────────────────────────────────────────────────── */
+
+.ca-text-xs {
+  font-size: var(--text-xs);
+}
+
+.ca-text-sm {
+  font-size: var(--text-sm);
+}
+
+.ca-text-md {
+  font-size: var(--text-md);
+}
+
+.ca-num {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1;
+}
+
+.ca-muted {
+  color: var(--fg-muted);
+}
+
+/* 台账里的 null(未记录)带 dim 呈现「—」,与 0 严格区分:0 是个数,null 是口径缺失 */
+.ca-dim {
+  color: var(--fg-faint);
+}
+
+.ca-accent-purple {
+  color: var(--accent-purple);
+}
+
+.ca-accent-teal {
+  color: var(--accent-teal);
+}
+
+/* ── 布局骨架(4px 栅格)────────────────────────────────────────────── */
+
+.ca-shell {
+  margin: 0 auto;
+  max-width: 960px;
+  padding: var(--space-8) var(--space-6);
+}
+
+.ca-stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.ca-cluster {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+/* 把集群里的末项推到行尾(头部工具条的常规需求):`auto` 不是尺寸,不进 4px 栅格 */
+.ca-ml-auto {
+  margin-left: auto;
+}
+
+.ca-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-base);
+  padding: var(--space-4);
+}
+
+.ca-card-2 {
+  background: var(--surface-2);
+}
+
+/* ── 徽章:胶囊 + 四态三件套(底/描边/字成组,不许单换字色)────────── */
+
+.ca-badge {
+  align-items: center;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-badge);
+  display: inline-flex;
+  gap: var(--space-1);
+  height: var(--space-6);
+  line-height: 1;
+  padding: 0 var(--space-2);
+  font-size: var(--text-xs);
+  white-space: nowrap;
+}
+
+.ca-state--ok {
+  background: var(--ok-bg);
+  border-color: var(--ok-border);
+  color: var(--ok-fg);
+}
+
+.ca-state--run {
+  background: var(--run-bg);
+  border-color: var(--run-border);
+  color: var(--run-fg);
+}
+
+.ca-state--warn {
+  background: var(--warn-bg);
+  border-color: var(--warn-border);
+  color: var(--warn-fg);
+}
+
+.ca-state--err {
+  background: var(--err-bg);
+  border-color: var(--err-border);
+  color: var(--err-fg);
+}
+
+/* ── kind 描边(c9b 已验收的值集;assistant/tool_use 复用状态描边)──── */
+
+.ca-kind--system {
+  border-color: var(--kind-system-border);
+}
+
+.ca-kind--user {
+  border-color: var(--kind-user-border);
+}
+
+.ca-kind--tool-result {
+  border-color: var(--kind-tool-result-border);
+}
+
+.ca-kind--assistant {
+  border-color: var(--ok-border);
+}
+
+.ca-kind--tool-use {
+  border-color: var(--run-border);
+}
+
+.ca-kind--error {
+  border-color: var(--err-border);
+  color: var(--err-fg-emph);
+}
+
+/* heartbeat 是节奏信号不是内容,点线描边把它与真事件分开 */
+.ca-kind--heartbeat {
+  border-style: dotted;
+}
+
+/* result 是反白件:底 = ok 字色,字 = --ok-on。与其他 kind 不成组,单独一条 */
+.ca-kind--result {
+  background: var(--ok-fg);
+  border-color: var(--ok-fg);
+  color: var(--ok-on);
+}
+
+/* ── 表格 ─────────────────────────────────────────────────────────────── */
+
+.ca-table {
+  border-collapse: collapse;
+  font-size: var(--text-sm);
+  width: 100%;
+}
+
+.ca-table th,
+.ca-table td {
+  border-bottom: 1px solid var(--border);
+  height: var(--row-height);
+  text-align: left;
+  padding: 0 var(--space-2);
+}
+
+.ca-table th {
+  background: var(--surface-2);
+  color: var(--fg-muted);
+  font-weight: normal;
+}
+
+/* ── 按钮 ─────────────────────────────────────────────────────────────── */
+
+.ca-btn {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-base);
+  color: var(--fg);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: var(--text-sm);
+  padding: var(--space-1) var(--space-3);
+}
+
+.ca-btn:hover {
+  border-color: var(--border-strong);
+}
+
+.ca-btn--primary {
+  background: var(--primary-bg);
+  border-color: var(--primary-border);
+  color: var(--primary-fg);
+}
+
+/* ── err 方向的闪烁 ───────────────────────────────────────────────────── */
+
+@keyframes ca-blink {
+  50% {
+    border-color: var(--err-fg);
+  }
+}
+
+.ca-blink {
+  animation: ca-blink var(--blink-period) step-end infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ca-blink {
+    animation: none;
+  }
+}

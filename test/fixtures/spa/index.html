@@ -1,0 +1,22 @@
+<!doctype html>
+<!--
+  SPA 入口夹具:代替 `dist/index.html`。
+
+  为什么不直接指向真产物:`npm test` 在 verify 链里跑在 `npm run build` **之前**
+  (`npm run typecheck && npm test && npm run build`),测试池启动时 dist/ 往往还不存在,
+  而 assets.directory 指向缺失目录会让整个测试池起不来。故测试配置(wrangler.test.jsonc)
+  指向这个稳定存在的最小夹具;真 dist/ 由 build 步骤与部署后的操作员冒烟覆盖。
+
+  它与真入口的一致性由 test/assets-routing.test.ts 钉:两边必须有同一个挂载锚点(`#root`)
+  与同一个 module script 入口 —— 夹具与 web/index.html 脱钩时,SPA fallback 的断言就变成自证。
+-->
+<html lang="zh">
+  <head>
+    <meta charset="utf-8" />
+    <title>cloud-agent · SPA fixture</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/assets/probe.js"></script>
+  </body>
+</html>
