@@ -104,10 +104,20 @@ GET  /admin/{tasks,attempts,events,chain-check}      → GET /api/admin/…
 | 路由 | 棒 | 数据源 | 要点 |
 |---|---|---|---|
 | `/login` | w2 | `POST /api/session/login` | token 粘贴框；错误提示不区分「token 错」与「网络错」（不泄露探测面） |
-| `/` 任务列表 | w3 | `GET /api/admin/tasks`（**已有端点，零后端改动**） | TanStack Table；state 过滤（search param + zod）；**游标「加载更多」**（服务端是 cursor 分页，不伪装成页码）；RUNNING 置顶；30s refetchInterval |
+| `/` 任务列表 | w3 | `GET /api/admin/tasks`（**已有端点，零后端改动**） | TanStack Table；state 过滤（search param + zod）；30s refetchInterval |
 | `/tasks/$taskId` 详情 | w4 | `GET /api/tasks/:id` + `/events` + `/events/stream`（全部已有） | 头部（state 徽章/budget/base sha/digest/attempts）+ **事件时间线**（SSE 直连 + Last-Event-ID 续传，与 `?after=` 拉取互为恢复源）+ attempts + result/evidence/candidate 区。**逐条迁移 c9b/c9c 实测经验**：kind 徽章全值、200 字符截断、停滞三色 >90s 黄 >300s 红（`Date.now()` 差值）、坏帧跳过并计数（绝不让一条坏帧停更整页）、end 帧停表、**readyState 双文案（401→CLOSED「不会自动重连」）** |
 | `/approvals` | w5 | `GET /api/admin/tasks?state=AWAITING_APPROVAL` + `POST /api/tasks/:id/approve`（已有；缺 state 过滤参数则小补） | 证据视图（result_text / binding digest / manifest）+ candidate patch 预览 + approve 确认弹层（原因必填）。**人工门的一等公民化** |
 | `/audit` | w6 | `GET /api/admin/events` + `GET /api/admin/chain-check`（已有） | 跨任务事件流 + **digest 链可视化**（prev→cur 链接图形化，chain-check 状态置顶）+ `supervisor_finding` 流（消费 c10 产出） |
+
+- **w3 注记（2026-09-06 派单前核实，取代上行与旧版两处设想）**：① 服务端 `GET /api/admin/tasks`
+  是纯 `LIMIT` 投影（limit∈[1,200] 缺省 50），**无游标分页**——旧设想的「游标加载更多」移出 w3，
+  登记为候选（服务端加 `?before=` 游标，随 w5 小补或独立微棒）；UI 不得用 limit 递增伪装页码。
+  ② 归档投影看不到未终态任务（D1 `tasks` 行只在归档时落），**无 RUNNING 行可置顶**——排序沿用
+  服务端 `updated_at DESC`。③ 响应 `count` 是**本次返回条数**（受 limit 截断）而非匹配总数，
+  UI 不得渲染成「共 N 条」。
+- **预算注记（2026-09-06）**：墙钟杠杆（MAX_WRITER_WALL_MINUTES=90）落地后，w 系列派单
+  `max_wall_seconds` 一律 6000（writer 实际拿 min(98,90)=90min 上限）；§6 表内 2400/3000 是
+  杠杆前旧账，w2/w2a/w2b 三连 exit55@41min 已证旧预算是死区。
 
 - w4 验收通过后**退役 `/live/:taskId`**（页面 + 路由删除；SSE 数据端点保留）；过渡期 301 到 `/tasks/$taskId`。
 - 后端在四层可观测架构里已经基本完工（admin/events、chain-check、approve、candidate 全部现成）——
