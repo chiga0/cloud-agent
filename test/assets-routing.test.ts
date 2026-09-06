@@ -130,7 +130,7 @@ function otherWorkerPaths(taskId: string): string[] {
  */
 function clientRoutes(taskId: string): string[] {
   return [
-    "/", // 资产层的 SPA 入口(注:landingHtml 仍在 worker 里保留不动,退役在 w2b)
+    "/", // 资产层的 SPA 入口(w2b 起 landingHtml 已从 worker 删除,`/` 只剩资产这一条路)
     "/login",
     "/tasks",
     `/tasks/${taskId}`,
@@ -261,7 +261,8 @@ describe("资产应答面:未匹配路径落 SPA 入口", () => {
    * 「谁认领」。三段合起来才是完整的防线,线上真实组合由操作员部署后 curl 全 API 前缀冒烟。
    */
   it("深链接(客户端路由)拿到 200 + index.html,而不是 404", async () => {
-    for (const path of ["/tasks/" + crypto.randomUUID(), "/approvals", "/login"]) {
+    // `/` 排在最前:w2b 退役 landingHtml 之后,根路径**只有**资产这一条路可走。
+    for (const path of ["/", "/tasks/" + crypto.randomUUID(), "/approvals", "/login", "/audit"]) {
       const res = await assets.fetch(new Request(`https://example.com${path}`));
       expect(res.status, `${path} 应落 SPA 入口`).toBe(200);
       expect(res.headers.get("content-type") ?? "").toContain("text/html");

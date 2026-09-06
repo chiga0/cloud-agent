@@ -1619,7 +1619,7 @@ cookie jar 隔离,`__Host-` 前缀的三条硬要求(Secure / `Path=/` / 无 `Do
 
 | 面 | 事实 | 钉它的地方 |
 |---|---|---|
-| 构建 | Vite,`root = web/`,`outDir = ../dist`,`emptyOutDir: true` | `test/web-build-base.test.ts` |
+| 构建 | Vite,`root = web/`,`outDir = ../dist`,`emptyOutDir: true`,`plugins: [react()]`(w2b 补:w2a 导入了 plugin-react 却没注册,dev 因此没有 Fast Refresh) | `test/web-build-base.test.ts` |
 | 类型 | 两份 tsconfig 各管一侧:`tsconfig.worker.json`(src+test,WebWorker lib)/ `web/tsconfig.json`(web/src,DOM lib + `jsx: react-jsx`);`npm run typecheck` 用 `&&` 双跑,两侧都必须过 | 同上 |
 | 产物 | `dist/index.html` + `dist/assets/index-<hash>.js` + `dist/assets/index-<hash>.css`;`dist/` 在 `.gitignore` 里(否则 land-gate 的 build 前后快照比对判 `tests_ok` 不过) | 同上 |
 | 资产 | `wrangler.jsonc`:`directory: "dist"` + `binding: ASSETS` + `not_found_handling: "single-page-application"` + `run_worker_first: ["/api/*", "/live", "/live/*", "/healthz"]` | `test/assets-routing.test.ts`(配置面 + 覆盖面 + 行为面三段) |
@@ -1628,12 +1628,21 @@ cookie jar 隔离,`__Host-` 前缀的三条硬要求(Secure / `Path=/` / 无 `Do
 
 依赖全在仓库根的 `package.json` + lockfile(`npm ci` 一次),`web/` 不是独立包。
 
-### `/` 的归属变了(代码还在,线上不再可达)
+### `/` 的归属变了(w2b:落地页已整体删除)
 
-`src/index.ts` 里 `GET /` → `landingHtml` 那个分支**代码原样保留**(退役排在 w2b),但资产一挂上,
-`/` 就由资产层的 HTML 路由应答 `dist/index.html`,压根不进 worker —— 与 `/login`、`/tasks/<uuid>`
+`src/index.ts` 里 `GET /` → `landingHtml` 那个分支在 **w2b 删除**(定义与装配点一起移除,不留兼容层):
+`/` 由资产层的 HTML 路由应答 `dist/index.html`,压根不进 worker —— 与 `/login`、`/tasks/<uuid>`
 这些深链走的是同一套机制(`test/assets-routing.test.ts` 的资产段钉「未匹配 / 目录路径拿 200 + 含
-`id="root"` 的 HTML」)。所以**部署冒烟看的是壳,不是旧落地页**:`curl /` 拿回 `landingHtml` 才是异常。
+`id="root"` 的 HTML」)。所以**部署冒烟看的是 SPA 的壳**:worker 现在对 `/` 只能答鉴权门的 401
+(未带凭据)或分发的 404 `not_found`(带凭据),`curl /` 拿回任何 HTML 都说明有页面分支又长回了
+worker 里 —— 那条形状由 `test/api-prefix.test.ts` 与 `test/web-frontend-contract.test.ts` 两头钉。
+
+**一处诚实的代价**:落地页原先兼任「端点目录」(每个 `/api/*` 的返回字段、口径、诚实性说明),
+删掉之后 README 是它唯一的载体。原先那三处「落地页 ↔ README ↔ 实际返回」三方对表的用例
+(`test/admin-tasks.test.ts`、`test/admin-attempts.test.ts`、`test/admin-events.test.ts`、
+`test/obs-events-api.test.ts`)因此收成两方对表,**断言的短语一条没减**;而「同一份端点说明抄两处
+会漂」这个风险,改由「不许再起第二份端点文档」承担 —— 页面要展示端点说明,读同一份 README/docs,
+不再抄一遍。
 
 ### 主题语义(三条规则,按权威等级排)
 
@@ -1662,14 +1671,20 @@ cookie jar 隔离,`__Host-` 前缀的三条硬要求(Secure / `Path=/` / 无 `Do
 
 ### 契约钉与实测边界
 
-`test/web-theme-tokens.test.ts`(36 条)读 `__WEB_STYLE_SOURCES__`(vitest.config.ts 构建期内联的
-CSS **原文** —— Workers 运行时没有 fs,而 `.css` 的 `?raw` 在 worker 池里恒为空串)与壳的 `?raw` 源码,
+`test/web-theme-tokens.test.ts`(w2a 落 36 条,w2b 随页面落地扩到 39 条)读 `__WEB_STYLE_SOURCES__`(vitest.config.ts 构建期内联的
+CSS **原文** —— Workers 运行时没有 fs,而 `.css` 的 `?raw` 在 worker 池里恒为空串)与前端源文件的 `?raw`
+源码(w2b 起那份名单是**硬编码的全文件清单**:漏登记一个 .tsx 就等于让它脱离「禁色值 / 禁第二套 CSS
+变量 / 禁内联 style / class 必须有定义」这四条,而漏的那个恰恰最可能是抄来一段组件库样式的),
 钉五类跨文件纪律:两套主题**变量名集合逐字一致(同序同数量)** + **浅色块排在暗色块之后**(两者特异度
 相同,覆盖全靠源码顺序)、关键色值逐字抽查、`base.css` 工具类间距 ⊆ `{4,8,12,16,24,32,48}px` 且所引
 变量都有定义处、**色值的唯一出口是 theme.css**(组件与另两份样式表出现字面色值即红)且组件只挂
 `base.css` 里存在的 class。这五类违反的现场全都是「只有暗色是对的」「某两块看着不齐」「浅色主题整体
 失效」—— 都只在另一套主题或另一次改动后才显现,靠 review 抓不住。这 36 条另配 11 个变异(把每条纪律
-逐条破坏一遍再跑)验过都会红,钉子不是装饰。
+逐条破坏一遍再跑)验过都会红,钉子不是装饰。**w2b 新增的 4 条也各配了一个变异实测**:①组件里写
+`color: "#0d1117"` → 「字面色值」红;②同一处写 `style={{...}}` → 「禁内联 style」红;③挂一个
+base.css 里没有的 class 并塞进 `--second-set: 1px` → 「class 全集」与「第二套 CSS 变量」各红一次;
+④**新建一个不登记的 .tsx**(带上述三种违规)→ 只有「源文件名单完整性」红 —— 那正是这条钉子存在的理由:
+前三条都只扫名单内的文件,漏登记就等于逃逸。
 
 **需浏览器实测(单测钉不住,§7 的 qwen 视觉边界纪律)**:① 暗色偏好系统下首帧不闪另一套配色;
 ② 切换后刷新保持(落盘成功),清掉 `ca-theme` 回到跟随系统;③ 跟随态下操作系统改色,页面实时跟着变;
@@ -1679,11 +1694,59 @@ CSS **原文** —— Workers 运行时没有 fs,而 `.css` 的 `?raw` 在 worke
 
 ### w2a 刻意不做的
 
-不引 Tailwind / TanStack / shadcn/ui(排在 w2b,与 `web/src/styles/*` 一起成套引入 ——
-现在混用两套样式体系只会得到「同一页面两种手感」);不做 `/login` 与 authed 布局壳(product.md §4
+不引 Tailwind / TanStack / shadcn/ui(排在 w2b);不做 `/login` 与 authed 布局壳(product.md §4
 的 w2 交付里那部分归 w2b);不动 `landingHtml`、不动 `/live/:taskId`、不动 `/api/*` 的任何行为。
+**w2b 的随动**:TanStack 三件套 + zod 成套引入了,但 **Tailwind 与 shadcn/ui 被否掉** ——
+「成套引入两套样式体系」这件事的真实代价不是「两种手感」,而是组件库自带的那套 CSS 变量会变成
+第二个配色权威(表现永远是「只有暗色是对的」)。前端样式自此只有 `web/src/styles/` 三份文件。
 `index.html` 里也没有内联主题脚本:那会把「读 localStorage 决定属性」复制成两处,而 w2b 之后组件也要
 读同一份状态 —— 一个键两个读者就是两个权威。
+
+## 12.6 页面与数据层(w2b)
+
+w2b 交的是 §4 剩下的那一半:路由、服务端状态、表格、SSE 封装、`/login`、authed 壳、`landingHtml` 退役。
+四条页面路由(`/`、`/tasks/$taskId`、`/approvals`、`/audit`)的内容**归 w3–w6**,这一棒只到
+「能导航过去、能过 guard、能声明自己还没实现」为止。
+
+| 面 | 事实 | 钉它的地方 |
+|---|---|---|
+| 路由 | @tanstack/react-router **代码式**路由(无文件路由插件、无 `routeTree.gen`):5 条页面路由 + 一条无 path 的 `/_auth` 布局;`Register` 登记之后 `Link to` 与 `useParams({from})` 全部编译期校验(写错路径 → `npm run typecheck` 红,清单在 `test/web-frontend-contract.test.ts`) | 同上 |
+| guard | `beforeLoad` 全站**只有一处**,判据是 `lib/auth.ts` 的 `probeSession`;走 `queryClient.ensureQueryData`,与壳上的会话状态位共用同一次请求 | 同上 + `test/web-data-layer.test.ts` |
+| 服务端状态 | Query v5;`queryClient` 与 `router` 各一个模块级单例,同一个实例经 **router context**(loader/guard)与 **Provider**(组件)两条路交付 | `test/web-frontend-contract.test.ts`(构造点恰好一处) |
+| 运行时校验 | zod 管两处:API 响应与 search 参数。`validateSearch` **不抛** —— 它在每次导航上被调,抛出等于把一个打错的链接变成白屏 | `test/web-data-layer.test.ts` |
+| 表格 | react-table **v8** headless:逻辑在实例里(页面自己 `useReactTable`),`components/DataTable.tsx` 只画 markup;没有页码器(§5 定的是游标「加载更多」) | 同上(反向钉子:markup 层不许出现 state→色的映射) |
+| SSE | 原生 `EventSource` + 纯协议层;停滞用 `Date.now()` 差值;**不进 Query 缓存**(增量流不是快照) | `test/web-stream-protocol.test.ts` |
+| 样式 | 一套体系(§12.5 那三份文件);**不引 Tailwind、不引 shadcn/ui**;radix 原语随用随加 | `test/web-build-base.test.ts`(依赖面的反向钉子)+ `test/web-theme-tokens.test.ts`(源文件硬名单) |
+| 退役 | `landingHtml` 定义与装配点整体删除,不留兼容层 | `test/api-prefix.test.ts`、`test/assets-routing.test.ts`、`test/web-frontend-contract.test.ts` |
+
+**为什么判定全部住在 `web/src/lib/*.ts` 而不是组件里**:本仓测试跑在 Workers 运行时里(没有 DOM,
+不引 jsdom)。「只有 401 才跳登录」「`?next=` 只认站内形状」「四种 API 失败共用一句登录错误文案」
+「坏帧只计数不断流」这四条都是**判据**;判据放进组件就只能靠肉眼验收,放进纯模块才有 65 条真用例。
+组件层剩下的接线(`Link` 跳转、表单 `onChange`)由源码形状钉子覆盖,再往下就是浏览器实测。
+
+**三个判据的来由,各自都不显然**:
+
+1. **`ApiFailure` 有 `shape` 这一支,而且它绝不能被当成未登录**。§7 的头号风险是 `run_worker_first`
+   漏列 `/api/*` → API 拿到 **200 + index.html**。那一刻「按 401 处理」与「按形状处理」分岔出的
+   现场是「反复被踢回登录页」对「一句说不清的错误」—— 前者会把一条配置问题追成会话问题。
+   `test/web-data-layer.test.ts` 直接喂一份 HTML 给客户端,钉的就是这一支。
+2. **登录失败四种 kind 一句文案**(§5「不泄露探测面」):`/login` 是门前唯一的端点,没有鉴权也没有
+   速率限制兜着,每多一个分支就多一个可白嫖的 oracle。空 token 是唯一例外 —— 它压根没发请求,
+   把它说成「登录失败」是在替服务端背锅。
+3. **`?next=` 用白名单而不是黑名单**:站内路径清单是**数据**(`INTERNAL_NEXT_PATTERNS`),
+   `//evil.example/`(协议相对)与 `javascript:` 都在测试里逐条被拒。黑名单漏一条就是
+   「操作员登录后的第一眼给钓鱼背书」。
+
+**副本一致性(这个前端最容易烂的地方)**:停滞两档阈值、kind 名单、任务状态集、SSE event 名、
+截断长度在前端各有一份副本 —— 不 import `src/` 是不想把整条摄取链拖进 bundle。代价与防线都在
+`test/web-stream-protocol.test.ts` 的 A 组:它从 worker 侧 import 那五份权威逐值比对,所以
+「改了后端忘了前端」在这里红,而不是在 prod 的红绿徽章上被人看出来。
+
+**需浏览器实测(单测钉不住,§7 的 qwen 视觉边界纪律)**:① 未登录访问 `/approvals` → 落
+`/login?next=/approvals`,登录后**直接回到** Approvals;② 会话过期后连 `/api/tasks/:id/events/stream`
+得 401 → 连接位显示「不会自动重连」而不是「正在自动重连」;③ 两套主题下 `/login` 的输入框、
+错误提示、Approvals 的 warn 角标都可读(重点是浅色面的描边对比度);④ 顶导航三格的 active 态
+只在当前页,`/live/:taskId` 与 SPA 并存不互相抢路径。四项都由部署后操作员冒烟复查。
 
 ---
 

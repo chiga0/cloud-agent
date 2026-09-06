@@ -22,8 +22,12 @@
   "dependencies": {
     "@cloudflare/containers": "^0.3.7",
     "@cloudflare/sandbox": "^0.8.14",
+    "@tanstack/react-query": "^5.102.8",
+    "@tanstack/react-router": "^1.170.32",
+    "@tanstack/react-table": "^8.21.3",
     "react": "^19.2.8",
-    "react-dom": "^19.2.8"
+    "react-dom": "^19.2.8",
+    "zod": "^4.5.4"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.22.0",

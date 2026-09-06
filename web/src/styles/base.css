@@ -1,11 +1,19 @@
 /**
  * 基座工具类:把设计 token 变成可直接挂上去的 class,组件里不出现任何字面色值/尺寸。
- * 全部加 `ca-` 前缀(w2b 会引 Tailwind + shadcn/ui,无前缀的 `.row`/`.badge` 这类
- * 通用名迟早与工具类撞名,撞了就是「样式随机失效」)。
+ * 全部加 `ca-` 前缀:无前缀的 `.row`/`.badge`/`.btn` 这类通用名,迟早与任何第三方组件的
+ * 产物撞名(radix 原语、w3+ 临时引入的东西都算),撞了就是「样式随机失效」。
  *
- * 这里只交**色彩/尺寸的形状**,不交业务映射:state→色、kind→徽章的对应关系
- * (DONE=ok、RUNNING=run、停滞>90s=warn、>300s=err;c9b 已验收的 kind 全集)由 w2b 的
- * 数据层产出 class 名,因为它依赖后端权威(src/supervisor/detect.ts 的阈值、状态机)。
+ * w2b 的定夺(派单规格,用户签字):**不引 Tailwind、不引 shadcn/ui**。本文件与 theme.css、
+ * scale.css 就是唯一的一套样式体系 —— 组件库自带的一套 CSS 变量(`--background`/`--primary`
+ * 那类)会立刻造成「第二个配色权威」,而那正是 §7 设计语言与 test/web-theme-tokens.test.ts
+ * 花最大力气排除的东西:两套变量漂移的表现永远是「只有暗色是对的」。
+ * 需要 radix 的行为(弹层焦点管理、菜单键盘导航)时按「随用随加」引它的**运行时原语**,
+ * 样式仍然只挂这里的 class。
+ *
+ * 这里只交**色彩/尺寸的形状**,不交业务映射:state→色、kind→徽章、停滞三色的对应关系
+ * 全部在 web/src/lib/view.ts 与 lib/stream-protocol.ts 产出 class 名 —— 它们依赖后端权威
+ * (状态机的取值集、src/supervisor/detect.ts 的阈值),而那两个数字不在这里复述:
+ * 一份数字两处抄写正是 c10b 之前那条错误前提被复制两遍的成因(§9.8)。
  */
 
 *,
@@ -211,6 +219,12 @@ code {
   color: var(--ok-on);
 }
 
+/* raw 是「认不出的也留下」那一类:虚线 = 内容存疑(点线已被 heartbeat 占去,含义不同) */
+.ca-kind--raw {
+  border-style: dashed;
+  color: var(--fg-muted);
+}
+
 /* ── 表格 ─────────────────────────────────────────────────────────────── */
 
 .ca-table {
@@ -231,6 +245,22 @@ code {
   background: var(--surface-2);
   color: var(--fg-muted);
   font-weight: normal;
+}
+
+/* 表头里的排序按钮:看起来是表头,点下去是按钮。
+   背景与边框清零是为了让 th 的 --surface-2 底不被按钮的缺省样式打断;
+   保留 UA 的焦点环(不写 outline: none)—— 键盘操作者需要看得见焦点。 */
+.ca-sort-btn {
+  background: none;
+  border: 0;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  padding: 0;
+}
+
+.ca-sort-btn:hover {
+  color: var(--fg);
 }
 
 /* ── 按钮 ─────────────────────────────────────────────────────────────── */
@@ -254,6 +284,98 @@ code {
   background: var(--primary-bg);
   border-color: var(--primary-border);
   color: var(--primary-fg);
+}
+
+/* 禁用态:只降不透明度,不换成 err 色 —— 「现在不能点」不是「点下去会错」。
+   cursor 从 pointer 退回 default,否则鼠标形状在承诺一个不会发生的动作。 */
+.ca-btn:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+
+.ca-btn:disabled:hover {
+  border-color: var(--border);
+}
+
+/* ── 顶导航(authed 壳)────────────────────────────────────────────────── */
+
+.ca-nav {
+  align-items: center;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+  padding-bottom: var(--space-2);
+}
+
+.ca-nav-link {
+  border-radius: var(--radius-base);
+  color: var(--fg-muted);
+  padding: var(--space-1) var(--space-3);
+}
+
+.ca-nav-link:hover {
+  background: var(--surface-2);
+  color: var(--fg);
+  text-decoration: none;
+}
+
+/* 当前页:次级面 + 正文字色。刻意不用 err/run/warn 之类的状态色 —— 导航项没有状态含义,
+   给它上状态色就是在教人把「你在这儿」读成「这儿出事了」。 */
+.ca-nav-link--active {
+  background: var(--surface-2);
+  color: var(--fg);
+}
+
+/* ── 表单(/login)────────────────────────────────────────────────────── */
+
+.ca-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.ca-label {
+  color: var(--fg-muted);
+  font-size: var(--text-xs);
+}
+
+/* 控件的底色/描边一律走 surface-2 + border:与 .ca-btn 同一条配方,
+   这样按钮与输入框在同一行里看起来是一对,而不是两个体系的东西。 */
+.ca-input {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-base);
+  color: var(--fg);
+  font-family: inherit;
+  font-size: var(--text-sm);
+  padding: var(--space-2) var(--space-3);
+  width: 100%;
+}
+
+.ca-input:focus {
+  border-color: var(--border-strong);
+}
+
+.ca-input--error {
+  border-color: var(--err-border);
+}
+
+/* 错误提示用 err 字色(不用 err 三件套:那是一块红底,会把「一句提示」渲染成「一个状态」)。 */
+.ca-error-text {
+  color: var(--err-fg);
+}
+
+/* ── 页面骨架(w2b 起 authed 壳内的通用尺寸)──────────────────────────── */
+
+/* 表格页需要比 960px 的落地宽度更宽;单独一个修饰类,免得每个页面自带 max-width 字面值。 */
+.ca-shell--wide {
+  max-width: 1280px;
+}
+
+/* 页面级留白(比 .ca-stack 高一档):卡片与卡片之间要能看出是分块,不是列表项。 */
+.ca-stack--loose {
+  gap: var(--space-6);
 }
 
 /* ── err 方向的闪烁 ───────────────────────────────────────────────────── */

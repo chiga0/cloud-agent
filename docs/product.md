@@ -74,7 +74,7 @@ GET  /admin/{tasks,attempts,events,chain-check}      → GET /api/admin/…
 | **路由** | **@tanstack/react-router**（代码式路由，不引文件路由插件） | 类型安全 params/search、loader 与 Query 集成；用户定夺由 react-router 改此栈 |
 | 服务端状态 | **@tanstack/react-query** v5 | router context 携 queryClient，loader `ensureQueryData` 预取 |
 | **表格** | **@tanstack/react-table** v8 | headless（排序/过滤/分页逻辑），markup 用设计 token 自绘 |
-| 样式 | Tailwind CSS v4（@tailwindcss/vite 官方插件）+ shadcn/ui | 组件源码进仓；radix 运行时原语随用随加，不预装全家桶 |
+| 样式 | **设计 token CSS 变量**（`web/src/styles/` 三份文件；w2b 定夺：**不引 Tailwind、不引 shadcn/ui**，见下方注记） | 组件只认变量名、禁字面色值；radix 运行时原语随用随加，不预装全家桶 |
 | SSE | 原生 EventSource + hook 封装 | 事件流是增量流不是快照，**不走 Query 缓存**；停滞计时用 `Date.now()` 差值（抗 hidden-tab 节流，c9b 实测） |
 | 校验 | zod | search 参数校验 + API 响应运行时校验 |
 
@@ -85,7 +85,19 @@ GET  /admin/{tasks,attempts,events,chain-check}      → GET /api/admin/…
   `run_worker_first: ["/api/*", "/live", "/live/*", "/healthz"]`（漏列 = API 被 SPA 吞掉返回 HTML，w2 冒烟必测）。
 - `verify_command` 自 w2 起扩为 `npm run typecheck && npm test && npm run build`。
 - 交付：工程骨架绿 + `/login` 页（第一个路由）+ authed 布局壳（`beforeLoad` guard：`/api/session/me` 401 → 重定向）。
-- 旧 `/` 落地页（landingHtml）在 w2 退役。
+  实际拆成两棒：**w2a** = Vite+React+TS strict+双主题 token+assets 绑定+`run_worker_first`+verify 三连+首页壳；
+  **w2b** = TanStack 路由/Query/Table 与 zod 接线、`/login` 页、authed 布局壳（顶导航 + Approvals 计数角标 +
+  会话状态位）、EventSource hook、`landingHtml` 退役。四条页面路由的**内容**仍归 w3–w6（范围栅栏）。
+- **w2b 注记（2026-09-06，取代上表「样式」行的原选型）**：不引 Tailwind v4、不引 shadcn/ui。理由：组件库
+  自带一套 CSS 变量（`--background`/`--primary` 那类）会立刻成为**第二个配色权威**，与签字 token 并行；
+  两套变量漂移的表现永远是「只有暗色是对的」。签字 token 变量不得被任何组件库或生成物改写，也不许另起
+  一套变量体系。防线：`test/web-build-base.test.ts`（依赖面的反向钉子：tailwind/shadcn/radix/文件路由插件
+  一律不许出现）与 `test/web-theme-tokens.test.ts`（源文件硬名单、class 全集比对、禁第二套 CSS 变量）。
+  需要 radix 的行为（弹层焦点管理、菜单键盘导航）时按「随用随加」引运行时原语，样式仍挂 `ca-` 工具类。
+- 旧 `/` 落地页（landingHtml）在 w2 退役。**已于 w2b 落地**：定义与装配点整体删除，不留兼容层。
+  它原先兼任「端点目录」，退役后 README 是唯一载体 —— 原先「落地页 ↔ README ↔ 实际返回」三方对表的
+  用例收成两方对表，断言的短语一条不减（`test/admin-tasks.test.ts`、`test/admin-attempts.test.ts`、
+  `test/admin-events.test.ts`、`test/obs-events-api.test.ts`）。工程事实见 docs/architecture.md §12.6。
 
 ## 5. 页面清单与信息架构
 

@@ -5,6 +5,7 @@ import { TaskSession } from "../src/control/session";
 import { ingestTranscript, type ObsTranscriptReader } from "../src/obs/ingest";
 import { OBS_EVENT_KINDS, OBS_SECRET_MASK, type AgentEventV1 } from "../src/obs/events";
 import { applyMigrations } from "./d1";
+import readme from "../README.md?raw";
 
 /**
  * GET /api/tasks/:id/events —— 在途事件流的读端点。
@@ -290,14 +291,14 @@ describe("GET /api/tasks/:id/events", () => {
     expect(body.events.map((e) => e.attempt_id)).toEqual([attemptIds[1], attemptIds[1]]);
   });
 
-  it("落地页登记该端点,并如实说明它读 R2、RUNNING 即可用", async () => {
-    const html = await (await request("/")).text();
-    expect(html).toContain("<dt>GET /api/tasks/:id/events</dt>");
-    expect(html).toContain("不经 D1 终态归档");
-    expect(html).toContain("新事件停止而进程 alive");
-    // 悬挂的两种形状(心跳=runner 时间源 / 转录=模型时间源)是页面必须说实话的地方
-    expect(html).toContain("连心跳都停");
-    // kind 词表由权威枚举派生而非页面写死:枚举变了页面跟不上就该红
-    expect(html).toContain(OBS_EVENT_KINDS.join("/"));
+  it("README 登记该端点,并如实说明它读 R2、RUNNING 即可用", () => {
+    // w2b 退役落地页:端点描述只剩 README 一份,所以「文档与实现漂移」只剩这一个对表点。
+    expect(readme).toContain("`GET /api/tasks/:id/events`");
+    expect(readme).toContain("不经 D1 终态归档");
+    expect(readme).toContain("新事件停止而进程 alive");
+    // 悬挂的两种形状(心跳=runner 时间源 / 转录=模型时间源)是文档必须说实话的地方
+    expect(readme).toContain("连心跳都停");
+    // kind 词表由权威枚举派生而非文档写死:枚举变了文档跟不上就该红
+    expect(readme).toContain(OBS_EVENT_KINDS.join("/"));
   });
 });

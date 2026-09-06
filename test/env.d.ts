@@ -20,6 +20,9 @@ declare global {
    * Workers 运行时没有 fs,而 `.css` 的 ?raw 在 worker 测试池里是空串,只能在配置里读。
    */
   const __WEB_STYLE_SOURCES__: Record<string, string>;
+
+  /** vitest.config.ts 内联的 web/src 源文件路径清单(样式契约的「名单不许漏文件」钉子用)。 */
+  const __WEB_SOURCE_PATHS__: string[];
 }
 
 export {};

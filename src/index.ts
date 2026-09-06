@@ -19,7 +19,7 @@ import { sha256Hex } from "./audit/evidence";
 import { assembleCandidate, candidateFileName } from "./audit/candidate";
 import { assembleRescueView } from "./audit/rescue";
 import { isValidSha } from "./exec/base";
-import { OBS_EVENT_KINDS, type AgentEventV1 } from "./obs/events";
+import type { AgentEventV1 } from "./obs/events";
 import { readObsAttemptEvents } from "./obs/journal";
 import {
   OBS_SSE_TAIL_INTERVAL_MS,
@@ -55,78 +55,6 @@ function invalidOrigin(): Response {
     },
     { status: 403 },
   );
-}
-
-function landingHtml(env: Env): string {
-  const model = env.DEFAULT_MODEL ?? "unknown";
-  const envName = env.ENVIRONMENT ?? "unknown";
-  const base = env.PUBLIC_URL ?? "";
-  return `<!DOCTYPE html>
-<html lang="zh">
-<head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>cloud-agent</title>
-<style>
-  body { font-family: -apple-system, "SF Mono", Menlo, monospace; background:#0b0f14; color:#e6edf3; margin:0; padding:48px 24px; }
-  main { max-width:720px; margin:0 auto; }
-  h1 { font-size:22px; margin:0 0 8px; }
-  .sub { color:#8b949e; margin-bottom:32px; }
-  .card { background:#161b22; border:1px solid #30363d; border-radius:10px; padding:20px; margin-bottom:16px; }
-  .k { color:#7ee787; }
-  .v { color:#e6edf3; }
-  a { color:#58a6ff; text-decoration:none; }
-  a:hover { text-decoration:underline; }
-  code { background:#21262d; padding:2px 6px; border-radius:4px; font-size:13px; }
-  .endpoints dt { font-family:monospace; color:#d2a8ff; margin-top:12px; }
-  .endpoints dd { margin-left:16px; color:#c9d1d9; }
-</style>
-</head>
-<body>
-<main>
-  <h1>cloud-agent</h1>
-  <div class="sub">Coding agent on Cloudflare Workers · TaskSession DO authority · Durable Workflows · R2 evidence</div>
-
-  <div class="card">
-    <div><span class="k">environment:</span> <span class="v">${envName}</span></div>
-    <div><span class="k">default_model:</span> <span class="v">${model}</span></div>
-    <div><span class="k">base_url:</span> <span class="v">${base}</span></div>
-    <div><span class="k">healthz:</span> <a href="/healthz">/healthz</a></div>
-  </div>
-
-  <div class="card endpoints">
-    <strong>API</strong>
-    <dl>
-      <dt>GET /healthz</dt><dd>公开,返回 <code>{"ok":true}</code></dd>
-      <dt>POST /api/tasks</dt><dd>创建任务(需要 <code>Authorization: Bearer WORKER_API_TOKEN</code>)。<code>budget.max_wall_seconds</code> 必须是 <strong>JSON 正整数</strong>(秒):负数 / 0 / 小数 / 字符串 / 非有限值 → <code>400 invalid_budget</code> 且不建任务;不给则取 <code>DEFAULT_MAX_WALL_SECONDS</code>。注意这是<strong>用户契约</strong>而非 writer 能力:平台安全上限可能把实际墙钟夹钳到更少分钟数,夹钳会往权威链落一条 <code>budget.clamped</code> 事件(<code>requested_seconds</code> / <code>writer_wall_minutes</code> / <code>ceiling_minutes</code> / <code>clamp_reason</code>),DO 的超时兜底仍按请求预算排 —— 口径见 <code>src/control/budget.ts</code> 与 <code>docs/architecture.md</code> §7.2.2</dd>
-      <dt>GET /api/tasks/:id</dt><dd>查询任务、attempts 与事件链(需鉴权)</dd>
-      <dt>GET /api/tasks/:id/result</dt><dd>读取 agent 最终答案(纯文本,需鉴权)</dd>
-      <dt>POST /api/tasks/:id/approve</dt><dd>审批,只收 <code>approve</code> / <code>reject</code>(必须带 attempt_id + evidence_digest,需鉴权;<code>accept_with_notes</code> 是控制面内部降级决策,不由外部提交)</dd>
-      <dt>GET /api/tasks/:id/evidence</dt><dd>钉住的候选 manifest + approve 所需 attempt_id / binding_digest(需鉴权)</dd>
-      <dt>GET /api/tasks/:id/candidate</dt><dd>候选交付视图:基线 commit、patch 引用、判定标签与诚实性告警(需鉴权)。被预算击杀的差量在此自报:<code>patch_complete=false</code> + <code>patch_incomplete_reason</code>(如 <code>budget_abort(exit=55)</code>),此时 <code>safe_to_apply</code> 恒 <code>false</code></dd>
-      <dt>GET /api/tasks/:id/candidate?format=patch</dt><dd>下载补丁正文(<code>curl -o candidate.patch</code> 后本地 <code>git apply</code>);下发前重算 sha256,状态在 <code>x-candidate-status</code> / <code>x-safe-to-apply</code> / <code>x-patch-complete</code> 头里</dd>
-      <dt>GET /api/tasks/:id/rescue</dt><dd><strong>BLOCKED 专用的抢救读面</strong>(需鉴权):被预算击杀的 writer 那一轮的差量视图。失败轮次按 M7 门禁从不钉入 <code>current_evidence</code>,所以它在 <code>/candidate</code> 上恒 404 —— 本端点读的是该 attempt 自己回报的 manifest。字段与 <code>/candidate</code> 同形,另加 <code>rescued: true</code> / <code>pinned: false</code>,且 <code>binding_digest</code> 恒 <code>null</code>、<code>safe_to_apply</code> 恒 <code>false</code>:它只是人接续工作的起点,不进任何审批口径。非 BLOCKED → 404 <code>not_blocked</code>;BLOCKED 但执行面未回报证据 → 404 <code>no_rescue_yet</code></dd>
-      <dt>GET /api/tasks/:id/rescue?format=patch</dt><dd>下载抢救差量正文(同样逐字节重算 sha256,不一致 → 500 <code>integrity_error</code>);响应头额外带 <code>x-rescued: true</code> / <code>x-pinned: false</code>,只看头也不会把它当成可提交成品</dd>
-      <dt>GET /api/tasks/:id/events</dt><dd>在途事件流(需鉴权):读 Observation 层的 R2 段文件 journal,<strong>不经 D1 终态归档</strong>,因此任务 <code>RUNNING</code> 期间就有内容 —— 这是它相对 <code>/api/admin/events</code>(只读已归档的 hash chain)的核心增量。数据来自 poll 相的 transcript 增量摄取,每轮另落一条 <code>kind=heartbeat</code> 心跳(runner 自己的时间源):模型悬挂表现为 <strong>「新事件停止而进程 alive」</strong>,而它有两种形状 —— <strong>连心跳都停 = runner 停了(红线);心跳在而转录静 = 模型沉默(只黄线)</strong>,两个阈值的推导与实测来源见 <code>docs/architecture.md</code> §9.8(权威常量在 <code>src/supervisor/detect.ts</code>)。按 attempt 创建序、attempt 内按 <code>generation</code> 与 <code>seq</code> 升序返回 <code>{"task_id",state,"events":[AgentEventV1],"count",total,"next_cursor","unreadable_attempts"}</code>;信封为 <code>{v:1,task_id,attempt_id,generation,seq,ts,kind,payload}</code>,<code>kind</code> ∈ ${OBS_EVENT_KINDS.join("/")}(认不出的行不丢)。payload 已在 ingress 过白名单:只留类型/工具名/token 用量/时长/退出码等枚举字段,自由文本 ≤2048 字符并对平台注入的凭据值精确打码。分页:<code>?after=</code>(扁平有序流上已读的条数,默认 0)、<code>?limit=</code>(默认 500,上限 2000,非数字或越界 → 400);<code>next_cursor</code> 无后续时为 <code>null</code>。任务不存在 → 404;从未摄取过事件 → 空列表而不是 404</dd>
-      <dt>GET /api/tasks/:id/attempts/:aid/transcript</dt><dd>attempt 的 transcript 原文(verifier 为 JSON 验证报告,需鉴权)</dd>
-      <dt>GET /api/admin/chain-check</dt><dd>校验归档事件 hash chain(需鉴权)。<strong>两种模式</strong>:不带参数 = 全局扫描 D1 <code>events</code> 表,返回 <code>{checked,broken,brokenTasks}</code>,破口标记 <code>&lt;task_id&gt;:&lt;seq&gt;:&lt;kind&gt;</code>,kind ∈ <code>prev</code>/<code>digest</code>(内容被改)、<code>seq</code>(序号不严格递增/重号)、<code>state</code>(状态行已是终态而链尾转换不是)。⚠ 全局模式<strong>看不见未归档的任务</strong>(events 只在归档成功时写)。带 <code>?task_id=</code>(36 字符 UUID,畸形 → 400)= <strong>DO↔D1 对账模式</strong>:同时读 DO 链与 D1 行,返回 <code>{mode:"reconcile",result,do_events,d1_events,do_tail_digest,d1_tail_digest,broken,brokenTasks}</code>,<code>result</code> 三态 = <code>consistent</code> / <code>not_archived</code>(DO 有链而 D1 零行)/ <code>diverged</code>(行数或尾 digest 不等);DO 无该任务记录 → 404 <code>task_not_found</code>。对账模式的 <code>broken</code>/<code>brokenTasks</code> 覆盖<strong>两侧</strong>:D1 链的四类破口,加上对 <strong>DO 全量事件</strong>的重号扫描(复用同一种 <code>seq</code> 标记)—— 未归档的任务在 D1 里零行,只查 D1 等于替它宣布「损伤不存在」。判据边界与运维含义见 <code>docs/architecture.md</code> §6.2</dd>
-      <dt>GET /api/admin/tasks</dt><dd>归档任务列表(需鉴权):<strong>只读</strong>投影,数据源仅为 D1 归档的 <code>tasks</code> 表 —— 任务到终态才归档,因此<strong>不含仍在 DO 中运行、尚未归档的任务</strong>(实时状态看 <code>GET /api/tasks/:id</code>)。按 <code>updated_at</code> 降序返回 <code>{"tasks":[{id,state,created_at,updated_at,version}],"count":N}</code>;可选 <code>?state=</code> 精确过滤(合法取值见状态机,非法 → 400)、可选 <code>?limit=</code>(默认 50,上限 200,非数字或越界 → 400)</dd>
-      <dt>GET /api/admin/events</dt><dd>归档事件流(需鉴权):按任务回放审计事件的 hash chain。<strong>只读</strong>投影,数据源仅为 D1 归档的 <code>events</code> 表 —— 事件随任务终态才归档,因此<strong>只含已归档(终态)任务的事件</strong>,<strong>看不到仍在 DO 中运行、尚未归档的在途事件</strong>(实时状态看 <code>GET /api/tasks/:id</code>)。<code>?task_id=</code>(36 字符 UUID)<strong>必填</strong>:每 task 的 <code>seq</code> 才是分页脊线,跨 task 分页无意义;缺失或畸形 → 400。按 <code>seq</code> 升序(审计回放顺序)返回 <code>{"events":[{seq,kind,digest,prev_digest,created_at,canonical}],"next_cursor":&lt;string|null&gt;}</code>。<code>canonical</code> 是 D1 <code>payload</code> 列<strong>逐字原文</strong>(即 <code>JSON.stringify({task_id,kind,payload})</code>,正是被 hash 的那个串),不解析、不重新序列化 —— 客户端因此能独立重算 <code>digest == sha256Hex((prev_digest ?? "GENESIS") + canonical)</code> 并逐条核对 <code>prev_digest</code>,即在本地重放一遍 <code>/api/admin/chain-check</code>。安全:审计 journal 按构造<strong>绝不携带</strong>一次性模型代理凭据 <code>proxy_token</code>(它只存在于 <code>attempts</code> 表,从不进事件链)。游标分页:<code>?limit=</code>(默认 50,上限 200,非数字或越界 → 400)、<code>?cursor=</code>(不透明游标,首页省略;畸形 → 400),<code>next_cursor</code> 为下一页起点、无后续时为 <code>null</code>;过滤不命中返回空列表而不是 404</dd>
-      <dt>GET /api/admin/attempts</dt><dd>归档 attempt 列表(需鉴权):按任务复盘各 attempt(writer / verifier / reviewer)的终态与 token 消耗。<strong>只读</strong>投影,数据源仅为 D1 归档的 <code>attempts</code> 表 —— attempt 随任务终态才归档,因此<strong>不含尚未归档的在途 attempt</strong>(实时状态看 <code>GET /api/tasks/:id</code>)。按 <code>created_at</code> 降序返回 <code>{"attempts":[{id,task_id,role,state,tokens_used,input_tokens,cache_read_tokens,output_tokens,cost_weighted_tokens,max_model_tokens,max_wall_seconds,workflow_instance_id,created_at,finished_at}],"count":N}</code>(<code>count</code> 是本次返回条数,受 limit 截断)。口径:<code>tokens_used</code> 是 raw total(历史可比,<strong>不是成本</strong> —— r11 实测其 96.9% 是最便宜的隐式缓存命中);四元组拆分与 <code>cost_weighted_tokens</code>(缓存命中按 <code>CACHE_READ_COST_FACTOR</code> 折扣加权)才是成本口径,今后看成本看后者。四列与 <code>cost_weighted_tokens</code> 为 <code>null</code> 表示该记录产生时未记过拆分口径(M8 前的历史行),<strong>不等于消耗为 0</strong>。安全投影:<code>proxy_token</code>(一次性模型代理凭据)<strong>绝不下发</strong>,内部去重用的 <code>idempotency_key</code> 同样不进投影。可选过滤器按 AND 组合:<code>?task_id=</code>(36 字符 UUID,畸形 → 400)、<code>?role=</code>(writer/reviewer/verifier)、<code>?state=</code>(RUNNING/SUCCEEDED/FAILED/BLOCKED;合法取值来自权威声明,非法 → 400,不命中返回空列表)、<code>?limit=</code>(默认 50,上限 200,非数字或越界 → 400)</dd>
-    </dl>
-  </div>
-
-  <div class="card">
-    <strong>CLI 示例</strong>
-    <pre style="overflow:auto"><code>curl -X POST ${base}/api/tasks \\
-  -H "Authorization: Bearer $WORKER_API_TOKEN" \\
-  -H "Content-Type: application/json" \\
-  -d '{"spec":{"prompt":"在 /workspace 写一个 hello.py 并运行","acceptance":["存在 hello.py","运行输出 hello"]}}'</code></pre>
-    <div class="sub" style="margin:12px 0 0">acceptance 决定 reviewer 的否决权:没有验收标准时,它的 reject 只作为附注留档。</div>
-  </div>
-</main>
-</body>
-</html>`;
 }
 
 /** 凭据种类:`bearer` = API 客户端/land.mjs,`cookie` = 浏览器会话。null = 未鉴权。 */
@@ -1282,12 +1210,6 @@ export default {
 
     if (url.pathname === "/healthz") return Response.json({ ok: true, env: env.ENVIRONMENT });
 
-    if (url.pathname === "/" && req.method === "GET") {
-      return new Response(landingHtml(env), {
-        headers: { "content-type": "text/html; charset=utf-8" },
-      });
-    }
-
     // 登录端点在鉴权门**之前**:它是唯一一条「无凭据也要答」的 API(拿凭据换凭据)。
     // 仍然挂 /api/* 之下 —— 前缀分区对它的约束与其余端点一模一样,漏挂就会被 w2 的
     // SPA fallback 静默吞成 index.html,防线同 test/api-prefix.test.ts 的分发清单。
@@ -1302,8 +1224,9 @@ export default {
       return handleSessionLogout();
     }
 
-    // 鉴权门位置保持不变:在 /healthz、GET /、门前那两条会话分支(login/logout)之后,
-    // 一切 /api/* 与 /live 之前。
+    // 鉴权门位置保持不变:在 /healthz、门前那两条会话分支(login/logout)之后,
+    // 一切 /api/* 与 /live 之前。`GET /` 不在这一列里:w2b 起 worker 不再答任何页面路径,
+    // `/` 与其余非 API 路径全部归静态资产与 SPA fallback(§2 分区表、§4「旧落地页退役」)。
     const credential = await checkApiToken(req, env);
     if (!credential) return unauthorized();
 

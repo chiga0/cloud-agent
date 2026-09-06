@@ -4,6 +4,7 @@ import worker from "../src/index";
 import { ATTEMPT_ROLES, type AttemptRole, type TaskState } from "../src/types";
 import { ATTEMPT_STATES, type AttemptState } from "../src/control/session";
 import { applyMigrations } from "./d1";
+import readme from "../README.md?raw";
 
 /**
  * GET /api/admin/attempts —— 归档 attempt 列表的读模型投影。
@@ -491,18 +492,17 @@ describe("GET /api/admin/attempts", () => {
     expect(await snapshot()).toEqual(before);
   });
 
-  it("落地页登记该端点,并如实说明归档视图与凭据不外泄", async () => {
-    const res = await request("/");
-    expect(res.status).toBe(200);
-    const html = await res.text();
-    expect(html).toContain("<dt>GET /api/admin/attempts</dt>");
+  it("README 登记该端点,并如实说明归档视图与凭据不外泄", () => {
+    // w2b 退役落地页(landingHtml),端点描述的唯一载体是 README。
+    // 原断言里的 HTML 标记(<dt>、<code>)换成 README 的 markdown 反引号,内容一条不减。
+    expect(readme).toContain("`GET /api/admin/attempts`");
     // 漏掉这句,读者就会把复盘视图当实时看板
-    expect(html).toContain("不含尚未归档的在途 attempt");
-    expect(html).toContain("数据源仅为 D1 归档的 <code>attempts</code> 表");
+    expect(readme).toContain("不含尚未归档的在途 attempt");
+    expect(readme).toContain("数据源仅为 D1 归档的 `attempts` 表");
     // 诚实性:文档里点名 proxy_token 不下发,且枚举的合法取值与权威声明一致
-    expect(html).toContain("proxy_token");
-    expect(html).toContain("绝不下发");
-    expect(html).toContain(ATTEMPT_ROLES.join("/"));
-    expect(html).toContain(ATTEMPT_STATES.join("/"));
+    expect(readme).toContain("proxy_token");
+    expect(readme).toContain("绝不下发");
+    expect(readme).toContain(ATTEMPT_ROLES.join("/"));
+    expect(readme).toContain(ATTEMPT_STATES.join("/"));
   });
 });

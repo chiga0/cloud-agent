@@ -95,13 +95,43 @@ curl -s localhost:8787/api/tasks/<task_id> -H "authorization: Bearer $TOKEN" \
 wrangler r2 object get "cloud-agent-evidence/<manifest_key>"   # 内含 patch.key + patch_complete + patch_incomplete_reason
 wrangler r2 object get "cloud-agent-artifacts/<patch.key>" --file ./aborted.diff   # 人工接续的起点,不是成品
 
-curl -N localhost:8787/api/tasks/<task_id>/events/stream -H "authorization: Bearer $TOKEN"   # GET /api/tasks/:id/events/stream:SSE 在途事件流(第④层可观测的投影,**非权威**,不写任何状态)—— 帧 id = 该帧之后已读的条数,与 /events 的 `?after=` 完全同口径,断线带 `Last-Event-ID` 续传不重发不漏读;每拍 3s 推增量,任务离开 RUNNING 且增量推完则一帧 `end` 后关流(详见 docs/architecture.md §9.6)
+# 在途事件流 —— `GET /api/tasks/:id/events`(需鉴权):读 Observation 层的 R2 段文件 journal,
+# **不经 D1 终态归档**,因此任务 `RUNNING` 期间就有内容 —— 这是它相对
+# `GET /api/admin/events`(只读已归档的 hash chain)的核心增量。数据来自 poll 相的 transcript
+# 增量摄取,每轮另落一条 `kind=heartbeat` 心跳(runner 自己的时间源):模型悬挂表现为
+# **“新事件停止而进程 alive”**,而它有两种形状 —— **连心跳都停 = runner 停了(红线);
+# 心跳在而转录静 = 模型沉默(只黄线)**;两个阈值的推导与实测来源见 docs/architecture.md §9.8
+# (权威常量在 `src/supervisor/detect.ts`)。按 attempt 创建序、attempt 内按 `generation` 与
+# `seq` 升序返回 `{"task_id",state,"events":[AgentEventV1],"count",total,"next_cursor","unreadable_attempts"}`;
+# 信封为 `{v:1,task_id,attempt_id,generation,seq,ts,kind,payload}`,
+# kind ∈ system/assistant/user/tool_use/tool_result/result/error/raw/heartbeat(认不出的行不丢)。
+# payload 已在 ingress 过白名单:只留类型/工具名/token 用量/时长/退出码等枚举字段,
+# 自由文本 ≤2048 字符并对平台注入的凭据值精确打码。分页:`?after=`(扁平有序流上已读的条数,
+# 缺省 0)、`?limit=`(缺省 500,上限 2000,非数字或越界 → 400);`next_cursor` 无后续时为 `null`。
+# 任务不存在 → 404;从未摄取过事件 → 空列表而不是 404。
+curl -s "localhost:8787/api/tasks/<task_id>/events?limit=200" -H "authorization: Bearer $TOKEN" \
+  | jq '{state, total, next_cursor, unreadable_attempts, events: [.events[-3][] | {seq, kind, ts}]}'
+
+curl -N localhost:8787/api/tasks/<task_id>/events/stream -H "authorization: Bearer $TOKEN"   # GET /api/tasks/:id/events/stream:SSE 在途事件流(第④层可观测的投影,**非权威**,不写任何状态)—— 帧 id = 该帧之后已读的条数,与 /events 的 `?after=` 完全同口径,断线带 `Last-Event-ID` 续传不重发不漏读;每拍 3s 推增量,任务离开 RUNNING 且增量推完则一帧 `end` 后关流(详见 docs/architecture.md §9.6)。w1b 起浏览器可用同源会话 cookie 直连(EventSource 自动携带),前端 SSE 层见 `web/src/lib/`
 
 curl -s "localhost:8787/live/<task_id>" -H "authorization: Bearer $TOKEN" -o live.html && $BROWSER live.html   # GET /live/:taskId:上面那条流的人眼端(第④层下半,docs/architecture.md §9.7)—— 全内联、零外部依赖的单页 HTML,页面自己用 `EventSource` 连 /api/tasks/:id/events/stream。核心价值是**停滞检测**:一条 pill 每秒自增,**两条时间源、三个说法** —— 平时「最后事件 Ns 前」,心跳停止 >180s 转红「心跳停止 Ns(runner 停了)」,模型静默 >900s 转黄「模型静默 Ns(runner 活着)」且**永不转红**(静默区分不了「挂了」与「在干不产字的长活」;心跳 = poll 相每轮无条件写的那条 `kind=heartbeat`,是红线唯一的时间源;两个阈值派生自 §9.8 的那对常量,页面不自带理由)。⚠️ 口径变化:旧文案的「>90s 黄、>300s 红 / 5 分钟内肉眼可判」建立在「新数据每 30s 推进一次」这个已被 prod 证伪的前提上,已作废 —— 新口径下 C2-r6 那种 24 分钟模型悬挂要 15 分钟才亮黄、不会亮红(runner 一直活着)。时间线按到达序渲染 seq/kind 徽章/ts/payload.text 摘要(>200 字符截断标注),`tool_use` 显示 tool_names、`raw` 显示 raw_type,收到 `end` 帧显示「流已结束」并停表;坏帧跳过并计数。**只被动显示:不做任何判定与处置**。判定由 Supervisor 做(第②层 Observation 的独立消费者,docs/architecture.md §9.8):它寄生在既有 watchdog alarm 里每 `SUPERVISOR_TICK_SECONDS`(缺省 60)醒一次,读 journal 判 stall/loop/no_progress 三类启发式(loop/no_progress 的「目标」三级取值:先 `payload.tool_targets`(§9.5 的入参形状摘要:按键白名单 + 打码 + ≤128,与 `tool_names` 下标对齐)→ 再 `payload.text` → 再退化为工具名;⚠️ 攒 shadow 样本时按 `tool_targets` **是否存在分段统计**,混算会把 c10a 之前那批「反复调同一工具 = 反复做同一件事」的误报算进之后判据的可信度里),把结论写成权威链上的 `supervisor_finding` 事件 —— **只记事件,不做任何处置**(不 cancel/kill/BLOCKED/改路由)。启用点是 `wrangler.jsonc` 的 `SUPERVISOR_MODE`(代码缺省 `off`,prod 显式配 `shadow`,先攒样本再谈 enforce)。鉴权与 /api/tasks/:id/events* 同源:无凭据 401、任务不存在 404。⚠️ 已知前提:`EventSource` 不能携带 `Authorization` 头,浏览器直连会得到 401 并显示重连提示 —— 打通需要部署侧注入凭据(§9.7)
 
+# 归档任务列表 —— `GET /api/admin/tasks`(需鉴权):**只读**投影,数据源仅为 D1 归档的
+# `tasks` 表 —— 任务到终态才归档,因此**不含仍在 DO 中运行、尚未归档的任务**
+# (实时状态看 `GET /api/tasks/:id`)。按 `updated_at` 降序返回
+# `{"tasks":[{id,state,created_at,updated_at,version}],"count":N}`;可选 `?state=` 精确过滤
+# (合法取值见状态机,非法 → 400)、可选 `?limit=`(缺省 50,上限 200,非数字或越界 → 400)。
+# 这条投影是前端任务列表(w3)与 Approvals 角标(w2b)的数据源 —— 角标用的就是
+# `?state=AWAITING_APPROVAL`,零后端改动。
+curl -s "localhost:8787/api/admin/tasks?state=DONE&limit=5" -H "authorization: Bearer $TOKEN" \
+  | jq '{count, tasks: [.tasks[] | {id, state, updated_at, version}]}'
+
 # 复盘各 attempt(writer/verifier/reviewer)的终态与 token 消耗 —— `GET /api/admin/attempts`。
-# 它是 D1 归档的**只读视图**(读投影,不是新的状态权威):attempt 随任务终态才归档,
+# 它是 D1 归档的**只读视图**(读投影,不是新的状态权威),数据源仅为 D1 归档的 `attempts` 表:
+# attempt 随任务终态才归档,
 # 因此**不含尚未归档的在途 attempt** —— 在跑的任务仍看 `GET /api/tasks/<task_id>`。
+# 过滤器里两个枚举与权威声明同值(role ∈ writer/reviewer/verifier、
+# state ∈ RUNNING/SUCCEEDED/FAILED/BLOCKED;非法 → 400,不命中 → 空列表而不是 404)。
 # 安全投影:一次性模型代理凭据 `proxy_token` **绝不下发**,内部去重用的
 # `idempotency_key` 同样不进投影;返回字段固定为 id/task_id/role/state/tokens_used/
 # input_tokens/cache_read_tokens/output_tokens/cost_weighted_tokens/max_model_tokens/
@@ -177,10 +207,25 @@ npm run preview:web # 只看构建产物(这条路没有 API 代理)
 
 w2 起的验收线 = `npm run typecheck && npm test && npm run build` 三步全绿(typecheck 双跑两份 tsconfig)。
 
-w2a 交的是**壳**:产品名、一句状态说明、主题切换按钮 —— 部署后 `/` 的真实首页,不是空白页。
-注意 `/` 的归属变了:`src/index.ts` 里 `landingHtml` 那个分支代码原样保留(退役排在 w2b),但 `/`
-现在由资产层应答 `dist/index.html`,不再进 worker,所以冒烟该看到壳;看到旧落地页反而说明 `dist/`
-没构建或没部署上。
+w2a 交的是**壳**(产品名 + 状态说明 + 主题切换);w2b 交的是**页面与数据层**:
+
+- **路由**:`web/src/router.tsx` 用 @tanstack/react-router 的**代码式**路由(不引文件路由插件),
+  站内一共 5 条 —— `/login`、`/`、`/tasks/$taskId`、`/approvals`、`/audit`。后四条挂在一条无 path 的
+  authed 布局路由下,`beforeLoad` guard 读 `GET /api/session/me`,**只有 401** 才跳登录(网络错与
+  「API 被 SPA 兜底吞成 HTML」都不跳,那样只会把人踢进登录死循环)。
+- **数据层**:`web/src/lib/` —— `api.ts`(每次响应过 zod,失败面只有 unauthorized/http/network/shape
+  四种)、`schema.ts`(响应契约 + search 参数契约)、`queries.ts`(Query 工厂:会话与 Approvals 计数)、
+  `auth.ts`(登录/跳转/状态位三条判定)、`view.ts`(state→色调、kind→徽章、截断)、
+  `stream-protocol.ts` + `use-event-stream.ts`(原生 EventSource:停滞用 `Date.now()` 差值、
+  readyState 双文案、坏帧跳过并计数、end 帧停表)。
+- **样式仍只有一套**:`web/src/styles/` 那三份。**不引 Tailwind、不引 shadcn/ui**(§4 表格里那一行
+  已被 w2b 的定夺取代):组件里出现字面色值、另起一套 CSS 变量、或挂了 base.css 里没有的 class,
+  都由 `test/web-theme-tokens.test.ts` 与 `test/web-build-base.test.ts` 判红。radix 原语随用随加。
+- **旧 `/` 落地页(`landingHtml`)已退役**:定义与装配点整体删除,不留兼容层。端点目录现在只有
+  README 这一份载体,原先「落地页 ↔ README ↔ 实际返回」三方对表的用例收成两方,断言短语一条没减。
+
+部署冒烟因此该看到 SPA 的壳(未登录 → `/login`);`curl /` 拿回 HTML 是**资产层**给的,
+worker 自己只会给 401/404 的 JSON。
 
 主题(`web/src/lib/theme.ts`,规则按权威等级排):
 

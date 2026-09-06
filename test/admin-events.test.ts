@@ -283,7 +283,7 @@ function documentedEventFields(doc: string, where: string): string[] {
     .sort();
 }
 
-/** 两处文档都必须如实交代的几件事。 */
+/** README 必须如实交代的几件事(w2b 起它是端点描述的唯一载体)。 */
 const HONESTY_PHRASES = [
   "已归档(终态)任务的事件",
   "看不到仍在 DO 中运行、尚未归档的在途事件",
@@ -707,23 +707,14 @@ describe("GET /api/admin/events", () => {
   });
 
   describe("文档登记", () => {
-    it("落地页登记该端点,字段清单与实际返回一致,描述不粉饰", async () => {
-      const taskId = await seedTask();
-      await seedChain(taskId, manySpecs(2));
-      const live = await getJson<EventsBody>(`?task_id=${taskId}`);
-
-      const html = await (await request("/")).text();
-      expect(html).toContain("<dt>GET /api/admin/events</dt>");
-      expect(documentedEventFields(html, "落地页")).toEqual(PROJECTED_FIELDS);
-      expect(Object.keys(live.body.events[0]).sort()).toEqual(PROJECTED_FIELDS);
-      for (const phrase of HONESTY_PHRASES) {
-        expect(html, `落地页应写明「${phrase}」`).toContain(phrase);
-      }
-      // 漏掉「实时状态另看 /api/tasks/:id」,读者就会把归档视图当实时看板
-      expect(html).toContain("实时状态看 <code>GET /api/tasks/:id</code>");
-    });
-
-    it("README 登记该端点,字段清单与落地页、实际返回三方对齐", async () => {
+    /**
+     * w2b 退役了 worker 内联的落地页(landingHtml),端点描述的唯一载体变成 README。
+     * 于是这个 describe 从「落地页 + README 三方对齐」收成「README ↔ 实际返回两方对齐」——
+     * 少了一个读者,**没有放松任何一条**:字段清单、11 条诚实性短语、必填与默认值全部照钉。
+     * (三方对表的价值本来是「两处文档各自抄写会漂」;现在只剩一处,那条风险由「不许另起
+     * 第二份端点文档」承担 —— 页面侧要展示端点说明,必须读同一份 README/docs,不再抄一遍。)
+     */
+    it("README 登记该端点,字段清单与实际返回一致,描述不粉饰", async () => {
       const taskId = await seedTask();
       await seedChain(taskId, manySpecs(2));
       const live = await getJson<EventsBody>(`?task_id=${taskId}`);
@@ -731,13 +722,12 @@ describe("GET /api/admin/events", () => {
       expect(readme).toContain("GET /api/admin/events");
       expect(readme).toContain("/api/admin/events?task_id=<task_id>");
       expect(documentedEventFields(readme, "README")).toEqual(PROJECTED_FIELDS);
-      expect(documentedEventFields(readme, "README")).toEqual(
-        documentedEventFields(await (await request("/")).text(), "落地页"),
-      );
-      expect(Object.keys(live.body.events[0]).sort()).toEqual(documentedEventFields(readme, "README"));
+      expect(Object.keys(live.body.events[0]).sort()).toEqual(PROJECTED_FIELDS);
       for (const phrase of HONESTY_PHRASES) {
         expect(readme, `README 应写明「${phrase}」`).toContain(phrase);
       }
+      // 漏掉这句,读者就会把归档视图当实时看板
+      expect(readme).toContain("在跑的任务仍看");
       // README 承诺的必填与默认值不能被实现悄悄改掉
       expect(readme).toContain("默认 50,上限 200");
       expect(readme).toContain("不解析、不重新序列化");

@@ -4,6 +4,7 @@ import worker from "../src/index";
 import { TASK_TRANSITIONS } from "../src/control/statemachine";
 import type { TaskState } from "../src/types";
 import { applyMigrations } from "./d1";
+import readme from "../README.md?raw";
 
 /**
  * GET /api/admin/tasks —— 归档任务列表的读模型投影。
@@ -203,12 +204,12 @@ describe("GET /api/admin/tasks", () => {
     expect(await tableSnapshot()).toEqual(before);
   });
 
-  it("落地页登记该端点,并如实说明它只是归档视图", async () => {
-    const res = await request("/");
-    expect(res.status).toBe(200);
-    const html = await res.text();
-    expect(html).toContain("<dt>GET /api/admin/tasks</dt>");
+  it("README 登记该端点,并如实说明它只是归档视图", () => {
+    // w2b 退役落地页之后,README 是端点描述的唯一载体(test/admin-events.test.ts 同一条纪律)。
+    expect(readme).toContain("`GET /api/admin/tasks`");
     // 端点列表里漏掉「不含未归档任务」这句,读者就会把复盘视图当实时看板
-    expect(html).toContain("不含仍在 DO 中运行、尚未归档的任务");
+    expect(readme).toContain("不含仍在 DO 中运行、尚未归档的任务");
+    // 口径:count 与 limit 的截断关系不能被写成「总数」
+    expect(readme).toContain("上限 200");
   });
 });

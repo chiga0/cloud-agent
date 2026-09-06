@@ -164,14 +164,24 @@ describe("/api 前缀契约", () => {
     }
   });
 
-  it("非 API 路由逐字段不变:/healthz 公开、GET / 公开、/live/:id 仍是页面", async () => {
+  it("非 API 路由:/healthz 公开、/live/:id 仍是页面,而 GET / 已不归 worker(w2b 退役落地页)", async () => {
     const health = await request("/healthz", { token: null });
     expect(health.status).toBe(200);
     expect(((await health.json()) as { ok: boolean }).ok).toBe(true);
 
-    const landing = await request("/", { token: null });
-    expect(landing.status).toBe(200);
-    expect(landing.headers.get("content-type")).toContain("text/html");
+    // landingHtml 整体删除(不留兼容层),worker 因此**不再认领** `/`。两种形状都要钉:
+    // - 未鉴权落到全局门 → 401 JSON(旧落地页是 200 + HTML 公开页,这条公开面到此消失:
+    //   现在门前的只有 /healthz 与两条会话端点);
+    // - 带凭权 → 分发到底的 404 not_found,证明 worker 里没有任何一条 `/` 的分支残留。
+    // 运行时 `/` 由静态资产层接管(它不在 run_worker_first 清单里),那半边的证据在
+    // test/assets-routing.test.ts:配置面 + 资产应答面。
+    const anonymous = await request("/", { token: null });
+    expect(anonymous.status, "worker 不再对 `/` 开公开面,只能落鉴权门").toBe(401);
+    expect(((await anonymous.json()) as ErrorBody).error?.type).toBe("unauthorized");
+
+    const authed = await request("/");
+    expect(authed.status, "带凭据也不该命中任何 `/` 分支").toBe(404);
+    expect(((await authed.json()) as ErrorBody).error?.type).toBe("not_found");
 
     const { taskId } = await seedRunningTask();
     const live = await request(`/live/${taskId}`);

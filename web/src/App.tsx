@@ -1,32 +1,30 @@
-import { ThemeToggle } from "./components/ThemeToggle";
+import { QueryClientProvider } from "@tanstack/react-query";
+import { RouterProvider } from "@tanstack/react-router";
+
+import { queryClient } from "./lib/query-client";
+import { createAppRouter } from "./router";
 
 /**
- * 部署后 `/` 的真实首页(w2a 的壳)。**禁止空白**:静态资产一挂上,这里就是用户看到的
- * 第一页,渲染不出东西的故障形状与「后端整站挂了」在浏览器里长得一模一样。
+ * 前端入口的装配(w2b):两个 Provider,没有第三样。
  *
- * 刻意只有三样:产品名、一句状态说明、主题切换。页面清单(docs/product.md §5)由 w3–w6
- * 逐页接入,那之前这里没有任何数据形状可渲染 —— 现在多放一张卡片,就是给还没接的后端
- * 编一个投影,而前端是投影这件事由后端权威说了算(§1 的不变量)。
+ * 顺序即依赖方向:`QueryClientProvider` 在外,`RouterProvider` 在内。
+ * 路由的 loader/guard 通过 **context** 拿 queryClient(见 router.tsx 的 RouterContext),
+ * 组件通过 Provider 拿同一个实例。反过来接不会报错,但 `useQueryClient()` 会在路由层
+ * 拿到 undefined —— 那是最费时间查的一类「装配顺序」bug。
  *
- * 样式全部挂 base.css 的 `ca-` 工具类(4px 栅格 + 双主题 token),本文件不出现任何
- * 字面色值/尺寸,也不新增 class:由 test/web-theme-tokens.test.ts 双向钉住
- * (组件里的 class 必须在 base.css 里有定义、色值的唯一出口是 theme.css)。
+ * router 与 queryClient 都是模块级单例(理由见 lib/query-client.ts):两处各 new 一份的
+ * 后果不是内存,是「同一份数据两个真相」—— guard 已经读到 /me 了,壳还在那儿转圈。
+ *
+ * w2a 那份「前端基座壳」首页(产品名 + 状态说明 + 主题切换)到此不再是首页:
+ * `/` 现在是任务列表的位置(内容由 w3 接入),壳与品牌挪进 components/AuthedLayout.tsx,
+ * 主题切换跟着挪到右上角。worker 侧那个 `/` 落地页(landingHtml)在同一棒退役(§4)。
  */
+const router = createAppRouter(queryClient);
+
 export function App() {
   return (
-    <main className="ca-shell ca-stack">
-      <header className="ca-cluster">
-        <h1 className="ca-text-md">cloud-agent</h1>
-        <span className="ca-badge">前端基座 · w2a</span>
-        <div className="ca-cluster ca-ml-auto">
-          <ThemeToggle />
-        </div>
-      </header>
-      <p className="ca-muted">
-        运维看板的前端与 API 同源部署在同一个 Worker 上:页面走静态资产,数据仍只认{" "}
-        <code>/api/*</code>(无 CORS、会话 cookie 与 SSE 直接可用);任务列表、任务详情、
-        审批与审计四页按 w3–w6 逐页接入,此刻这里只有壳。
-      </p>
-    </main>
+    <QueryClientProvider client={queryClient}>
+      <RouterProvider router={router} />
+    </QueryClientProvider>
   );
 }

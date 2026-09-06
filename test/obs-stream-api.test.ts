@@ -237,11 +237,18 @@ describe("GET /api/tasks/:id/events/stream", () => {
     expect(JSON.parse(end.data!).unreadable_attempts).toEqual([attemptIds[0]]);
   });
 
-  it("没有 /live、没有任何 HTML:本期只做 SSE 投影(下半是下一期)", async () => {
-    const res = await request("/live");
-    expect(res.status).toBe(404);
-    const html = await (await request("/")).text();
-    expect(html).not.toContain("/events/stream");
-    expect(html).not.toContain("text/event-stream");
+  /**
+   * w2b 之后的形状:worker 只剩**一处**页面分支(/live/:taskId,w4 退役),根路径不再由
+   * worker 答 HTML(落地页已删)。这条钉子管的是「别在 worker 里再长出一个页面」——
+   * 每多一处,资产层的 SPA 兜底就多一个被静默抢走的入口(§2 分区表、§7 头号风险)。
+   */
+  it("裸 /live 与 / 都不由 worker 答页面", async () => {
+    const bare = await request("/live");
+    expect(bare.status, "只有 /live/<uuid> 才是页面").toBe(404);
+    const root = await request("/");
+    expect(root.status).toBe(404);
+    const body = await root.text();
+    expect(root.headers.get("content-type") ?? "").toContain("application/json");
+    expect(body).not.toContain("text/event-stream");
   });
 });

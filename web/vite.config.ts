@@ -11,6 +11,11 @@ import { defineConfig } from "vite";
  */
 export default defineConfig({
   root: "web",
+  // @vitejs/plugin-react 必须在 plugins 里,否则上面那行 import 是死的:JSX 仍然会被
+  // Vite 自带的转换器编掉(所以 `npm run build` 照样绿),但 dev 期没有 React Fast Refresh ——
+  // 改一个组件就整页重载、state 全丢。这类「依赖装了但没接线」的漂移由
+  // test/web-build-base.test.ts 钉(它断言这个文件里 react 插件真的被注册)。
+  plugins: [react()],
   build: {
     outDir: "../dist",
     emptyOutDir: true,

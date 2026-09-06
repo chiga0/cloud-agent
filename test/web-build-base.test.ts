@@ -75,8 +75,59 @@ describe("npm 脚本面", () => {
     expect(pkg.dependencies["react-dom"]).toBeTruthy();
     expect(pkg.devDependencies.vite).toBeTruthy();
     expect(pkg.devDependencies["@vitejs/plugin-react"]).toBeTruthy();
+    // 装了 ≠ 接上了。w2a 的 vite.config.ts 就停在「import 了 react 插件但没进 plugins」:
+    // JSX 仍被 Vite 自带转换器编掉,build 全绿、线上无恙,坏的是 dev —— 没有 Fast Refresh,
+    // 改一个组件整页重载、表单里的 token 就没了。这类「只有本地变慢、没人报障」的缺失
+    // 只能由源码钉子兜住,所以这里正反两面都断言(导入了 + 真的注册了)。
+    expect(viteConfigRaw).toMatch(/import react from "@vitejs\/plugin-react"/);
+    expect(viteConfigRaw).toMatch(/plugins:\s*\[\s*react\(\)\s*\]/);
     // worker 打包只走 src/index.ts,前端依赖不该出现在 worker 的运行时里
     expect(pkg.dependencies.vite).toBeUndefined();
+  });
+});
+
+/**
+ * w2b 的依赖面(§4 技术栈 + 派单的两条定夺:代码式路由、不引 shadcn/Tailwind)。
+ *
+ * 每条「不该有」都与「该有」同等重要,因为它们防的是同一种事故:**有人按 §4 表格的字面
+ * 把 Tailwind 与 shadcn/ui 装上**。那两个包一旦进来就会带自己的一套 CSS 变量
+ * (`--background`/`--primary` 那类),与本仓签字的 theme token 并行成第二套配色权威 ——
+ * 漂移的表现永远是「只有暗色是对的」,而 npm 不会拦你,只有这里会。
+ */
+describe("页面与数据层的依赖(w2b)", () => {
+  const major = (range: string | undefined): string | null => {
+    if (!range) return null;
+    const match = /(\d+)/.exec(range.replace(/^[\^~]/, ""));
+    return match ? match[1] : null;
+  };
+
+  it("TanStack 三件套 + zod 就位,且大版本就是规格点名的那几个", () => {
+    // Router 只钉「必须是 1.x」:它是快迭代的包,§4 的判据是「代码式路由 + 类型安全 params」,
+    // 那两个能力从 1.x 起就有。Table/Query 反过来必须钉大版本 —— v9 的 table 与 v4 的 query
+    // API 都不同形(规格写的是 headless v8 与 v5 的 ensureQueryData),漂了就是照错的文档写代码。
+    expect(major(pkg.dependencies["@tanstack/react-router"])).toBe("1");
+    expect(major(pkg.dependencies["@tanstack/react-table"])).toBe("8");
+    expect(major(pkg.dependencies["@tanstack/react-query"])).toBe("5");
+    expect(pkg.dependencies.zod).toBeTruthy();
+  });
+
+  it("不引文件路由插件(代码式路由是定稿)", () => {
+    for (const banned of ["@tanstack/router-plugin", "@tanstack/router-vite-plugin"]) {
+      expect(pkg.devDependencies[banned], `${banned} 会带来 routeTree.gen 与一套目录约定`).toBeUndefined();
+      expect(pkg.dependencies[banned]).toBeUndefined();
+    }
+  });
+
+  it("不引 Tailwind、不引 shadcn/ui、不预装 radix(随用随加)", () => {
+    const all = { ...pkg.dependencies, ...pkg.devDependencies };
+    for (const name of Object.keys(all)) {
+      expect(name, `Tailwind 一旦进来就会与本仓 token 并行成两套变量体系`).not.toMatch(/tailwind/);
+      // 路由栈只认 TanStack 那一条:裸 react-router / react-router-dom 是 §4 里被用户改掉的旧选型
+      expect(name, "路由选型已改为 @tanstack/react-router,不留第二套路由库").not.toMatch(/^(react-router|react-router-dom)$/);
+      expect(name, "radix 原语按「随用随加」,不预装全家桶").not.toMatch(/^radix-ui$|^@radix-ui\//);
+    }
+    expect(all.shadcn).toBeUndefined();
+    expect(all["@shadcn/ui"]).toBeUndefined();
   });
 });
 
