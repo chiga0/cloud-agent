@@ -2327,6 +2327,70 @@ timeout 240 npm test                                            # 全量收敛�
 
 **测试**(`test/token-ledger.test.ts` +5,29→34 条):壳帧不进 calls 且 cache_read 保留折扣 15,800(对照旧实现的 70,200 全价)/ 真实调用缺报 cache_read 仍整列留空 70,255(p3 判定存活的负向钉)/ `output>0` 边界 / 全壳帧 → `usage:null` / 完成态对账不受壳帧影响。变异 3/3 红:M1 恢复壳帧计入 → 4 红;M2 零判定只看 input → output 边界 1 红;M3 在场判定弱化为「至少一次出现」→ p3 钉与 C17 负向钉 2 红。**操作员值级钉**:修复后对 w2b 真实 transcript 实测 `calls=133 / zeroConsumptionEvents=134 / input 23,608,470 / cache_read 23,351,731 / output 118,282 / 加权 5,045,367` —— 与取证预测逐字段一致,`underreportedFields` 空(cache 列救回)。
 
+### 13.25 POST body 解析失败面统一:三处一份口径(C18)— 已实现
+
+**问题(prod 实测,部署 `c471b145`,4/4 复现)**:`src/index.ts` 里有三处把请求体当 JSON 读,
+其中 `handleCreateTask`(`POST /api/tasks`)与 `handleApprove`(`POST /api/tasks/:id/approve`)
+是**裸的 `Request#json()`**,没有任何降级路径。空 body 或坏 JSON(如 `{bad`)让解析抛
+SyntaxError → 异常冒出 `fetch` 边界 → 平台代答 **500 `error code: 1101`**(worker 未捕获异常)。
+对照第三处 `handleSessionLogin` 从来不会崩:同样的三种输入稳定得到 401 `invalid_credentials`。
+所以缺陷不是「平台会 500」,而是**同一个失败面在三个端点上给了三种答案**,其中两种还是 5xx ——
+对客户端的表现是「curl 少打个 `-d` 就得到一个查不出原因的 500」,对运维的表现是「worker
+错误率里混进一批根本不是故障的故障」。
+
+**修法(统一口径,一句话:读请求体的地方只有一处)**:抽出 `src/http/body.ts`,三个解析点
+一律走它。口径分两层,层与层各管各的:
+
+1. **形态层(共享函数,不含任何业务判断)**:把 body 读成一个 JSON 对象,三档失败、永不抛:
+   `empty`(没有字节 / 只有空白)、`malformed`(不是合法 JSON;读流中途失败也归这一档,
+   客户端拿到的是 4xx 而不是把 worker 抛穿)、`not_object`(是合法 JSON 但不是 JSON **对象**:
+   `"str"` / `123` / `null` / `[]` —— 数组单列,因为 `typeof [] === "object"`)。字段级判定
+   一律**不在**这一层:`spec.prompt` 缺失、`decision` 非法仍走各端点原有分支,免得
+   `invalid_body` 把别的类型吞成一个。
+2. **映射层(各端点自己决定失败该长成什么)**:`/api/tasks*` 用 `invalidBodyResponse` →
+   **400 + `{"error":{"type":"invalid_body","detail":…}}` + `application/json`**;
+   `/api/session/login` 把同一个解析结果**改口**成 401 `invalid_credentials`。这里不是偷懒复用,
+   而是它的契约要求:§3 / §10.5 的立场是「body 读不出来」与「token 错」必须是同一个答案,
+   400/401 之差就是「这台部署收不收 body」的探测面,而 detail 的有无本身也会成为可区分的信息
+   —— 所以 login 的应答体逐字节不变,一个 detail 也不带。
+
+**纪律怎么钉住**(`test/body-parse-contract.test.ts`,两道):源码层用 `import.meta.glob` 在
+构建期内联 `src/**/*.ts` 原文(**不能**用手抄文件清单 —— 新增文件不进清单就等于防线对新代码
+永远绿),规则是「除 `src/http/body.ts` 外,src/ 里不存在以 `req`/`request` 为接收者的
+`json`/`text`/`arrayBuffer`/`formData` 调用」;再从分发器里抽出所有 `req.method === "POST"`
+分支,**凡收到 `req` 实参的 handler 都必须调用 `parseJsonBody`**,并校验「分支数 == POST 条件数」
+防止扫描器被重构绕过。于是「新增端点自己裸解析」和「新增端点没登记」都会红。写注释时用
+`Request#json()` 记法提这件事,别写全调用式 —— 会被这条扫描当违规拦下。
+
+**测试判据落在值上**:create/approve × 九种坏输入逐条断 `status === 400` 与
+`error.type === "invalid_body"`(detail 只钉「存在且非空字符串」,不钉文案);login × 六种输入
+断 `status === 401` 且 `error` 对象**恰好等于** `{type:"invalid_credentials"}`,并把所有输入的实际
+应答收进 Set 断 `size === 1`(不可区分性本身是判据)。每个端点各留一条合法 body 对照
+(create 200 建出任务、approve 进 DO 的 `evidence_missing`、login 200 发 cookie),另有一张
+「解析成功但字段非法」表逐条钉住 `invalid_spec`/`invalid_acceptance`/`invalid_base_sha`/
+`invalid_budget`/`invalid_decision`/`evidence_required` 的类型名与状态码一字未改。变异实测:
+approve 退回裸解析 → 5 红;login 改口成 `invalid_body` → 3 红(含 `test/session-auth.test.ts`
+既有那条不可区分性钉);放宽数组判定 → 3 红。
+
+**prod 复测判据(部署后由操作员跑)**:同一份坏输入在三个端点上应当**再也看不到 1101**。
+
+```bash
+for p in "/api/tasks" "/api/tasks/00000000-0000-0000-0000-000000000000/approve"; do
+  for b in '' '{bad' '"str"'; do
+    printf '%s %s -> ' "$p" "$b"
+    curl -sS -o /dev/null -w '%{http_code} %{content_type}\n' -X POST "$API$p" \
+      "${auth[@]}" -H 'content-type: application/json' -d "$b"   # 一律 400 application/json
+  done
+done
+curl -sS -o /dev/null -w '%{http_code}\n' -X POST "$API/api/session/login" \
+  -H 'content-type: application/json' -d '{bad'                 # 401,与空 body 逐字节同形
+```
+
+**这一节刻意不做的**:不给 `/api/tasks*` 的 detail 加契约(它是给人读的一句话,钉死就是给
+下一棒留改不掉的字符串);不做 zod 式的 schema 校验(字段级判定已在各 handler,且 DO 侧还有
+权威兜底 —— 这里再加一层只会多造一个与现有类型抢地盘的错误名);不改鉴权门与 CSRF 的顺序
+(未鉴权的坏 body 仍先得到门的 401,解析根本不发生)。
+
 ---
 
 ## 14. 延伸阅读

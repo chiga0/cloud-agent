@@ -19,6 +19,7 @@ import { sha256Hex } from "./audit/evidence";
 import { assembleCandidate, candidateFileName } from "./audit/candidate";
 import { assembleRescueView } from "./audit/rescue";
 import { isValidSha } from "./exec/base";
+import { invalidBodyResponse, parseJsonBody } from "./http/body";
 import type { AgentEventV1 } from "./obs/events";
 import { readObsAttemptEvents } from "./obs/journal";
 import {
@@ -104,12 +105,13 @@ async function handleSessionLogin(req: Request, env: Env): Promise<Response> {
       { error: { type: "invalid_credentials" } },
       { status: 401, headers: { "cache-control": "no-store" } },
     );
-  let provided: unknown;
-  try {
-    provided = ((await req.json()) as { token?: unknown } | null)?.token;
-  } catch {
-    return reject();
-  }
+  // 走同一个解析入口,但把三档失败**改口**成 invalid_credentials 而不是 invalid_body:
+  // 「body 读不出来」与「token 错」在这里必须是同一个答案(上面「失败面只有一个形状」),
+  // 而 400/401 之差就是「这台部署收不收 body」的探测面。响应体逐字节不变是这里的硬约束,
+  // 所以一个 detail 也不带 —— detail 的有无本身也会成为可区分的信息。
+  const parsed = await parseJsonBody<{ token?: unknown }>(req);
+  if (!parsed.ok) return reject();
+  const provided = parsed.body.token;
   if (typeof provided !== "string") return reject();
   if (!env.WORKER_API_TOKEN) return reject();
   if (!constantTimeEqual(provided, env.WORKER_API_TOKEN)) return reject();
@@ -200,14 +202,22 @@ function validateBaseSha(baseSha: unknown): string | null {
   return null;
 }
 
+/** `POST /api/tasks` 的 body 形状。形态由 `parseJsonBody` 保证,字段级校验在下面各分支。 */
+interface CreateTaskBody {
+  spec: TaskSpec;
+  model?: string;
+  budget?: { max_model_tokens?: number; max_wall_seconds?: number };
+  review_evidence_mode?: string;
+}
+
 async function handleCreateTask(req: Request, env: Env): Promise<Response> {
-  const body = (await req.json()) as {
-    spec: TaskSpec;
-    model?: string;
-    budget?: { max_model_tokens?: number; max_wall_seconds?: number };
-    review_evidence_mode?: string;
-  };
-  if (!body?.spec?.prompt) {
+  // 空 body / 坏 JSON / body 不是对象 → 400 invalid_body(c18)。这里曾是对请求体的裸
+  // `Request#json()` 解析,抛出去就是平台的 500 error 1101;而 /login 上同一个失败面
+  // 从来是 4xx,三种输入还不可区分。
+  const parsed = await parseJsonBody<CreateTaskBody>(req);
+  if (!parsed.ok) return invalidBodyResponse(parsed.failure);
+  const body = parsed.body;
+  if (!body.spec?.prompt) {
     return Response.json({ error: { type: "invalid_spec", detail: "spec.prompt required" } }, { status: 400 });
   }
   const acceptanceError = validateAcceptance(body.spec.acceptance);
@@ -690,14 +700,20 @@ async function handleLivePage(env: Env, taskId: string): Promise<Response> {
   });
 }
 
+/** `POST /api/tasks/:id/approve` 的 body 形状(同上:形态在这里,字段级在下面)。 */
+interface ApproveBody {
+  decision?: string;
+  actor?: string;
+  attempt_id?: string;
+  evidence_digest?: string;
+}
+
 async function handleApprove(req: Request, env: Env, taskId: string): Promise<Response> {
-  const body = (await req.json()) as {
-    decision?: string;
-    actor?: string;
-    attempt_id?: string;
-    evidence_digest?: string;
-  };
-  if (body?.decision !== "approve" && body?.decision !== "reject") {
+  // 与 handleCreateTask 同一个入口、同一个失败形状(c18)。
+  const parsed = await parseJsonBody<ApproveBody>(req);
+  if (!parsed.ok) return invalidBodyResponse(parsed.failure);
+  const body = parsed.body;
+  if (body.decision !== "approve" && body.decision !== "reject") {
     return Response.json({ error: { type: "invalid_decision" } }, { status: 400 });
   }
   const res = await TaskSession.from(env, taskId).submitDecision({
