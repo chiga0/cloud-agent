@@ -3,6 +3,7 @@ import { createExecutionContext, env } from "cloudflare:test";
 
 import worker from "../src/index";
 import workerIndexRaw from "../src/index.ts?raw";
+import routerRaw from "../web/src/router.tsx?raw";
 import { TASK_TRANSITIONS } from "../src/control/statemachine";
 import { applyMigrations } from "./d1";
 import { ApiError } from "../web/src/lib/api";
@@ -470,5 +471,24 @@ describe("与真服务端对表:这一页发出去的每个 URL 都答 200", () 
     expect(overLimit.status).toBe(400);
     const errorType = ((await overLimit.json()) as { error?: { type?: string } }).error?.type;
     expect(errorType).toBe("invalid_limit");
+  });
+});
+
+// ── 7. 路由接线:validateSearch 必须恒回写 state 键 ──────────────────────────
+
+describe("validateSearch 接线:恒回写 state 键(TanStack raw+validated 合并陷阱)", () => {
+  // 组件那一半没有 DOM 可测(文件头分工),而这正是 2026-09-06 prod 实测抓到的洞:
+  // 校验器对非法/空 state 返回裸 {} 时,TanStack 按 `{ ...原始, ...校验输出 }` 合并出
+  // match.search,URL 上的坏值原样流进 useSearch、被原样发到服务端 → 400(invalid_state),
+  // 页面口供(「按全部读取」)与实际行为(带坏值读取失败)分家。
+  // 单测起不了浏览器,这枚钉子读源码形状,让这处接线在 review 阶段就红。
+  it("validateSearch 恒回写 state(null → undefined),不得在无过滤分支返回裸 {}", () => {
+    const start = routerRaw.indexOf("validateSearch: (search): TasksSearch");
+    const end = routerRaw.indexOf("const taskDetailRoute");
+    expect(start).toBeGreaterThan(0);
+    expect(end).toBeGreaterThan(start);
+    const body = routerRaw.slice(start, end);
+    expect(body).toContain("return { state: filter.state ?? undefined };");
+    expect(body).not.toContain("=== null ? {}");
   });
 });

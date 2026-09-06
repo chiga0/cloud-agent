@@ -85,9 +85,16 @@ const indexRoute = createRoute({
   // (`lib/tasks-page.ts` 的 parseTasksFilter),差别只在这一份**不**把被拒收的原值带进
   // search:validateSearch 的返回是下一次导航要写回地址栏的东西,把旁注写进 URL 就等于
   // 承诺一个谁都会以为是过滤器一部分的参数。被拒的值由页面自己从 searchStr 里取。
+  //
+  // 返回值必须**恒回写 state 键**(null → undefined),不能在「无过滤」时返回裸 {}:
+  // TanStack 把原始 search 与校验输出按 `{ ...原始, ...校验输出 }` 合并成 match.search
+  // (@tanstack/router-core matchRoutesInternal),裸 {} 里没有 state 键去覆盖它,
+  // URL 上的坏值/空串就原样流进 useSearch,被页面当过滤值发出去 —— 服务端 400,
+  // 页面口供(「按全部读取」)与实际行为(带坏值读取失败)分家。
+  // undefined 在合并时覆盖原键、stringifySearch 又会省略它,地址栏不会被污染。
   validateSearch: (search): TasksSearch => {
     const filter = parseTasksFilter(search);
-    return filter.state === null ? {} : { state: filter.state };
+    return { state: filter.state ?? undefined };
   },
 });
 
