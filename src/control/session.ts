@@ -1051,6 +1051,17 @@ export class TaskSession extends DurableObject<Env> {
 
     await this.pinWriterEvidence(s, attempt, args.manifest_key, args.manifest_digest);
 
+    // 观察事件(非闸门):writer 自报成功但候选是空 patch —— 空串 sha256(e3b0c44…)。
+    // 首个空 patch 由 verify 拦下(git apply 对空输入 exit 128),重复空候选经
+    // no_progress 直达审批面;这里只让「空」在事件链上明说,不 setState、不 return、
+    // 不改任何分支顺序(§N.37 普查 3/144 例全是假成功形状)。
+    if (candidate === (await sha256Hex(""))) {
+      await this.appendEvent(s, "candidate.empty_patch", {
+        attempt_id: attempt.id,
+        candidate_digest: candidate,
+      });
+    }
+
     if (isNoProgress(s.task!.last_candidate_digest, candidate)) {
       // 两轮候选逐字节相同:自动循环不会再有进展,停下转人工(省一次沙箱 + 一次裁决)
       await this.appendEvent(s, "gate.no_progress", {

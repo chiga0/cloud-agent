@@ -7,8 +7,9 @@ import {
   archiveRetryDelayMs,
 } from "../src/control/session";
 import type { ReviewVerdict } from "../src/control/gates";
+import { normalizeForMatch } from "../src/control/gates";
 import type { TranscriptUsage } from "../src/exec/extract";
-import { compositeEvidenceDigest } from "../src/audit/evidence";
+import { compositeEvidenceDigest, sha256Hex } from "../src/audit/evidence";
 import { reportArgsFrom, type ReportMessage } from "../src/exec/queue";
 import type { ErrorClass } from "../src/routing/error-class";
 import { applyMigrations } from "./d1";
@@ -487,6 +488,112 @@ describe("TaskSession DO 门禁分级", () => {
     expect(snap!.attempts.filter((a) => a.role === "writer")).toHaveLength(2);
     expect(snap!.task.state).toBe("RUNNING");
     chainIntact(snap!.events);
+  });
+});
+
+/**
+ * c20:空候选观察事件。§N.37 全历史普查:144 份 writer manifest 里 patch.size==0 共
+ * 3 例,全是 writer 自报成功的假成功形状;首个空 patch 被 verifier 拦下(git apply 对
+ * 空输入 exit 128),重复空候选经 gate.no_progress 直达审批面 —— 「空」此前只以
+ * e3b0c44 digest 字样隐式存在。本组钉住:事件在两条路径上都先于既有判定事件出现,
+ * 且流程行为零变化(candidate.empty_patch 是观察事件,不是闸门)。
+ */
+describe("TaskSession DO 空候选观察事件(c20)", () => {
+  it("空摘要常量双向逐字比对;normalizeForMatch(\"\") 空串行为实证", async () => {
+    const LITERAL = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    expect(await sha256Hex("")).toBe(LITERAL);
+    expect(normalizeForMatch("")).toBe("");
+    expect(await sha256Hex(normalizeForMatch(""))).toBe(LITERAL);
+  });
+
+  it("首见空候选(repo 任务):事件先于 verify.requested,验证派发照旧", async () => {
+    const stub = newStub();
+    await createTask(stub, { prompt: "c20", repo_url: "https://example.invalid/r.git" });
+    const empty = await sha256Hex("");
+    await writerOk(stub, { patch_digest: empty });
+
+    const snap = await stub.getSnapshot();
+    expect(payloads(snap!, "candidate.empty_patch")).toEqual([
+      { attempt_id: expect.any(String), candidate_digest: empty },
+    ]);
+    expect(kinds(snap!)).toContain("verify.requested");
+    expect(snap!.task.state).toBe("VERIFYING");
+    const seqOf = (kind: string) => snap!.events.find((e) => e.kind === kind)!.seq;
+    expect(seqOf("candidate.empty_patch")).toBeLessThan(seqOf("verify.requested"));
+    chainIntact(snap!.events);
+  });
+
+  it("重复空候选:每轮各一条观察事件,先于 gate.no_progress,熔断路径照旧", async () => {
+    const stub = newStub();
+    await createTask(stub);
+    const empty = await sha256Hex("");
+    const first = await writerOk(stub, { patch_digest: empty });
+    const second = await writerOk(stub, { patch_digest: empty });
+    expect(second).not.toBe(first);
+
+    const snap = await stub.getSnapshot();
+    expect(payloads(snap!, "candidate.empty_patch")).toHaveLength(2);
+    const noProgress = snap!.events.find((e) => e.kind === "gate.no_progress")!;
+    expect(JSON.parse(noProgress.payload).attempt_id).toBe(second);
+    for (const e of snap!.events.filter((ev) => ev.kind === "candidate.empty_patch")) {
+      expect(e.seq).toBeLessThan(noProgress.seq);
+    }
+    expect(snap!.task.awaiting_human).toBe(true);
+    expect(snap!.task.state).toBe("AWAITING_APPROVAL");
+    chainIntact(snap!.events);
+  });
+
+  it("result_text 路径:空串同触发(non-repo),事件后审批流照旧", async () => {
+    const stub = newStub();
+    await createTask(stub);
+    await writerOk(stub, { result_text: "" });
+
+    const snap = await stub.getSnapshot();
+    expect(payloads(snap!, "candidate.empty_patch")).toHaveLength(1);
+    expect(snap!.task.state).toBe("AWAITING_APPROVAL");
+    chainIntact(snap!.events);
+  });
+
+  it("负向:非空候选、candidate 为 null、同一 attempt 重放,都不产生事件", async () => {
+    // ① 非空 patch_digest
+    const a = newStub();
+    await createTask(a);
+    await writerOk(a, { patch_digest: "same-candidate" });
+    expect(kinds((await a.getSnapshot())!)).not.toContain("candidate.empty_patch");
+
+    // ② 无 patch_digest 无 result_text:candidate 为 null,连「空」都算不上
+    const b = newStub();
+    await createTask(b);
+    const { attempt_id } = await b.startAttempt({
+      role: "writer",
+      idempotency_key: crypto.randomUUID(),
+      ...BUDGET,
+    });
+    expect((await b.reportExecution({ attempt_id, exit_code: 0 })).ok).toBe(true);
+    const snapB = (await b.getSnapshot())!;
+    expect(kinds(snapB)).not.toContain("candidate.empty_patch");
+    expect(snapB.task.state).toBe("AWAITING_APPROVAL");
+
+    // ③ 同一 attempt 重放回报:链判重兜底,事件至多一条
+    const c = newStub();
+    await createTask(c);
+    const empty = await sha256Hex("");
+    const started = await c.startAttempt({
+      role: "writer",
+      idempotency_key: crypto.randomUUID(),
+      ...BUDGET,
+    });
+    const report = {
+      attempt_id: started.attempt_id,
+      exit_code: 0,
+      result_text: "已按要求完成",
+      patch_digest: empty,
+    };
+    expect((await c.reportExecution(report)).ok).toBe(true);
+    for (let i = 0; i < 3; i++) {
+      expect(await c.reportExecution(report)).toMatchObject({ ok: true, ignored: true });
+    }
+    expect(payloads((await c.getSnapshot())!, "candidate.empty_patch")).toHaveLength(1);
   });
 });
 
