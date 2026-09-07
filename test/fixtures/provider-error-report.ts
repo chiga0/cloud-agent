@@ -21,3 +21,15 @@ export const PROVIDER_ACCESS_DENIED_BARE = "AccessDenied.Unpurchased";
 export const QUALITY_RESULT_TEXT =
   "已完成改动,但 npm test 有 2 条断言失败:expected resolve('a') 实际 reject(Error('boom'))。" +
   "上一轮报的 ECONNRESET 我已修,这次是断言本身的缺陷。";
+
+/**
+ * w4a 标本(task 2cbfd46c,2026-09-06):token-plan 周配额 429 被 qwen-code 0.21.10 渲染成
+ * 「成功」—— result 事件 `subtype:"success"` / `is_error:false`,result 文本整串是这段散文。
+ * 与 403 标本同族(CLI 把 API 错误当成功回报),但形状是**散文**而非方括号包壳:
+ * 首段 `Quota exhausted: …`,第三段括号内嵌 `insufficient_quota: 429` 机器码。
+ */
+export const QUOTA_PROSE_RESULT_TEXT =
+  "Quota exhausted: Your token-plan 1-week quota has been exhausted. The quota will reset at 09-11 01:47:00 UTC.\n\nPlease retry after the reset time, or switch to another API key / auth method. (cause: insufficient_quota: 429 Your token-plan 1-week quota has been exhausted. The quota will reset at 09-11 01:47:00 UTC.)";
+
+/** 取证事实:result 文本 315 字符(无尾随换行)。 */
+export const QUOTA_PROSE_RESULT_LEN = 315;

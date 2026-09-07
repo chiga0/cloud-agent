@@ -2264,7 +2264,7 @@ r11 向量自检:`factor=1` → 6,949,711,**恰等于 raw total**(「缓存与 f
 
 - `ErrorClass` 六个成员:`provider_access_denied` / `provider_quota_exhausted` / `provider_model_unavailable` / `upstream_error` / `upstream_timeout` / `bad_response_body`。后两个是 reviewer 三个位点带来的;**前四个与 writer 的 provider 分类共用** —— 刻意不立 `reviewer_failure_class` 之类的第二套词汇:两套词表迟早漂移,而漂移的表现是同一个故障在两个读面上叫两个名字。
 - 分类器是纯函数,输入 `{result_text, exit_code}`,输出 `{is_infra, error_class}`。**按形状判读,一处都不读 `exit_code` 的数值**:11 只是 `adjudicateCliExit`(§7.2.1)上翻的产物,拿它当判据是循环论证 —— 测试用同一份文本换 9 个退出码断言结论逐字段相同。`is_error:false` 更说明「CLI 说成功」这件事本身不可信。
-- 三条形状通道,全部**整串匹配**(与 §7.2.1 同一理由:包含即失败那个假设已被 c15 打穿过三次 —— 规格要求 writer 在总结里讨论这些字样):`[API Error: <3 位码> …]` 包壳(状态码必须后面不接数字,`4033` 不读成 `403`)/ 裸 `AccessDenied.*` / 裸定长机器码。与 `src/exec/cli-exit.ts` 那张形状表做**锁步断言**:它认的整串错误形状,这边必须给出非 null 成因,否则两张表分叉会立刻炸测试。
+- 三条形状通道,全部**整串匹配**(与 §7.2.1 同一理由:包含即失败那个假设已被 c15 打穿过三次 —— 规格要求 writer 在总结里讨论这些字样):`[API Error: <3 位码> …]` 包壳(状态码必须后面不接数字,`4033` 不读成 `403`)/ 裸 `AccessDenied.*` / 裸定长机器码。与 `src/exec/cli-exit.ts` 那张形状表做**锁步断言**:它认的整串错误形状,这边必须给出非 null 成因,否则两张表分叉会立刻炸测试。(c19 起为**四条**,见下方配额散文随动段。)
 - `is_infra` 只给「重开沙箱原规格重做必然复现」的四类;**`upstream_error`(5xx / 无码 / 裸 `upstream_error`)刻意 `is_infra:false`** —— 里面混着瞬态。漏报可以(unknown 落 quality 走老路),**误报不行**:把质量失败判成 infra 会吞掉本来该返工的轮次。
 
 **分流(`ROUTING_INFRA_MODE`,三档,缺省 `shadow`)**
@@ -2300,6 +2300,19 @@ r11 向量自检:`factor=1` → 6,949,711,**恰等于 raw total**(「缓存与 f
 **编号说明**:本节刻意不叫「c15 那一棒」—— `c15` 在本仓已被 §7.2.3 用作**任务规格**的编号
 (`src/exec/cli-exit.ts` 的「c15 三次俱毁」指的是那次跑出来的标本),一名两指正是本节要消掉的漂移。
 新判据一律以 §13.23 引用。
+
+**c19 随动(2026-09-07):配额散文 = 第二族「假成功」形状**
+
+w4a(task `2cbfd46c`)死法与 §13.23 的 403 标本同族但**形状不同**:token-plan 周配额 429 被
+qwen-code 0.21.10 渲染成 `subtype=success / is_error:false` 的**散文** result(315 字符,首段
+`Quota exhausted: …`,括号内嵌 `insufficient_quota: 429`),既不是包壳也不是裸码 —— §7.2.1 的
+裁决器把它放成 exit 0,0 字节补丁流进验证层烧光返工,终态被降成 REJECTED。处置:**同一形状写进
+两张表**并锁步(cli-exit 的 `QUOTA_PROSE_SHAPE` 上翻 exit 11;error-class 第四条通道 →
+`provider_quota_exhausted`,与裸 token / 状态码 429 同名同权),锚点仍是**整串**(散文引用不命中,
+负向钉已变异验证承重)。**路由含义不变**:quota-prose 上翻为 11 后,`ROUTING_INFRA_MODE=shadow`
+(现配置)下行为与落地前一字不差 —— 照旧 quality → rework,只是 `route.infra_candidate` 从此看得见
+这类死亡;只有操作员切 `enforce` 才 BLOCKED。prod 正向证据待收:下次真实配额死亡出现 exit 11
+attempt + `route.infra_candidate` 即闭合。
 
 **测试**
 

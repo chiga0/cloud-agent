@@ -38,6 +38,7 @@ import {
   adjudicateCliExit,
   isCliErrorShape,
 } from "../src/exec/cli-exit";
+import { QUOTA_PROSE_RESULT_TEXT } from "./fixtures/provider-error-report";
 import { collectQwenAttempt } from "../src/exec/sandbox";
 import { PATCH_PATH } from "../src/exec/base";
 import { LONGRUN_STDERR, LONGRUN_STDOUT } from "../src/exec/longrun";
@@ -203,6 +204,50 @@ describe("包含形状:c15 的误杀不许复发", () => {
   it("刻意的精度边界:包壳未闭合不算整串(真失败标本总是闭合的)", () => {
     expect(isCliErrorShape("[API Error: 403 AccessDenied.Unpurchased.")).toBe(false);
     expect(isCliErrorShape("[API Error: a] and b]")).toBe(false);
+  });
+});
+
+describe("quota 散文形状(w4a 标本):CLI 把 429 渲染成 subtype=success", () => {
+  it("整串散文 → 11,与 is_error 在场与否无关(w4a 死法的直接判据)", () => {
+    expect(adjudicateCliExit({ nativeExit: 0, isError: false, resultText: QUOTA_PROSE_RESULT_TEXT })).toBe(11);
+    expect(adjudicateCliExit({ nativeExit: 0, resultText: QUOTA_PROSE_RESULT_TEXT })).toBe(11);
+    expect(adjudicateCliExit({ nativeExit: 0, isError: undefined, resultText: QUOTA_PROSE_RESULT_TEXT })).toBe(11);
+    expect(isCliErrorShape(QUOTA_PROSE_RESULT_TEXT)).toBe(true);
+  });
+
+  it("去首尾空白后仍算整串(CLI 写行尾换行)", () => {
+    expect(
+      adjudicateCliExit({
+        nativeExit: 0,
+        isError: false,
+        resultText: `  \n${QUOTA_PROSE_RESULT_TEXT}\n  `,
+      }),
+    ).toBe(11);
+  });
+
+  it("散文被引用或被包裹 → 0(成功总结完全可能讨论配额死法)", () => {
+    const quoted = `上一轮死于 ${QUOTA_PROSE_RESULT_TEXT} 本轮已换 key 重试成功。`;
+    expect(isCliErrorShape(quoted)).toBe(false);
+    expect(adjudicateCliExit({ nativeExit: 0, isError: false, resultText: quoted })).toBe(0);
+
+    const prefixed = `note: ${QUOTA_PROSE_RESULT_TEXT} then we retried`;
+    expect(isCliErrorShape(prefixed)).toBe(false);
+    expect(adjudicateCliExit({ nativeExit: 0, isError: false, resultText: prefixed })).toBe(0);
+  });
+
+  it("既有两族形状不受新通道影响(裸机器码 / 包壳照旧,429 包壳本来就是整串错误)", () => {
+    expect(isCliErrorShape("insufficient_quota")).toBe(true);
+    expect(isCliErrorShape("[API Error: 429 quota]")).toBe(true);
+    expect(isCliErrorShape("model_not_found")).toBe(true);
+    expect(isCliErrorShape("Quota exhausted: 四百二十九。")).toBe(false);
+  });
+
+  it("接线层:exit 0 + 整串散文 → 11,且不导差量(不让 0 字节假补丁进验证)", async () => {
+    const { r } = await collect(0, resultLine({ is_error: false, result: QUOTA_PROSE_RESULT_TEXT }));
+    expect(r.exitCode).toBe(11);
+    expect(exportWasAttempted()).toBe(false);
+    expect(r.patch).toBeUndefined();
+    expect(r.patchIncompleteReason).toBeUndefined();
   });
 });
 

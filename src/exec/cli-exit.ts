@@ -35,6 +35,15 @@ export const EXIT_UNKNOWN_NATIVE = -1;
 const CLI_ERROR_SHAPE =
   /^\[API Error:[^\]]*\]$|^(?:AccessDenied\.[^\s]*|model_not_found|upstream_error|insufficient_quota)$/;
 
+/**
+ * 配额散文形状(w4a,2026-09-06):token-plan 周配额 429 被 CLI 渲染成
+ * `subtype=success` / `is_error:false` 的**散文** result —— 首段 `Quota exhausted: …`,
+ * 第三段括号内嵌 `insufficient_quota: 429` 机器码。与方括号包壳不同族的第二类假成功,
+ * 锚点仍是整串:首段开头 + 括号内 429,被引用/被包裹一概不算(`s` 让 `.` 跨段)。
+ * 与 `src/routing/error-class.ts` 的散文通道锁步(钉在 routing-error-class.test.ts)。
+ */
+const QUOTA_PROSE_SHAPE = /^Quota exhausted: .+\(cause: insufficient_quota: 429 .+\)$/s;
+
 /** 裁决的输入:一次 CLI 运行的终态事实。 */
 export interface CliExitFacts {
   /** 进程自己交回的退出码;`null` = 没拿到(到期被杀且无终态回报)。 */
@@ -48,7 +57,7 @@ export interface CliExitFacts {
 /** result 文本**整串**(去首尾空白)就是一条 CLI 错误。包含不算。 */
 export function isCliErrorShape(resultText: string | undefined): boolean {
   const text = resultText?.trim() ?? "";
-  return text !== "" && CLI_ERROR_SHAPE.test(text);
+  return text !== "" && (CLI_ERROR_SHAPE.test(text) || QUOTA_PROSE_SHAPE.test(text));
 }
 
 /**

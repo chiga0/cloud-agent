@@ -18,6 +18,8 @@ import {
   PROVIDER_403_RESULT_TEXT,
   PROVIDER_ACCESS_DENIED_BARE,
   QUALITY_RESULT_TEXT,
+  QUOTA_PROSE_RESULT_LEN,
+  QUOTA_PROSE_RESULT_TEXT,
 } from "./fixtures/provider-error-report";
 
 /**
@@ -57,6 +59,42 @@ describe("标本形状:2026-09-03 的 403 必须被认出来", () => {
     expect(classifyProviderError({ result_text: `  ${PROVIDER_403_RESULT_TEXT}\n` }).error_class).toBe(
       "provider_access_denied",
     );
+  });
+});
+
+describe("quota 散文标本(w4a):整串散文 → provider_quota_exhausted", () => {
+  it("事故 result 文本逐字收录,长度就是取证的那个 315", () => {
+    expect(QUOTA_PROSE_RESULT_TEXT.length).toBe(QUOTA_PROSE_RESULT_LEN);
+  });
+
+  it("整串散文(非包壳、非裸码的第二族假成功)→ 确定性 infra", () => {
+    expect(classifyProviderError({ result_text: QUOTA_PROSE_RESULT_TEXT })).toEqual({
+      is_infra: true,
+      error_class: "provider_quota_exhausted",
+    });
+  });
+
+  it("前后空白不算散文:仍然命中", () => {
+    expect(
+      classifyProviderError({ result_text: `  \n${QUOTA_PROSE_RESULT_TEXT}\n` }).error_class,
+    ).toBe("provider_quota_exhausted");
+  });
+
+  it("散文被引用/被包裹 → 不命中(误报面与 403 同一条纪律)", () => {
+    for (const text of [
+      `本轮死因照抄:${QUOTA_PROSE_RESULT_TEXT} —— 换 key 后重跑成功`,
+      `${QUOTA_PROSE_RESULT_TEXT} 是上周的报错,这轮已恢复`,
+      `summary line\n${QUOTA_PROSE_RESULT_TEXT}`,
+    ]) {
+      expect(classifyProviderError({ result_text: text, exit_code: 11 })).toEqual({
+        is_infra: false,
+        error_class: null,
+      });
+    }
+  });
+
+  it("与状态码通道同名:429 → provider_quota_exhausted(散文只是同一成因的第三个读面)", () => {
+    expect(errorClassFromHttpStatus(429)).toBe("provider_quota_exhausted");
   });
 });
 
@@ -174,6 +212,7 @@ describe("纪律②:误报面必须封死(整串匹配,包含不算)", () => {
 describe("纪律③:词表只有一份 —— 与 cli-exit 的形状表锁步", () => {
   const cliErrorShapes = [
     PROVIDER_403_RESULT_TEXT,
+    QUOTA_PROSE_RESULT_TEXT,
     "[API Error: 429 too many requests]",
     "[API Error: fetch failed]",
     PROVIDER_ACCESS_DENIED_BARE,
@@ -259,6 +298,17 @@ describe("档位:ROUTING_INFRA_MODE 三档,缺省 shadow", () => {
       rule: "writer_provider_error_shape",
       action: "blocked",
       error_class: "provider_access_denied",
+    });
+  });
+
+  it("enforce:配额散文同权改判 blocked(同名同权,不因形状是散文而降档)", () => {
+    expect(
+      classifyAttemptFailure(signals({ infra_mode: "enforce", result_text: QUOTA_PROSE_RESULT_TEXT })),
+    ).toEqual({
+      kind: "provider_infra",
+      rule: "writer_provider_error_shape",
+      action: "blocked",
+      error_class: "provider_quota_exhausted",
     });
   });
 

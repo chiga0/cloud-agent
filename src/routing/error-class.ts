@@ -101,6 +101,14 @@ const BARE_MACHINE_CODES: Readonly<Record<string, ErrorClass>> = {
 };
 
 /**
+ * 配额散文(w4a,2026-09-06):CLI 把 token-plan 429 渲染成 `subtype=success` 的散文
+ * result(首段 `Quota exhausted: …`,括号内嵌 `insufficient_quota: 429`)。成因与裸
+ * `insufficient_quota` / 状态码 429 同名,只是第三个读面。整串匹配,与
+ * `src/exec/cli-exit.ts` 的散文通道锁步(钉在 routing-error-class.test.ts)。
+ */
+const QUOTA_PROSE = /^Quota exhausted: .+\(cause: insufficient_quota: 429 .+\)$/s;
+
+/**
  * HTTP 状态码 → 成因。**两侧共用这一张表**:writer 从 result 包壳里的数字读,
  * reviewer 从 `resp.status` 读 —— 同一个 403 在两个读面上必须是同一个名字。
  *
@@ -121,10 +129,11 @@ function verdict(errorClass: ErrorClass): ProviderErrorVerdict {
 /**
  * 一次**失败**的回报文本 → 成因。纯函数,不读 env、不碰事件。
  *
- * 三条通道,全部要求**整串**匹配(去首尾空白后):
+ * 四条通道,全部要求**整串**匹配(去首尾空白后):
  * 1. `[API Error: <码> …]` 包壳 → 按码分流(无码 → `upstream_error`);
  * 2. 裸 `AccessDenied.*` → `provider_access_denied`;
- * 3. 裸定长机器码 → 查表。
+ * 3. 裸定长机器码 → 查表;
+ * 4. 配额散文(w4a)→ `provider_quota_exhausted`。
  * 形状不符返回 `{is_infra:false, error_class:null}`:不猜,交回 quality 兜底。
  */
 export function classifyProviderError(args: ProviderErrorSignals): ProviderErrorVerdict {
@@ -142,6 +151,8 @@ export function classifyProviderError(args: ProviderErrorSignals): ProviderError
   if (BARE_ACCESS_DENIED.test(text)) return verdict("provider_access_denied");
   const bare = BARE_MACHINE_CODES[text];
   if (bare) return verdict(bare);
+
+  if (QUOTA_PROSE.test(text)) return verdict("provider_quota_exhausted");
 
   return NOT_INFRA;
 }
