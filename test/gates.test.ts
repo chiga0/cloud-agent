@@ -5,10 +5,17 @@ import {
   isNoProgress,
   MATERIAL_LIMITS,
   normalizeForMatch,
+  reviewTaskSection,
   type ReviewMaterial,
   type ReviewVerdict,
 } from "../src/control/gates";
 import { parseReviewVerdict } from "../src/exec/extract";
+import {
+  W4A_ACCEPTANCE,
+  W4A_TASK_PROMPT,
+  W4A_VERDICT,
+  W4A_WRITER_RESULT,
+} from "./fixtures/w4a-review-c21";
 
 /**
  * 门禁分级判定单测:reviewer 的 reject 什么时候值得为它重开一个沙箱。
@@ -238,5 +245,113 @@ describe("parseReviewVerdict:解析失败不是 reject", () => {
 
   it("decision 值不合法 → none", () => {
     expect(parseReviewVerdict('{"decision":"maybe","reason":"再说"}').decision).toBe("none");
+  });
+});
+
+/**
+ * c21:验收标准块与喂入 prompt 同源。§N.38 取证(w4a,transcript 6187213d):
+ * reviewer 诚实引用自己被展示的验收标准原文会被判 quote_not_found,因为标准块
+ * 进了 LLM prompt 却不在 material 核对面里,违反 gates.ts 自己声明的
+ * 「材料与实际喂入一致」不变量。修的是材料组成,不是命中规则 —— 防伪造负向一根不松。
+ */
+describe("c21:reviewTaskSection 一次组装两处消费", () => {
+  const merged = reviewTaskSection(W4A_TASK_PROMPT, W4A_ACCEPTANCE);
+
+  it("格式钉:原始任务 + 空行 + 标准头 + 编号从 0 的标准列表,与 prompt 模板逐字同形", () => {
+    expect(reviewTaskSection("任务正文", ["甲标准", "乙标准"])).toBe(
+      "任务正文\n\n【验收标准(编号从 0 开始)】\n0. 甲标准\n1. 乙标准",
+    );
+    expect(reviewTaskSection("任务正文", [])).toBe(
+      "任务正文\n\n【验收标准(编号从 0 开始)】\n(任务未声明验收标准)",
+    );
+  });
+
+  it("fixture 自洽:三条 evidence 引用逐条命中其声明的源面(排除 fixture 错位假红)", () => {
+    const surfaces: Record<string, string> = {
+      task_prompt: merged,
+      writer_result: W4A_WRITER_RESULT,
+    };
+    for (const item of W4A_VERDICT.evidence ?? []) {
+      expect(normalizeForMatch(surfaces[item.source])).toContain(normalizeForMatch(item.quote));
+    }
+  });
+
+  it("w4a 真实判词:并入标准块后 assessReviewRejection 判 honored:true", () => {
+    const material: ReviewMaterial = {
+      task_prompt: merged.slice(0, MATERIAL_LIMITS.task_prompt),
+      writer_result: W4A_WRITER_RESULT.slice(0, MATERIAL_LIMITS.writer_result),
+      verify_output: null,
+      patch_excerpt: null,
+    };
+    expect(
+      assessReviewRejection({ acceptance: W4A_ACCEPTANCE, verdict: W4A_VERDICT, material }),
+    ).toEqual({ honored: true });
+  });
+
+  it("旧组成(不含标准块)下确实 quote_not_found —— 钉住病因本身,修复点在材料组成", () => {
+    const legacy: ReviewMaterial = {
+      task_prompt: W4A_TASK_PROMPT.slice(0, MATERIAL_LIMITS.task_prompt),
+      writer_result: W4A_WRITER_RESULT.slice(0, MATERIAL_LIMITS.writer_result),
+      verify_output: null,
+      patch_excerpt: null,
+    };
+    expect(
+      assessReviewRejection({ acceptance: W4A_ACCEPTANCE, verdict: W4A_VERDICT, material: legacy }),
+    ).toEqual({ honored: false, reason: "quote_not_found" });
+  });
+
+  it("防伪造负向不弱化:跨源引用 / 改写 / 编造 仍然 quote_not_found", () => {
+    const material: ReviewMaterial = {
+      task_prompt: merged.slice(0, MATERIAL_LIMITS.task_prompt),
+      writer_result: W4A_WRITER_RESULT.slice(0, MATERIAL_LIMITS.writer_result),
+      verify_output: null,
+      patch_excerpt: null,
+    };
+    // ① 跨源:标准原文在 task_prompt 面里存在,标成 writer_result 源必须不命中
+    const crossSource: ReviewVerdict = {
+      ...W4A_VERDICT,
+      evidence: [
+        {
+          source: "writer_result",
+          quote: "无新事件 >90s 黄、>300s 红(Date.now() 差值,阈值常量自权威导入)",
+        },
+      ],
+    };
+    expect(
+      assessReviewRejection({ acceptance: W4A_ACCEPTANCE, verdict: crossSource, material }),
+    ).toEqual({ honored: false, reason: "quote_not_found" });
+    // ② 改写:>300s 抄成 >301s,去掉空白后仍不逐字
+    const paraphrased: ReviewVerdict = {
+      ...W4A_VERDICT,
+      evidence: [
+        {
+          source: "task_prompt",
+          quote: "无新事件 >90s 黄、>301s 红(Date.now() 差值,阈值常量自权威导入)",
+        },
+      ],
+    };
+    expect(
+      assessReviewRejection({ acceptance: W4A_ACCEPTANCE, verdict: paraphrased, material }),
+    ).toEqual({ honored: false, reason: "quote_not_found" });
+    // ③ 编造:材料里根本没有的句子
+    const fabricated: ReviewVerdict = {
+      ...W4A_VERDICT,
+      evidence: [{ source: "task_prompt", quote: "writer 隐瞒了三处阻断性缺陷未修复" }],
+    };
+    expect(
+      assessReviewRejection({ acceptance: W4A_ACCEPTANCE, verdict: fabricated, material }),
+    ).toEqual({ honored: false, reason: "quote_not_found" });
+  });
+
+  it("截断不变量:并入后整体按 MATERIAL_LIMITS.task_prompt 截断,截断点落在标准块内", () => {
+    expect(MATERIAL_LIMITS.task_prompt).toBe(6000);
+    const longPrompt = "长".repeat(5900) + "尾部标记";
+    const truncated = reviewTaskSection(longPrompt, W4A_ACCEPTANCE).slice(
+      0,
+      MATERIAL_LIMITS.task_prompt,
+    );
+    expect(truncated.length).toBeLessThanOrEqual(6000);
+    expect(truncated.startsWith("长".repeat(100))).toBe(true);
+    expect(truncated).toContain("【验收标准(编号从 0 开始)】");
   });
 });

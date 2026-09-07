@@ -7,12 +7,18 @@ import {
   archiveRetryDelayMs,
 } from "../src/control/session";
 import type { ReviewVerdict } from "../src/control/gates";
-import { normalizeForMatch } from "../src/control/gates";
+import { normalizeForMatch, type ReviewMaterial } from "../src/control/gates";
 import type { TranscriptUsage } from "../src/exec/extract";
 import { compositeEvidenceDigest, sha256Hex } from "../src/audit/evidence";
 import { reportArgsFrom, type ReportMessage } from "../src/exec/queue";
 import type { ErrorClass } from "../src/routing/error-class";
 import { applyMigrations } from "./d1";
+import {
+  W4A_ACCEPTANCE,
+  W4A_TASK_PROMPT,
+  W4A_VERDICT,
+  W4A_WRITER_RESULT,
+} from "./fixtures/w4a-review-c21";
 
 /**
  * 沙箱销毁的假实现入口。
@@ -594,6 +600,122 @@ describe("TaskSession DO 空候选观察事件(c20)", () => {
       expect(await c.reportExecution(report)).toMatchObject({ ok: true, ignored: true });
     }
     expect(payloads((await c.getSnapshot())!, "candidate.empty_patch")).toHaveLength(1);
+  });
+});
+
+/**
+ * c21:评审材料与喂入 prompt 同源。§N.38 取证(w4a):验收标准块进了 reviewer 的
+ * LLM prompt 却不在 material.task_prompt 核对面里,诚实引用标准原文的 reject 在
+ * 结构上必然 quote_not_found。这里钉 DO 级接线:唯一组装点(gates.reviewTaskSection)
+ * 的返回值同时是 LLM 模板段与存储材料 —— 逐字同串,不是两份格式化。
+ */
+
+type ReviewRequestMsg = { type: string; spec: { prompt: string } };
+
+function spyReviewQueue(
+  instance: TaskSession,
+  sent: ReviewRequestMsg[],
+): () => void {
+  const queue = (
+    instance as unknown as {
+      env: { REVIEW_QUEUE: { send: (msg: ReviewRequestMsg) => Promise<unknown> } };
+    }
+  ).env.REVIEW_QUEUE;
+  const orig = queue.send.bind(queue);
+  queue.send = (msg: ReviewRequestMsg) => {
+    sent.push(msg);
+    return orig(msg);
+  };
+  return () => {
+    queue.send = orig;
+  };
+}
+
+/** runInDurableObject 内直接驱动的 writer 腿(与 writerOk 同参,只是不经 stub 转发)。 */
+async function writerAttemptViaInstance(
+  instance: TaskSession,
+  over: { result_text?: string } = {},
+): Promise<void> {
+  const { attempt_id } = await instance.startAttempt({
+    role: "writer",
+    idempotency_key: crypto.randomUUID(),
+    ...BUDGET,
+  });
+  const res = await instance.reportExecution({
+    attempt_id,
+    exit_code: 0,
+    result_text: over.result_text ?? "已按要求完成",
+    manifest_key: `manifests/task/w/${attempt_id}.json`,
+    manifest_digest: `writer-digest-${attempt_id}`,
+    patch_digest: null,
+  });
+  expect(res.ok).toBe(true);
+}
+
+describe("TaskSession DO 评审材料同源(c21)", () => {
+  it("一次组装两处消费:LLM 收到的 prompt 内嵌的就是核对材料原文(逐字同串)", async () => {
+    const stub = newStub();
+    await createTask(stub, {
+      prompt: "c21 同源任务",
+      acceptance: ["标准甲:必须完成", "标准乙:必须有证据"],
+    });
+    const sent: ReviewRequestMsg[] = [];
+    const stored = await runInDurableObject(stub, async (instance, state) => {
+      const restore = spyReviewQueue(instance, sent);
+      try {
+        await writerAttemptViaInstance(instance);
+      } finally {
+        restore();
+      }
+      return state.storage.get<ReviewMaterial>("review_material");
+    });
+
+    const merged = stored!.task_prompt;
+    expect(merged).toBe(
+      "c21 同源任务\n\n【验收标准(编号从 0 开始)】\n0. 标准甲:必须完成\n1. 标准乙:必须有证据",
+    );
+    expect(sent).toHaveLength(1);
+    expect(sent[0].type).toBe("review-request");
+    expect(sent[0].spec.prompt).toContain(`【原始任务】\n${merged}\n\n【agent 产出】`);
+    chainIntact((await stub.getSnapshot())!.events);
+  });
+
+  it("截断在并入之后:截断点落在标准块内,LLM 看到的就是截断文本", async () => {
+    const stub = newStub();
+    const longPrompt = "长".repeat(5900) + "尾部标记";
+    await createTask(stub, { prompt: longPrompt, acceptance: W4A_ACCEPTANCE });
+    const sent: ReviewRequestMsg[] = [];
+    const stored = await runInDurableObject(stub, async (instance, state) => {
+      const restore = spyReviewQueue(instance, sent);
+      try {
+        await writerAttemptViaInstance(instance);
+      } finally {
+        restore();
+      }
+      return state.storage.get<ReviewMaterial>("review_material");
+    });
+
+    const merged = stored!.task_prompt;
+    expect(merged.length).toBeLessThanOrEqual(6000);
+    expect(merged.startsWith(longPrompt.slice(0, 100))).toBe(true);
+    expect(merged).toContain("【验收标准(编号从 0 开始)】");
+    expect(sent[0].spec.prompt).toContain(`【原始任务】\n${merged}\n\n【agent 产出】`);
+    chainIntact((await stub.getSnapshot())!.events);
+  });
+
+  it("w4a 真实判词 e2e(enforce):修复后诚实引用标准原文的 reject 成立并返工", async () => {
+    const stub = newStub();
+    await createTask(stub, { prompt: W4A_TASK_PROMPT, acceptance: W4A_ACCEPTANCE }, "enforce");
+    await writerOk(stub, { result_text: W4A_WRITER_RESULT });
+    await reviewerReport(stub, { exit_code: 0, review: W4A_VERDICT });
+
+    const snap = await stub.getSnapshot();
+    const assessed = snap!.events.find((e) => e.kind === "review.reject_assessed");
+    expect(JSON.parse(assessed!.payload)).toMatchObject({ honored: true, mode: "enforce" });
+    expect(kinds(snap!)).toContain("review.retry_scheduled");
+    expect(kinds(snap!)).not.toContain("review.downgraded");
+    expect(snap!.attempts.filter((a) => a.role === "writer")).toHaveLength(2);
+    chainIntact(snap!.events);
   });
 });
 

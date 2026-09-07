@@ -58,6 +58,21 @@ export const MATERIAL_LIMITS = {
 } as const;
 
 /**
+ * 【原始任务】+【验收标准】合并段 —— 唯一组装点。session 的两个消费方
+ * (reviewer prompt 模板、material.task_prompt 核对面)引用同一个返回值,
+ * 不许各自格式化:标准块一旦只进 prompt 不进材料,诚实引用标准原文的 reject
+ * 就在结构上必然 quote_not_found(w4a 实例,§N.38)。调用方拿到后统一按
+ * MATERIAL_LIMITS.task_prompt 截断 —— 截断必须发生在并入之后,否则标准块
+ * 会被整体截掉,同源修复失效。
+ */
+export function reviewTaskSection(taskPrompt: string, acceptance: string[]): string {
+  const criteria = acceptance.length
+    ? acceptance.map((c, i) => `${i}. ${c}`).join("\n")
+    : "(任务未声明验收标准)";
+  return [taskPrompt, "", "【验收标准(编号从 0 开始)】", criteria].join("\n");
+}
+
+/**
  * 去掉所有空白 + 忽略大小写。折叠成单空格不够:模型换行重排中文原文时断点处
  * 本就没有空格,会把真实引用判成伪造 —— 那是把返工病理反着制造一遍。
  *  anti-fabrication 不依赖空格:去掉空白后字符序列仍必须逐字命中。

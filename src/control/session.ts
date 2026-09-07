@@ -20,6 +20,7 @@ import {
   isNoProgress,
   MATERIAL_LIMITS,
   normalizeForMatch,
+  reviewTaskSection,
   type ReviewMaterial,
   type ReviewSource,
   type ReviewVerdict,
@@ -1344,21 +1345,21 @@ export class TaskSession extends DurableObject<Env> {
     verify?: { passed: boolean; summary: string },
   ): Promise<{ spec: TaskSpec; material: ReviewMaterial; missing: ReviewSource[] }> {
     const taskSpec = JSON.parse(s.task!.spec) as TaskSpec;
-    const taskPrompt = taskSpec.prompt.slice(0, MATERIAL_LIMITS.task_prompt);
     const writerResult = (s.task!.result_text ?? "").slice(0, MATERIAL_LIMITS.writer_result);
     const verifyOutput = verify ? verify.summary.slice(0, MATERIAL_LIMITS.verify_output) : null;
     const { text: patchExcerpt, missing } = await this.loadPatchExcerpt(s);
 
+    // 唯一组装点(reviewTaskSection):验收标准块同时进 prompt 模板与核对面,
+    // 并入后才截断 —— 拆开格式化或先截断都会让诚实引用标准原文的 reject 举证失败。
     const material: ReviewMaterial = {
-      task_prompt: taskPrompt,
+      task_prompt: reviewTaskSection(taskSpec.prompt, taskSpec.acceptance ?? []).slice(
+        0,
+        MATERIAL_LIMITS.task_prompt,
+      ),
       writer_result: writerResult,
       verify_output: verifyOutput,
       patch_excerpt: patchExcerpt,
     };
-    const acceptance = taskSpec.acceptance ?? [];
-    const criteria = acceptance.length
-      ? acceptance.map((c, i) => `${i}. ${c}`).join("\n")
-      : "(任务未声明验收标准)";
 
     const prompt = [
       `你是 review agent。只做判断,不执行任务:`,
@@ -1367,10 +1368,7 @@ export class TaskSession extends DurableObject<Env> {
       `- 你的唯一职责:核对【agent 产出】是否切题、是否满足每一条【验收标准】`,
       ``,
       `【原始任务】`,
-      taskPrompt,
-      ``,
-      `【验收标准(编号从 0 开始)】`,
-      criteria,
+      material.task_prompt,
       ``,
       `【agent 产出】`,
       writerResult,
