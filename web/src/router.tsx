@@ -17,9 +17,13 @@
  *    读到空 / 读失败」三种状态都是**页面内容**(§5 要求失败态与空态各有文案),把它们搬进
  *    loader 就等于让失败绕过页面自己的诊断去渲染错误边界;而 `defaultPreload: "intent"`
  *    已经让悬停开始解析与预取,gate 一次只多一道吞掉诊断的关卡。
- *    仍然算前置条件的是 guard 那一条(没登录就没有页面)。w4 详情若要把预取搬进 loader,
- *    那一棒的 loader 长这样:
- *    `loader: ({ context: { queryClient }, params }) => queryClient.ensureQueryData(taskDetailQueryOptions(params.taskId))`
+ *    仍然算前置条件的是 guard 那一条(没登录就没有页面)。
+ *    **w4a 落在同一侧**:详情页的快照也留在组件里(`useQuery`),没有 loader —— 这一页要的
+ *    四句「404 / 读失败 / 读到快照 / 快照还没到」全是页面内容,而 §5 的「失败 ≠ 空」只有
+ *    页面自己渲染时才说得出那一句。这一页的实时性另有来源(SSE + `?after=` 补齐),
+ *    loader 预取一份快照并不能让它更实时,只会让失败去渲染错误边界。
+ *    (w2b 那份注释曾预告过 `loader: ensureQueryData(taskDetailQueryOptions(...))` 的写法;
+ *    w4a 按上面这条理由**不采用**,预告作废,判据与接线见 `lib/use-task-timeline.ts`。)
  * 2. **只有 unauthenticated 才 redirect**。`unreachable`(网络/形状/5xx)放行到壳里,由右上角
  *    那一位说「会话状态未知」。判据在 lib/auth.ts 的 probeSession,理由写在那儿。
  * 3. **search 参数一律 zod 校验后交付**。/login 用 `loginSearchSchema`(经 `parseSearch`),
@@ -37,8 +41,9 @@ import { sessionQueryOptions } from "./lib/queries";
 import { loginSearchSchema, parseSearch, type LoginSearch, type TasksSearch } from "./lib/schema";
 import { parseTasksFilter } from "./lib/tasks-page";
 import { LoginPage } from "./routes/LoginPage";
+import { TaskDetailPage } from "./routes/TaskDetailPage";
 import { TasksIndexPage } from "./routes/TasksIndexPage";
-import { ApprovalsPage, AuditPage, NotFoundPage, TaskDetailPage } from "./routes/Placeholders";
+import { ApprovalsPage, AuditPage, NotFoundPage } from "./routes/Placeholders";
 
 /** 路由 context 的契约:目前只有 QueryClient(§4:router context 携 queryClient)。 */
 export interface RouterContext {

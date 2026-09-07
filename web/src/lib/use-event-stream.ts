@@ -36,10 +36,14 @@ import {
   streamCountsText,
   STREAM_CONNECTED_TEXT,
   type StallClock,
+  type StallView,
   type StreamConnView,
   type StreamCounts,
   type StreamEventView,
 } from "./stream-protocol";
+
+/** 停滞三色的判据函数形状:hook 只管喂时钟,选哪套判据由调用方钉死。 */
+export type StallViewFn = (clock: StallClock, nowMs: number, ended: boolean) => StallView;
 
 /**
  * 时间线的内存上限。长跑 attempt 实测 450+ 条且仍在涨(c9b),而页面可能挂一整天:
@@ -64,7 +68,7 @@ export interface EventStreamState {
 
 const EMPTY_COUNTS: StreamCounts = { seen: 0, bad: 0, reconnects: 0 };
 
-export function useEventStream(path: string | null): EventStreamState {
+export function useEventStream(path: string | null, stallOf: StallViewFn = stallView): EventStreamState {
   const [events, setEvents] = useState<StreamEventView[]>([]);
   const [counts, setCounts] = useState<StreamCounts>(EMPTY_COUNTS);
   const [connection, setConnection] = useState<StreamConnView | null>(null);
@@ -154,10 +158,11 @@ export function useEventStream(path: string | null): EventStreamState {
   }, [path, ended.value]);
 
   const stall = useMemo(
-    () => stallView(clockRef.current, nowMs, ended.value),
+    () => stallOf(clockRef.current, nowMs, ended.value),
     // clockRef 是 ref:它的变化由 events/counts 的那次 setState 带进渲染,
-    // 这里显式列上两个依赖,让「帧到了必须重算」成为可读的事实。
-    [nowMs, ended.value, events, counts],
+    // 这里显式列上依赖,让「帧到了必须重算」成为可读的事实。stallOf 是调用方
+    // 传入的具名纯函数,引用恒稳定,列上是声明不是补救。
+    [nowMs, ended.value, events, counts, stallOf],
   );
 
   return {

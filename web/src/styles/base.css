@@ -386,6 +386,25 @@ code {
   gap: var(--space-6);
 }
 
+/* 详情页的「标签 → 值」块(w4a 头部)。标签列按内容宽、值列吃剩下的宽度,
+   两列由 grid 自动落位 —— 所以页面侧每个事实是一对平铺的 span,不给每行包一层 div:
+   包一层就成了「每行一个 grid item」,两列不再对齐。 */
+.ca-kv {
+  display: grid;
+  gap: var(--space-1) var(--space-4);
+  grid-template-columns: max-content minmax(0, 1fr);
+}
+
+/* 事件时间线:一行一条。列表符号由每行开头的位置数字代劳,所以清掉 UA 的圆点与缩进。 */
+.ca-timeline {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
 /* ── err 方向的闪烁 ───────────────────────────────────────────────────── */
 
 @keyframes ca-blink {

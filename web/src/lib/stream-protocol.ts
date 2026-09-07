@@ -46,6 +46,20 @@ export const SSE_END_EVENT = "end";
 export const STALL_WARN_SECONDS = 900;
 export const STALL_DANGER_SECONDS = 180;
 
+/**
+ * 任务详情页自己的停滞阈值(秒) —— 与上面那对是**两套判据**,不是同一件事的两次引用。
+ *
+ * 权威 = docs/product.md §5(「停滞三色:>90s 黄、>300s 红,`Date.now()` 与最后事件时间
+ * 差值」)。判据是「**无新事件**」:心跳也算事件,所以这里只有一条时间源(lastAnyMs),
+ * 不分 runner/模型;而监督器那对拆两条时间源、红只归心跳停。页面把"这条流还活着吗、
+ * 内容还在来吗"压成一个数,监督器把"runner 停了"与"模型沉默"分开 —— 两个问题,两个答案。
+ *
+ * worker 侧没有可逐值比对的对应常量,所以这四个值逐字钉在 test/web-task-detail.test.ts
+ * (含边界与 181s 双判据对照),改这里不改测试,红。
+ */
+export const TASK_STALL_WARN_SECONDS = 90;
+export const TASK_STALL_DANGER_SECONDS = 300;
+
 /** `EventSource.readyState` 的三个取值(WHATWG 冻结的常数,不是实现细节)。 */
 export const ES_READY_STATE_CONNECTING = 0;
 export const ES_READY_STATE_OPEN = 1;
@@ -243,6 +257,26 @@ export function stallView(clock: StallClock, nowMs: number, ended: boolean): Sta
     return { text: `模型静默 ${quietSecs}s(runner 活着)`, tone: "warn", seconds: quietSecs };
   }
   return { text: `最后事件 ${beatSecs}s 前`, tone: "ok", seconds: beatSecs };
+}
+
+/**
+ * 任务详情页的停滞三色(product.md §5 口径):只看「无新事件」,心跳也把计时归零。
+ *
+ * 与 stallView 的分工见 TASK_STALL_* 常量注释。整秒粒度(Math.floor)与 stallView
+ * 同口径:90s 整算正常,91s 才黄 —— 边界测试用的就是 90_000/91_000 这两刀。
+ * 红黄档点名「无新事件」、正常档说「最后事件」:同一个数,两句话,别让操作员
+ * 把 91s 的黄当成 runner 出了事。
+ */
+export function taskStallView(clock: StallClock, nowMs: number, ended: boolean): StallView {
+  if (ended) return { text: STREAM_ENDED_TEXT, tone: "", seconds: 0 };
+  const secs = Math.floor((nowMs - clock.lastAnyMs) / 1000);
+  if (secs > TASK_STALL_DANGER_SECONDS) {
+    return { text: `无新事件 ${secs}s(超过 ${TASK_STALL_DANGER_SECONDS}s)`, tone: "err", seconds: secs };
+  }
+  if (secs > TASK_STALL_WARN_SECONDS) {
+    return { text: `无新事件 ${secs}s(超过 ${TASK_STALL_WARN_SECONDS}s)`, tone: "warn", seconds: secs };
+  }
+  return { text: `最后事件 ${secs}s 前`, tone: "ok", seconds: secs };
 }
 
 export interface StreamCounts {

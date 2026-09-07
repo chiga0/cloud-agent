@@ -17,9 +17,13 @@ import {
   archivedTasksSchema,
   loginResultSchema,
   sessionSchema,
+  taskEventsPageSchema,
+  taskSnapshotSchema,
   type ArchivedTasks,
   type LoginResult,
   type SessionView,
+  type TaskEventsPage,
+  type TaskSnapshot,
 } from "./schema";
 import type { TaskStateValue } from "./view";
 
@@ -148,6 +152,91 @@ export function adminTasksQueryOptions(state: TaskStateValue | null) {
     staleTime: 10_000,
     retry: false,
   });
+}
+
+/**
+ * `/tasks/$taskId` 详情上半(w4a)的读取。
+ *
+ * 两条端点各管一件事,分工是这一页的全部结构:
+ * - **快照**(`GET /api/tasks/:id`)= TaskSession DO 的权威状态,进 Query 缓存:它是一份
+ *   按 key 覆盖的快照,正是 Query 的模型。
+ * - **补齐**(`GET /api/tasks/:id/events?after=`)= 同一份 R2 journal 的**增量读法**,
+ *   刻意**不进** Query(§4 那条纪律在拉取这一侧同样成立):它的进度是「已读条数」,
+ *   缓存一份会随续读点变化的列表等于制造第二个真值来源。接线在
+ *   `lib/use-task-timeline.ts`,判据与翻页全在 `lib/task-detail.ts`。
+ */
+export const TASK_SNAPSHOT_KEY = ["task"] as const;
+
+export function taskSnapshotQueryKey(taskId: string) {
+  return [...TASK_SNAPSHOT_KEY, taskId] as const;
+}
+
+/**
+ * 任务级路径的唯一拼法。`encodeURIComponent` 不是防御性花活:`taskId` 来自 URL 参数,
+ * 里面出现 `/` 就会把这条请求送到另一个端点上去(而页面还会拿到一份「合法形状」的答复
+ * 去渲染另一个任务)。id 的**合法性**本身仍归服务端判(`TASK_ID_RE`,畸形即 404)。
+ */
+export function taskPath(taskId: string): string {
+  return `/api/tasks/${encodeURIComponent(taskId)}`;
+}
+
+export function taskSnapshotUrl(taskId: string): string {
+  return taskPath(taskId);
+}
+
+/**
+ * SSE 的 URL。**这一条路径字面量是 §2 分区表在前端一侧的落点**:worker 侧那份由
+ * test/api-prefix.test.ts 钉住以 `/api/` 开头,这里这一份由 test/web-task-detail.test.ts
+ * 拿真 worker 打出 200 + text/event-stream 钉住。两边都断了才算两边都不漂。
+ */
+export function taskStreamUrl(taskId: string): string {
+  return `${taskPath(taskId)}/events/stream`;
+}
+
+export function fetchTaskSnapshot(taskId: string): Promise<TaskSnapshot> {
+  return apiGet(taskSnapshotUrl(taskId), taskSnapshotSchema);
+}
+
+/**
+ * 任务快照的查询。
+ *
+ * - **没有 `refetchInterval`**:这一页的实时性是**推**来的(§4:SSE 是这一页的当前数据源),
+ *   再挂一个轮询节拍就是给同一个问题第二个答案 —— 而 w2b 给角标与列表定过的那条纪律
+ *   (「两套刷新率必然互相矛盾」)在这里同样成立。推进快照的时机只有一个,而且是事件驱动的:
+ *   收到 `end` 帧(它只证明「已非 RUNNING」,精确终态必须由这条端点回答)。
+ * - `retry: false`:与列表同一条理由 —— 401 不会因为重试变 200,而失败文案本来就说得出
+ *   四种失败,早一点说比转圈好。
+ * - `staleTime` 30s:同一任务被来回导航(列表 → 详情 → 列表 → 详情)时不必每次重读 DO,
+ *   但也别更久:头部那个 state 是操作员判断「要不要动手」的依据。
+ */
+export function taskSnapshotQueryOptions(taskId: string) {
+  return queryOptions({
+    queryKey: taskSnapshotQueryKey(taskId),
+    queryFn: () => fetchTaskSnapshot(taskId),
+    staleTime: 30_000,
+    retry: false,
+  });
+}
+
+/**
+ * 补齐一页的条数。取服务端 `DEFAULT_OBS_LIMIT` 同一档(500):上限是 2000,再大它回 400,
+ * 而一次补齐要拉的是「流没送到的那一段」,不是一整份 journal。
+ */
+export const TASK_EVENTS_PAGE_LIMIT = 500;
+
+/**
+ * 一次补齐读。`after` 是**扁平流里已读的条数**,不是事件的 `seq` ——
+ * 判据与理由逐字照 `src/index.ts` 的 `parseObsAfter` 注释(seq 只在 attempt/generation
+ * 内单调,拿它当跨 attempt 游标会静默漏读)。
+ * `after=0` 与「不带 after」同义(服务端缺省 0);空值 `?after=` 服务端判非法回 400,
+ * 所以这里绝不允许把空串或不确定的数拼上去 —— 见 `lib/task-detail.ts` 的 runEventsPull。
+ */
+export function taskEventsUrl(taskId: string, after: number): string {
+  return `${taskPath(taskId)}/events?after=${after}&limit=${TASK_EVENTS_PAGE_LIMIT}`;
+}
+
+export function fetchTaskEvents(taskId: string, after: number): Promise<TaskEventsPage> {
+  return apiGet(taskEventsUrl(taskId, after), taskEventsPageSchema);
 }
 
 /**

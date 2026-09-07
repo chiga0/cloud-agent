@@ -9,6 +9,7 @@ import statusBadgeRaw from "../web/src/components/StatusBadge.tsx?raw";
 import themeToggleRaw from "../web/src/components/ThemeToggle.tsx?raw";
 import loginPageRaw from "../web/src/routes/LoginPage.tsx?raw";
 import placeholdersRaw from "../web/src/routes/Placeholders.tsx?raw";
+import taskDetailPageRaw from "../web/src/routes/TaskDetailPage.tsx?raw";
 import tasksIndexPageRaw from "../web/src/routes/TasksIndexPage.tsx?raw";
 import themeLibRaw from "../web/src/lib/theme.ts?raw";
 import apiLibRaw from "../web/src/lib/api.ts?raw";
@@ -19,7 +20,9 @@ import queryClientLibRaw from "../web/src/lib/query-client.ts?raw";
 import schemaLibRaw from "../web/src/lib/schema.ts?raw";
 import streamProtocolLibRaw from "../web/src/lib/stream-protocol.ts?raw";
 import tasksPageLibRaw from "../web/src/lib/tasks-page.ts?raw";
+import taskDetailLibRaw from "../web/src/lib/task-detail.ts?raw";
 import useEventStreamLibRaw from "../web/src/lib/use-event-stream.ts?raw";
+import useTaskTimelineLibRaw from "../web/src/lib/use-task-timeline.ts?raw";
 import viewLibRaw from "../web/src/lib/view.ts?raw";
 import mainRaw from "../web/src/main.tsx?raw";
 
@@ -79,6 +82,7 @@ const TSX_SOURCES: Record<string, string> = {
   "web/src/components/ThemeToggle.tsx": themeToggleRaw,
   "web/src/routes/LoginPage.tsx": loginPageRaw,
   "web/src/routes/Placeholders.tsx": placeholdersRaw,
+  "web/src/routes/TaskDetailPage.tsx": taskDetailPageRaw,
   "web/src/routes/TasksIndexPage.tsx": tasksIndexPageRaw,
 };
 
@@ -97,7 +101,9 @@ const WEB_SOURCES: Record<string, string> = {
   "web/src/lib/schema.ts": schemaLibRaw,
   "web/src/lib/stream-protocol.ts": streamProtocolLibRaw,
   "web/src/lib/tasks-page.ts": tasksPageLibRaw,
+  "web/src/lib/task-detail.ts": taskDetailLibRaw,
   "web/src/lib/use-event-stream.ts": useEventStreamLibRaw,
+  "web/src/lib/use-task-timeline.ts": useTaskTimelineLibRaw,
   "web/src/lib/view.ts": viewLibRaw,
 };
 

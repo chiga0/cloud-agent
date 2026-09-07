@@ -71,13 +71,119 @@ export const streamEventSchema = z.object({
 });
 export type StreamEvent = z.infer<typeof streamEventSchema>;
 
-/** SSE `event: end` 帧的 data 体(src/obs/stream.ts `obsSseEndFrame`)。 */
+/**
+ * SSE `event: end` 帧的 data 体(src/obs/stream.ts `obsSseEndFrame`)。
+ */
 export const streamEndSchema = z.object({
   v: z.number(),
   task_id: z.string(),
   events: z.number(),
   unreadable_attempts: z.array(z.string()),
 });
+
+/**
+ * GET /api/tasks/:id(src/index.ts `handleGetTask` → `TaskSession.getSnapshot()`)。
+ *
+ * 逐字段照 `src/control/session.ts:1656` 的那个返回类型转写:`{task, attempts[], events[]}`,
+ * 其中 `task` 是 `interface TaskRecord` 的展开(`{...s.task}`,**全部**字段都在这条端点上,
+ * 包括 `spec` 原文与 `result_text`),`attempts` 是**六列**的 Pick,`events` 是 DO 审计链行
+ * (注意 `payload` 在这里是**字符串** —— getSnapshot 里写的是 `JSON.stringify(e.payload)`)。
+ *
+ * required 的只有五个一定有值可渲染的字段,其余全部 `.optional()`:
+ * `TaskRecord` 的注释明写「M8 前的老记录没有 `base` 这个字段」——那是**缺键**而不是 null,
+ * 把它写成 required 就是发明一条后端没发过的契约,后果是整个头部红在解析上。
+ * 少声明一个字段无所谓(`.object` 剥掉未知键),多声明一个才是假契约。
+ * 这份取舍由 test/web-task-detail.test.ts 拿真端点的返回值对表钉住。
+ */
+export const taskBaseSchema = z.object({
+  sha: z.string(),
+  /** `BaseSource`:材质化来源(pinned / 默认分支 HEAD / …)。前端不枚举:它只是 title 里的一行字。 */
+  source: z.string(),
+});
+
+/** `interface CurrentEvidence`:审批绑定与 `/evidence` 的唯一口径。 */
+export const currentEvidenceSchema = z.object({
+  writer_attempt_id: z.string(),
+  writer_manifest_key: z.string(),
+  writer_manifest_digest: z.string(),
+  verifier_attempt_id: z.string().optional(),
+  verifier_manifest_digest: z.string().optional(),
+});
+
+export const taskRecordSchema = z.object({
+  id: z.string(),
+  state: z.string(),
+  version: z.number(),
+  created_at: z.string(),
+  updated_at: z.string(),
+  spec: z.string().optional(),
+  spec_digest: z.string().optional(),
+  result_text: z.string().nullable().optional(),
+  next_seq: z.number().optional(),
+  archived: z.boolean().optional(),
+  pending_review: z.boolean().optional(),
+  pending_verify: z.boolean().optional(),
+  awaiting_human: z.boolean().optional(),
+  review_evidence_mode: z.string().optional(),
+  base: taskBaseSchema.nullable().optional(),
+  last_candidate_digest: z.string().nullable().optional(),
+  current_evidence: currentEvidenceSchema.nullable().optional(),
+  archive_retry_step: z.number().optional(),
+});
+export type TaskRecordView = z.infer<typeof taskRecordSchema>;
+
+/** `getSnapshot()` 的 attempts 那一列集合(六列,不多不少 —— 这条由测试逐字钉)。 */
+export const taskAttemptSchema = z.object({
+  id: z.string(),
+  role: z.string(),
+  state: z.string(),
+  tokens_used: z.number(),
+  created_at: z.string(),
+  finished_at: z.string().nullable(),
+});
+export type TaskAttemptView = z.infer<typeof taskAttemptSchema>;
+
+/** DO 审计链的一行(hash chain 成员,与 `GET /api/admin/events` 的归档投影同源)。 */
+export const taskAuditEventSchema = z.object({
+  seq: z.number(),
+  kind: z.string(),
+  payload: z.string(),
+  digest: z.string(),
+  prev_digest: z.string().nullable(),
+  created_at: z.string(),
+});
+
+export const taskSnapshotSchema = z.object({
+  task: taskRecordSchema,
+  attempts: z.array(taskAttemptSchema),
+  events: z.array(taskAuditEventSchema),
+});
+export type TaskSnapshot = z.infer<typeof taskSnapshotSchema>;
+
+/**
+ * GET /api/tasks/:id/events(src/index.ts `handleGetTaskEvents`)。
+ *
+ * 两件事是刻意的,都不是省事:
+ *
+ * 1. **`events` 是 `z.array(z.unknown())`,不是 `z.array(streamEventSchema)`**。
+ *    后者会让**一条**读不懂的事件把**整页**判成 `shape` 失败,而这一页的纪律是「一条坏帧
+ *    绝不能停更整页」(§5 的 c9b 清单)。逐条解析交给 `lib/task-detail.ts` 的
+ *    `pulledEventAt`,读不懂的计数并跳过,同页其余照收。
+ * 2. **`next_cursor` 不声明**。服务端给的是 `next_cursor: more ? after + events.length : null`,
+ *    与本页要算的「还有没有更多」是同一个式子(`pullHasMore` = `after + count < total`)。
+ *    声明它就得读它,而读一个能由 count/total **推出**的字段等于给同一件事开第二个真值来源;
+ *    更要紧的是 `test/web-frontend-contract.test.ts` 把分页那套 API 钉成反向钉子,
+ *    这一页用的是位置续读,不需要那个名字。
+ */
+export const taskEventsPageSchema = z.object({
+  task_id: z.string(),
+  state: z.string(),
+  events: z.array(z.unknown()),
+  count: z.number(),
+  total: z.number(),
+  unreadable_attempts: z.array(z.string()),
+});
+export type TaskEventsPage = z.infer<typeof taskEventsPageSchema>;
 
 /**
  * search 参数的运行时校验。

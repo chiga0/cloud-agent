@@ -1,30 +1,21 @@
-import { useParams } from "@tanstack/react-router";
-
 import { PagePlaceholder } from "../components/PagePlaceholder";
 
 /**
- * 还没接入的页面共用的形状说明件(w3 起剩三条)。
+ * 还没接入的页面共用的形状说明件(w4a 起剩两条整页 + 详情内的分块占位)。
  *
- * `/` 任务列表原本也在这里,已由 w3 换成真页面(`routes/TasksIndexPage.tsx`)——
- * 范围栅栏对剩下那三页仍然有效:每一页都只到「能导航过去、能过 guard、能显示自己还没实现」
- * 为止,把任何一页真的填上都是越界:§5 的拆棒是按数据源与验收边界切的,提前实现的那一半没人验收,
- * 也不会在它那一棒的预算里被复查。
+ * 为什么占位页要长得像一份规格而不是「TODO」:这一页会被真实部署后被操作员看到,
+ * 而那时最有用的信息是「哪一棒接管它、接管之后会读到哪个端点」。这两个事实直接来自
+ * docs/product.md §5 的清单,写在这里等于把路由与规格绑住 —— 有人想顺手把页面填上时,
+ * 他会先撞见这段写明「本棒不实现」的话。
  *
- * 唯一的「数据」是路由参数本身:`/tasks/$taskId` 的 id 来自 TanStack 的类型化 params,
- * 显示它是为了钉住一件事 —— 参数确实按名解出来了,而不是被 SPA fallback 兜成整页 HTML
- * (§2 的分区动机)。w4 会读同一条 params,不需要再解一次 URL。
+ * 刻意不画骨架屏、不放假表格:一个空 `<table>` 配上假列名就是一个「投影」,
+ * 而投影必须来自真实数据(§1 的不变量:前端是投影,不做任何权威判定)。
+ *
+ * `/tasks/$taskId` 原来也在这里,已由 w4a 换成真页面(`routes/TaskDetailPage.tsx` 的上半);
+ * 那一棒的拆围把 result/evidence/candidate 与 `/live` 退役留给 w4b,那三块以同一形状的
+ * 说明件挂在详情页里 —— 范围栅栏对剩下这两页仍然有效:每一页都只到「能导航过去、能过
+ * guard、能显示自己还没实现」为止。
  */
-
-export function TaskDetailPage() {
-  const { taskId } = useParams({ from: "/_auth/tasks/$taskId" });
-  return (
-    <PagePlaceholder title="任务详情" wave="w4" sources={["GET /api/tasks/:id", "GET /api/tasks/:id/events", "GET /api/tasks/:id/events/stream"]}>
-      <p className="ca-muted">
-        路由参数 <code>taskId</code> = <code>{taskId}</code>
-      </p>
-    </PagePlaceholder>
-  );
-}
 
 export function ApprovalsPage() {
   return (

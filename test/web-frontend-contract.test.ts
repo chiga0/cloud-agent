@@ -8,6 +8,9 @@ import authedLayoutRaw from "../web/src/components/AuthedLayout.tsx?raw";
 import dataTableRaw from "../web/src/components/DataTable.tsx?raw";
 import placeholdersRaw from "../web/src/routes/Placeholders.tsx?raw";
 import tasksIndexPageRaw from "../web/src/routes/TasksIndexPage.tsx?raw";
+import taskDetailPageRaw from "../web/src/routes/TaskDetailPage.tsx?raw";
+import taskDetailLibRaw from "../web/src/lib/task-detail.ts?raw";
+import useTaskTimelineRaw from "../web/src/lib/use-task-timeline.ts?raw";
 import tasksPageLibRaw from "../web/src/lib/tasks-page.ts?raw";
 import useEventStreamRaw from "../web/src/lib/use-event-stream.ts?raw";
 import queryClientRaw from "../web/src/lib/query-client.ts?raw";
@@ -359,5 +362,116 @@ describe("/ 任务列表页(w3)", () => {
     expect(code).not.toMatch(/new EventSource|useEventStream|fetch\(/);
     // 反向:整条链上只有这一处列表 URL,拼第二处就会开始与角标那条漂移
     expect((codeOnly(queriesRaw).match(/\/api\/admin\/tasks/g) ?? []).length).toBe(1);
+  });
+});
+
+/**
+ * `/tasks/$taskId` 上半(w4a)。
+ *
+ * 判据本身(补齐该不该跑、翻没翻尽、坏形状怎么处理、四种失败各说哪句话、六列的预算边界)
+ * 由 test/web-task-detail.test.ts 真跑函数并**打真端点**钉住;这一节只补那些
+ * 「搬错一个位置就坏、而函数测试看不见」的装配事实。重点是那三根反向钉子:
+ * 复制协议字面量、把 I/O 写进页面、给这一页再加第三个节拍 —— 三种都能让页面当场看起来正常,
+ * 而坏的时候只在生产上、以最像「后端没事」的形状坏。
+ */
+describe("/tasks/$taskId 上半(w4a)", () => {
+  const w4a = { taskDetailPageRaw, taskDetailLibRaw, useTaskTimelineRaw };
+  const w4aCode = () => Object.values(w4a).map((source) => codeOnly(source)).join("\n");
+
+  it("详情页组件真换成了独立文件,占位那份不再挂整页 w4", () => {
+    expect(codeOnly(routerRaw)).toContain('from "./routes/TaskDetailPage"');
+    expect(codeOnly(routerRaw)).toMatch(/component:\s*TaskDetailPage/);
+    expect(codeOnly(placeholdersRaw)).not.toMatch(/TaskDetailPage|useParams/);
+    // 拆围接缝:result/evidence/candidate 与 /live 退役顺延 w4b,以同形状的说明件呈现
+    expect(codeOnly(taskDetailPageRaw)).toContain("PagePlaceholder");
+    expect(codeOnly(taskDetailPageRaw)).toContain("w4b");
+  });
+
+  it("SSE 只复用 use-event-stream,协议字面量一个字都不抄", () => {
+    // 本页的停滞三色走 taskStallView(product.md §5 的 90/300),以 DI 传入;
+    // 钉死实参,防止退回缺省的 stallView(监督器那对 900/180,/live 口径)而测试看不见。
+    expect(codeOnly(useTaskTimelineRaw)).toContain("useEventStream(streamPath, taskStallView)");
+    expect(codeOnly(useTaskTimelineRaw)).toContain("taskStreamUrl(taskId)");
+    // 复制这些字面量 = 第二份协议真相:w2b 那套与 worker 逐值比对的钉子从此管不到它
+    expect(w4aCode()).not.toMatch(/new EventSource|addEventListener\(|readyState\s*===|lastEventId/);
+    for (const banned of [/=\s*900\b/, /=\s*180\b/, /=\s*200\b/, /"agent"/, /"end"/, /"heartbeat"/]) {
+      expect(w4aCode(), String(banned)).not.toMatch(banned);
+    }
+    // 阈值与截断长度只能被引用,不能被再定义一次
+    expect(w4aCode()).toMatch(/STALL_WARN_SECONDS|stallView|stream\.stall/);
+    expect(codeOnly(taskDetailLibRaw)).toContain("summarize(");
+  });
+
+  it("取数只在 lib/queries.ts:这一页的 .tsx 与 hook 里没有第三条 I/O 出口", () => {
+    expect(w4aCode()).not.toMatch(/\bfetch\(|apiGet\(|apiPost\(|useMutation/);
+    // URL 只有一个拼点。页面里那些 `GET /api/tasks/:id` 是给人看的说明文字,不是请求。
+    for (const [name, source] of Object.entries({ taskDetailPageRaw, useTaskTimelineRaw })) {
+      expect(codeOnly(source), name).not.toMatch(/`\/api\/tasks\/\$\{/);
+    }
+  });
+
+  it("补齐不进 Query 缓存,也不给这一页加第三个节拍", () => {
+    const hook = codeOnly(useTaskTimelineRaw);
+    expect(hook).not.toMatch(/useQuery|queryKey|useInfiniteQuery|QueryClient/);
+    // 快照的实时性靠「end 帧 → 重读」这一条事件驱动的边,不靠轮询。
+    expect((codeOnly(queriesRaw).match(/refetchInterval/g) ?? []).length).toBe(2);
+    expect(hook).toContain("runEventsPull(");
+    expect(codeOnly(taskDetailPageRaw)).toContain("invalidateQueries");
+    expect(codeOnly(taskDetailPageRaw)).toContain("taskSnapshotQueryKey");
+  });
+
+  it("不伪装分页:翻页要用的那套 API 在 w4a 三件套里一个都不许出现", () => {
+    const banned =
+      /useInfiniteQuery|fetchNextPage|hasNextPage|getPaginationRowModel|pageIndex|pageSize|nextPage|previousPage|pageCount|next_cursor|\bcursor\b|offset=/;
+    for (const [name, source] of Object.entries(w4a)) {
+      expect(codeOnly(source), name).not.toMatch(banned);
+    }
+  });
+
+  it("取数判据出自纯函数:页面不解释 hook 返回值,只把原始量交给它们", () => {
+    const code = codeOnly(taskDetailPageRaw);
+    for (const needle of [
+      "streamEnabledFor(",
+      "isTaskNotFound(",
+      "stateDisplay(",
+      "connectionBadge(",
+      "detailFailureText(",
+      "timelineEmptyText(",
+      "pullNote(",
+    ]) {
+      expect(code, needle).toContain(needle);
+    }
+    // 补齐的触发判据住在纯函数里,由 hook 调用(页面里没有第二处「该不该拉」的判断)
+    expect(codeOnly(useTaskTimelineRaw)).toContain("pullStartAfter({");
+    expect(code).not.toMatch(/pullStartAfter|runEventsPull/);
+    // 这一页没有 search 参数:w4a 不放过滤器,也就不该有第二份「URL 上的值当判据」的坑
+    expect(code).not.toMatch(/useSearch|searchParams/);
+    // 直接分支在 hook 返回值上的形状(把判据留在组件里的那种):页面不许自己看 counts/tone/seconds
+    expect(code).not.toMatch(/stream\.counts\.\w+\s*[<>]=?|\.tone === "|\.seconds > /);
+  });
+
+  it("任务级 URL 只有一个拼点:taskPath 之外没有第二处 /api/tasks/ 字面量", () => {
+    // 三处各拼一遍 `/api/tasks/${id}/…` 的下一步一定是有一处少掉 `/api` 前缀 ——
+    // 那正是 §2 分区表最怕的漂移,而它的表现是「页面拿到一份 HTML 却不知道自己为什么红」。
+    expect((codeOnly(queriesRaw).match(/\/api\/tasks\//g) ?? []).length).toBe(1);
+    expect(codeOnly(queriesRaw)).toContain("export function taskPath");
+  });
+
+  it("流侧位置口径与拉侧同单位:坏帧也占一个位置(streamFramesOf 是唯一的算法)", () => {
+    expect(codeOnly(taskDetailLibRaw)).toMatch(/return counts\.seen \+ counts\.bad/);
+    expect(codeOnly(useTaskTimelineRaw)).toContain("streamFramesOf(stream.counts)");
+  });
+
+  it("范围栅栏:本棒不新增任何一条读法(result/evidence/candidate 与 /live 退役都顺延 w4b)", () => {
+    const code = w4aCode();
+    // 说明文字里出现 `GET /api/tasks/:id/result`(占位件的数据源)与
+    // `GET /api/admin/attempts`(「预算上限其实在那条端点上」的指路)是这一页的诚实形状:
+    // 说清读不到什么,才不至于让人以为空格子是没有。真正的越界形状是「有人把它拼出去」——
+    // w4a 三件套里没有任何 I/O 出口(那条路只经由 lib/queries.ts)。
+    expect(code).not.toMatch(/apiGet\(|apiPost\(|\bfetch\(/);
+    expect(code).not.toMatch(/\/api\/session\//);
+    // 读层里 w4a 只新增两条 fetch 型读法(快照 + events):admin 那三面的调用点仍是一个都没有
+    expect((codeOnly(queriesRaw).match(/apiGet\(/g) ?? []).length).toBe(5);
+    expect(codeOnly(queriesRaw)).not.toMatch(/\/api\/admin\/(events|attempts|chain-check)/);
   });
 });
