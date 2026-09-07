@@ -154,9 +154,9 @@ export const AGENT_SILENT_YELLOW_MS = ceilToTick(576_000 * 1.5);
 /**
  * 阈值。全部可注入(见 detectSupervisor 的 thresholds 参数),这里的常量是缺省值。
  *
- * **单一权威副本**:这几个数字同时是 Supervisor 的判据与 Live UI 的显示口径
- * (src/obs/live.ts 直接 import 本文件的常量)。历史上它们是一份数字、两处字面量、
- * 两段理由,于是 live.ts 里那句「摄取节拍每 30s 一次」的错误前提被抄了两遍。
+ * **单一权威副本**:这几个数字同时是 Supervisor 的判据与(w4b 前的)Live 页显示口径
+ * (该页曾直接 import 本文件的常量,已于 w4b 退役删除)。历史上它们是一份数字、两处字面量、
+ * 两段理由,于是 live 页里那句「摄取节拍每 30s 一次」的错误前提被抄了两遍。
  * 现在:推导只在这里(c10 的取证数据 + 上面的算式),读端只引用。
  *
  * loop/no_progress 的窗口是**条数**而不是时间:判据问的是「这段时间里它在做什么」,

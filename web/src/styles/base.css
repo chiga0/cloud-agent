@@ -405,6 +405,18 @@ code {
   padding: 0;
 }
 
+/* 原文块(result 正文 / patch 正文):等宽滚动区,长文档不撑破卡片。 */
+.ca-pre {
+  overflow: auto;
+  max-height: 24rem;
+  margin: 0;
+  padding: var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: var(--text-sm);
+  white-space: pre;
+}
+
 /* ── err 方向的闪烁 ───────────────────────────────────────────────────── */
 
 @keyframes ca-blink {

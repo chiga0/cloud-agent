@@ -10,6 +10,7 @@ import placeholdersRaw from "../web/src/routes/Placeholders.tsx?raw";
 import tasksIndexPageRaw from "../web/src/routes/TasksIndexPage.tsx?raw";
 import taskDetailPageRaw from "../web/src/routes/TaskDetailPage.tsx?raw";
 import taskDetailLibRaw from "../web/src/lib/task-detail.ts?raw";
+import taskDeliverablesRaw from "../web/src/lib/task-deliverables.ts?raw";
 import useTaskTimelineRaw from "../web/src/lib/use-task-timeline.ts?raw";
 import tasksPageLibRaw from "../web/src/lib/tasks-page.ts?raw";
 import useEventStreamRaw from "../web/src/lib/use-event-stream.ts?raw";
@@ -78,10 +79,10 @@ describe("路由表", () => {
     expect(viteConfigRaw).not.toMatch(/router-plugin|router-plugin\/vite|TanStackRouterVite/i);
   });
 
-  it("/live/:taskId 仍在 worker 侧保留(w4 才退役),前端不抢这条路径", () => {
+  it("/live/:taskId 仍归 worker(w4b 起答 301 到详情页),前端路由清单不抢这条路径", () => {
     expect(declaredPaths()).not.toContain("/live");
     const rules = (wrangler.assets?.run_worker_first ?? []) as string[];
-    // 分区仍然成立:旧页面归 worker,新页面归资产。
+    // 分区仍然成立:301 必须由 worker 答(资产层没有这条路由),新页面归资产。
     expect(matchesRunWorkerFirst(rules, "/live/x")).toBe(true);
     expect(matchesRunWorkerFirst(rules, "/tasks/x")).toBe(false);
     expect(matchesRunWorkerFirst(rules, "/api/session/me")).toBe(true);
@@ -226,13 +227,14 @@ describe("旧落地页退役不留兼容层(w2b)", () => {
   it("worker 源码里没有 landingHtml,也没有任何 `/` 的页面分支", () => {
     expect(workerIndexRaw).not.toMatch(/landingHtml/);
     expect(workerIndexRaw).not.toMatch(/pathname === "\/"/);
-    // 整站只剩一处内联 HTML:live.ts 的过渡期旧页面(w4 退役)。index.ts 里再出现一份
-    // `<!DOCTYPE html>` 就意味着有人又造了一个「worker 抢在资产前面的页面分支」。
+    // live 页也退役了(w4b 301):worker 源码里不再有任何内联 HTML 产出点。
+    // 再出现一份 `<!DOCTYPE html>` 就意味着有人又造了一个「worker 抢在资产前面的页面分支」。
     expect(workerIndexRaw).not.toMatch(/<!DOCTYPE html/i);
   });
 
-  it("/live 页面仍然由 worker 渲染(w4 之前不许顺手删)", () => {
-    expect(workerIndexRaw).toContain("renderLivePage");
+  it("/live 的 301 仍在 worker 里(资产层答不了重定向),旧页面渲染已删干净", () => {
+    expect(workerIndexRaw).toContain("liveMatch");
+    expect(workerIndexRaw).not.toContain("renderLivePage");
   });
 
   it("前端的首页不再是 w2a 的说明壳,而是路由树", () => {
@@ -382,9 +384,13 @@ describe("/tasks/$taskId 上半(w4a)", () => {
     expect(codeOnly(routerRaw)).toContain('from "./routes/TaskDetailPage"');
     expect(codeOnly(routerRaw)).toMatch(/component:\s*TaskDetailPage/);
     expect(codeOnly(placeholdersRaw)).not.toMatch(/TaskDetailPage|useParams/);
-    // 拆围接缝:result/evidence/candidate 与 /live 退役顺延 w4b,以同形状的说明件呈现
-    expect(codeOnly(taskDetailPageRaw)).toContain("PagePlaceholder");
-    expect(codeOnly(taskDetailPageRaw)).toContain("w4b");
+    // 拆围接缝(w4b 已合拢):下半三块真渲染,占位件不再挂在这一页。三条读法出自
+    // lib/queries.ts(取数只在 queries 的那条钉继续管「没有第三条 I/O 出口」)。
+    expect(codeOnly(taskDetailPageRaw)).not.toContain("PagePlaceholder");
+    expect(codeOnly(taskDetailPageRaw)).toContain("taskEvidenceQueryOptions(");
+    expect(codeOnly(taskDetailPageRaw)).toContain("candidateQueryOptions(");
+    // warnings 必须与 patch 同屏(src/audit/candidate.ts 的交付合同:消费方必须展示)
+    expect(codeOnly(taskDetailPageRaw)).toContain("candidate.warnings.map");
   });
 
   it("SSE 只复用 use-event-stream,协议字面量一个字都不抄", () => {
@@ -462,16 +468,29 @@ describe("/tasks/$taskId 上半(w4a)", () => {
     expect(codeOnly(useTaskTimelineRaw)).toContain("streamFramesOf(stream.counts)");
   });
 
-  it("范围栅栏:本棒不新增任何一条读法(result/evidence/candidate 与 /live 退役都顺延 w4b)", () => {
+  it("取数只在 lib/queries.ts:w4b 收拢下半三块后,读法清单恰好七条 apiGet + 一条裸 fetch", () => {
     const code = w4aCode();
-    // 说明文字里出现 `GET /api/tasks/:id/result`(占位件的数据源)与
-    // `GET /api/admin/attempts`(「预算上限其实在那条端点上」的指路)是这一页的诚实形状:
-    // 说清读不到什么,才不至于让人以为空格子是没有。真正的越界形状是「有人把它拼出去」——
-    // w4a 三件套里没有任何 I/O 出口(那条路只经由 lib/queries.ts)。
+    // 说明文字里出现 `GET /api/tasks/:id/result` 等字面量是这一页的诚实形状:说清读不到
+    // 什么,才不至于让人以为空格子是没有。真正的越界形状是「有人把它拼出去」——
+    // 页面/判定层/hook 里没有任何 I/O 出口(那条路只经由 lib/queries.ts)。
     expect(code).not.toMatch(/apiGet\(|apiPost\(|\bfetch\(/);
     expect(code).not.toMatch(/\/api\/session\//);
-    // 读层里 w4a 只新增两条 fetch 型读法(快照 + events):admin 那三面的调用点仍是一个都没有
-    expect((codeOnly(queriesRaw).match(/apiGet\(/g) ?? []).length).toBe(5);
+    // w2b 三条(session/approvals/列表)+ w4a 两条(快照/events)+ w4b 两条(evidence/candidate)= 7;
+    // admin 那三面的调用点仍是一个都没有
+    expect((codeOnly(queriesRaw).match(/apiGet\(/g) ?? []).length).toBe(7);
     expect(codeOnly(queriesRaw)).not.toMatch(/\/api\/admin\/(events|attempts|chain-check)/);
+    // patch 正文是 text/plain,apiRequest 的介质检查收不了它:queries.ts 里唯一一条裸 fetch,
+    // 判定交回 lib 纯函数(judgePatchResponse),介质纪律只在这条字节流上让步。
+    expect((codeOnly(queriesRaw).match(/\bfetch\(/g) ?? []).length).toBe(1);
+    expect(codeOnly(queriesRaw)).toContain("fetchCandidatePatchRaw");
+  });
+
+  it("w4b 判定层(task-deliverables.ts)是纯函数:没有第二条 I/O 出口,截断长度被引用不被再定义", () => {
+    const code = codeOnly(taskDeliverablesRaw);
+    expect(code).not.toMatch(/\bfetch\(|apiGet\(|apiPost\(|useMutation|new EventSource|addEventListener\(/);
+    expect(code).toContain("judgePatchResponse(");
+    expect(code).toContain("TEXT_SUMMARY_MAX_CHARS");
+    // 拦的是「另立一份常量 200」的赋值;`res.status === 200` 这类裁决分支的比较不算。
+    expect(code).not.toMatch(/[^=!<>]=\s*200\b/);
   });
 });

@@ -2,7 +2,6 @@ import { beforeAll, describe, expect, it } from "vitest";
 import { createExecutionContext, env } from "cloudflare:test";
 import worker from "../src/index";
 import { TaskSession } from "../src/control/session";
-import { liveStreamPath, renderLivePage } from "../src/obs/live";
 import { applyMigrations } from "./d1";
 
 /**
@@ -17,8 +16,8 @@ import { applyMigrations } from "./d1";
  * 2. 全部 API 端点必须挂在 /api/* 且命中分发 —— 见「分发命中清单」用例。
  *    **将来新增 API 端点时,把它的 method+path 加进 API_ENDPOINTS 清单**;
  *    漏加或漏挂 /api 只有这里会红,SPA fallback 上线后没有任何东西会提醒你。
- * 3. Live 页面的流地址是唯一藏在工作区产物里的 API 调用(liveStreamPath),
- *    漏改在本棒完全不可见,必须有独立的断言 —— 见「STREAM_URL」用例。
+ * 3. (w4b 删除)Live 页退役后,工作区产物里已没有藏 API 调用的注入点;
+ *    前端读法的路径钉在 test/web-task-detail.test.ts,端点本体在 obs-stream-api.test.ts。
  */
 
 const TOKEN = env.WORKER_API_TOKEN;
@@ -164,7 +163,7 @@ describe("/api 前缀契约", () => {
     }
   });
 
-  it("非 API 路由:/healthz 公开、/live/:id 仍是页面,而 GET / 已不归 worker(w2b 退役落地页)", async () => {
+  it("非 API 路由:/healthz 公开、/live/:id 301 到详情页(w4b 退役),而 GET / 已不归 worker(w2b 退役落地页)", async () => {
     const health = await request("/healthz", { token: null });
     expect(health.status).toBe(200);
     expect(((await health.json()) as { ok: boolean }).ok).toBe(true);
@@ -185,21 +184,10 @@ describe("/api 前缀契约", () => {
 
     const { taskId } = await seedRunningTask();
     const live = await request(`/live/${taskId}`);
-    expect(live.status).toBe(200);
-    expect(live.headers.get("content-type")).toContain("text/html");
+    expect(live.status).toBe(301);
+    expect(live.headers.get("location")).toBe(`/tasks/${taskId}`);
     // 页面路由不在 /api 下,也不会被 SPA fallback 的 API 分区波及
     const badLive = await request("/live/not-a-uuid", { token: null });
     expect(badLive.status).toBe(401); // /live 在鉴权门之后,与迁移前一致
-  });
-
-  it("STREAM_URL 防漏改:renderLivePage 产出的流地址必须以 /api/ 开头", () => {
-    const taskId = crypto.randomUUID();
-    const page = renderLivePage(taskId, { state: "RUNNING" });
-    const urlInPage = /var STREAM_URL = "([^"]*)";/.exec(page);
-    expect(urlInPage, "页面必须把流地址渲染成 JS 字符串常量").not.toBeNull();
-    expect(urlInPage![1], "流地址漏挂 /api 会在 SPA fallback 上线后被静默吞掉").toMatch(/^\/api\//);
-    expect(urlInPage![1]).toBe(`/api/tasks/${taskId}/events/stream`);
-    // 导出函数自身同样钉住(它被 __STREAM_URL__ 注入点复用)
-    expect(liveStreamPath(taskId)).toBe(`/api/tasks/${taskId}/events/stream`);
   });
 });

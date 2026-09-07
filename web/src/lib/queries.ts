@@ -12,17 +12,21 @@
  */
 
 import { queryOptions } from "@tanstack/react-query";
-import { apiGet, apiPost } from "./api";
+import { apiGet, apiPost, ApiError } from "./api";
 import {
   archivedTasksSchema,
+  candidateViewSchema,
   loginResultSchema,
   sessionSchema,
   taskEventsPageSchema,
+  taskEvidenceSchema,
   taskSnapshotSchema,
   type ArchivedTasks,
+  type CandidateView,
   type LoginResult,
   type SessionView,
   type TaskEventsPage,
+  type TaskEvidence,
   type TaskSnapshot,
 } from "./schema";
 import type { TaskStateValue } from "./view";
@@ -237,6 +241,91 @@ export function taskEventsUrl(taskId: string, after: number): string {
 
 export function fetchTaskEvents(taskId: string, after: number): Promise<TaskEventsPage> {
   return apiGet(taskEventsUrl(taskId, after), taskEventsPageSchema);
+}
+
+/**
+ * `/tasks/$taskId` 下半三块(w4b)的读法。与快照同一个派生点(taskPath),key 各自独立:
+ * 三块的失败互不拖累(坏帧纪律在取数侧的同一条),合并 key 会把一方的失败判死另两块。
+ * `staleTime` 与快照同档(30s),**没有** `refetchInterval`:这三块的实时性同样来自
+ * 事件驱动的快照失效(end 帧 → invalidate 快照),不给这一页加第四个节拍。
+ */
+
+export function taskEvidenceQueryKey(taskId: string) {
+  return [...TASK_SNAPSHOT_KEY, taskId, "evidence"] as const;
+}
+
+export function taskEvidenceUrl(taskId: string): string {
+  return `${taskPath(taskId)}/evidence`;
+}
+
+export function fetchTaskEvidence(taskId: string): Promise<TaskEvidence> {
+  return apiGet(taskEvidenceUrl(taskId), taskEvidenceSchema);
+}
+
+export function taskEvidenceQueryOptions(taskId: string) {
+  return queryOptions({
+    queryKey: taskEvidenceQueryKey(taskId),
+    queryFn: () => fetchTaskEvidence(taskId),
+    staleTime: 30_000,
+    retry: false,
+  });
+}
+
+export function candidateQueryKey(taskId: string) {
+  return [...TASK_SNAPSHOT_KEY, taskId, "candidate"] as const;
+}
+
+export function candidateUrl(taskId: string): string {
+  return `${taskPath(taskId)}/candidate`;
+}
+
+export function fetchCandidateView(taskId: string): Promise<CandidateView> {
+  return apiGet(candidateUrl(taskId), candidateViewSchema);
+}
+
+export function candidateQueryOptions(taskId: string) {
+  return queryOptions({
+    queryKey: candidateQueryKey(taskId),
+    queryFn: () => fetchCandidateView(taskId),
+    staleTime: 30_000,
+    retry: false,
+  });
+}
+
+export function candidatePatchUrl(taskId: string): string {
+  return `${taskPath(taskId)}/candidate?format=patch`;
+}
+
+/** 裸读的答复:status + 原始 body。怎么解释是 lib/task-deliverables.ts 的事。 */
+export interface RawResponse {
+  readonly status: number;
+  readonly body: string;
+}
+
+/**
+ * patch 正文是 text/plain:apiRequest 的介质检查会把它判成 shape 失败(api.ts 规矩 3),
+ * 所以这是全 queries.ts 唯一一条绕过它的读法 —— 拿回原始字节,判定交给
+ * `judgePatchResponse`(纯函数可测)。网络层异常照 apiRequest 同一条口径包成
+ * ApiError network;abort 原样上抛。错误体(JSON)与 200 体(字节流)两种介质都按
+ * 文本读,「能不能解」由判定层处理。
+ */
+export async function fetchCandidatePatchRaw(
+  taskId: string,
+  signal?: AbortSignal,
+): Promise<RawResponse> {
+  let res: Response;
+  try {
+    res = await fetch(candidatePatchUrl(taskId), {
+      headers: { accept: "text/plain" },
+      credentials: "same-origin",
+      signal,
+    });
+  } catch (err) {
+    if (err instanceof DOMException && err.name === "AbortError") throw err;
+    throw new ApiError({ kind: "network" }, candidatePatchUrl(taskId));
+  }
+  const body = await res.text().catch(() => "");
+  return { status: res.status, body };
 }
 
 /**

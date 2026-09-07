@@ -29,7 +29,6 @@ import {
   parseObsLastEventId,
   type ObsStreamDeps,
 } from "./obs/stream";
-import { renderLivePage } from "./obs/live";
 
 export { AttemptWorkflow } from "./exec/workflow";
 export { ContainerProxy } from "@cloudflare/sandbox";
@@ -654,49 +653,25 @@ async function handleGetTaskEventStream(req: Request, env: Env, taskId: string):
 }
 
 /**
- * GET /live/:taskId —— 在途事件时间线的**人眼端**(第④层下半)。页面怎么来的、为什么
- * 全内联、停滞阈值为什么是那两个派生值,都写在 src/obs/live.ts 顶部(阈值本身在
- * src/supervisor/detect.ts,§9.8 只在那里推导一次);这里只负责鉴权、404
- * 与响应头。事件内容一律由浏览器的 EventSource 拉,本函数不读 journal 的一个字节。
+ * GET /live/:taskId —— w4b 退役:301(永久)→ /tasks/:taskId。
  *
- * **为什么一个「只是给人看」的页面也要鉴权**:事件 payload 已在 ingress 过白名单脱敏,
- * 所以这里泄露的不是密钥 —— 泄露的是**任务存在性本身**,以及 state、事件条数、agent
- * 正在动哪个仓库这类元信息。它们对竞争对手或扫描器就是有价值的信号,而本项目的口径从来
- * 是「凡带任务信息的出口一律同一条 checkApiToken」(§11 全表无例外)。在这个前提下
- * 404 才能有意义:不鉴权的话,「这个 taskId 存在」会无条件回答出来 —— 未鉴权的 404
- * 与鉴权后的 404 是两台机器。
+ * 旧的内联 HTML 人眼页(src/obs/live.ts)整体删除,职责由 SPA 详情页接管;SSE 数据端点
+ * (/api/tasks/:id/events/stream)与监督器 detect 判据零改动 —— 前者由 test/obs-stream-api
+ * .test.ts 钉着,后者由 test/supervisor-detect.test.ts 钉着。
  *
- * **已知前提(EventSource 带不了 Authorization 头;页面可达性本期刻意不解决)**:浏览器发起的
- * EventSource 无法携带自定义头,而 §9.6 那条流只认 `Authorization: Bearer`。所以 prod 无凭据
- * 直开 `/live` 得到 **401 是预期行为** —— 全局那一条鉴权门有意覆盖这个出口(要守的是任务存在性
- * 本身,理由见上),这个页面泄露的从来不是密钥。
- *
- * 2026-09-03 的浏览器实测纠正了本注释旧版本的一句错话:**401 与网络断连在 EventSource 前端
- * 是可区分的**,判据是 `es.readyState`。同一 42s 窗口并排探两条流:HTTP 401 → `onerror` 只触发
- * **1 次**(dt≈1ms)、最终 `readyState === 2`(CLOSED)、浏览器**永不重连**;网络失败(拒连)→
- * `onerror` **每 ~3000ms 一次**、最终 `readyState === 0`(CONNECTING)、每 3s 真重连。页面因此
- * 给两个分支两个文案(规则与「为什么两个文案」见 `src/obs/live.ts` 的 `LIVE_CONN_RULES`),
- * 不再在 401 下承诺一件不会发生的事 —— 旧版停在「正在自动重连(第 1 次)」永不更新,操作员白等。
- *
- * **浏览器可达性由后续产品化会话方案统一解决,本期刻意不引入任何临时方案**:本地代理、登录壳、
- * query token、cookie 会话、平台 ticket 铸发一律不做(产品化方向已定,先做临时方案等于给下一棒
- * 留要拆的桥)。本期硬约束还包含不改 SSE 端点的任何行为(含它的鉴权)。其中"把 token 塞进 URL"
- * 尤其不能做:凭据会进浏览器历史、访问日志与 Referer,那是拿观测面换一个泄露面。
- * 此处仍需浏览器实测的是文案在真实页面上的可读性;分支判据本身已实测并由单测钉住。
+ * 重定向的三条语义:
+ * 1. **不查任务存在性**:任何 uuid 形状的 id 都 301(零 DO 读)。旧页面的 404-vs-200 是
+ *    「任务存在性」的泄露面(§11 的鉴权注释),重定向把泄露面整个关掉 —— 不存在的任务在
+ *    详情页里得到它的 not_found,而不是在门这里提前回答。
+ * 2. **鉴权门原样覆盖 /live**(全局门在一切 /api/* 与 /live 之前):无凭据 401 与迁移前
+ *    一致。这是既有边界,不是本分支新加的。
+ * 3. **体是空的**:301 只是路标,再带一份页面就等于页面分支没死干净(web-frontend-contract
+ *    的「无内联 HTML 产出点」钉与 obs-live 的空体钉两头看着)。
  */
-async function handleLivePage(env: Env, taskId: string): Promise<Response> {
-  // 与 /api/tasks/:id/events* 完全同源的 404 语义,且必须在生成 HTML **之前**判掉:
-  // 一旦 200 + text/html 发出去,就没法再补一个 404(同 §9.6 建流前判 404 的理由)。
-  const snap = await TaskSession.from(env, taskId).getSnapshot();
-  if (!snap) return Response.json({ error: { type: "not_found" } }, { status: 404 });
-  return new Response(renderLivePage(taskId, { state: snap.task.state }), {
-    headers: {
-      "content-type": "text/html; charset=utf-8",
-      // 不缓存:缓存住的就是一个不会再自增的停滞计时器 —— 这个页面的全部价值在于「现在」。
-      // 不给 frame-ancestors/CSP:内联脚本本页必须有,而加 CSP 头会引出一整套新契约(下一棒的事)。
-      "cache-control": "no-store",
-      "x-content-type-options": "nosniff",
-    },
+async function handleLivePage(_env: Env, taskId: string): Promise<Response> {
+  return new Response(null, {
+    status: 301,
+    headers: { location: `/tasks/${taskId}` },
   });
 }
 
@@ -1301,8 +1276,8 @@ export default {
       return handleAdminEvents(url, env);
     }
 
-    // Live UI(第④层下半)。id 的正则与下面 /api/tasks/:id/* **同一条**([0-9a-f-]{36}):
-    // 畸形 id 在这里就 404,不进渲染 —— 但 renderLivePage 仍然自己转义,理由见它上方注释。
+    // /live/:taskId(w4b 退役:301 → /tasks/:taskId)。id 的正则与下面 /api/tasks/:id/*
+    // **同一条**([0-9a-f-]{36}):畸形 id 在这里就落全局兜底 404,不进重定向。
     // 刻意不做 /live 列表页:那需要跨任务枚举,与 /api/admin/tasks 的归档口径纠缠,是另一棒。
     const liveMatch = /^\/live\/([0-9a-f-]{36})$/.exec(url.pathname);
     if (liveMatch && req.method === "GET") {

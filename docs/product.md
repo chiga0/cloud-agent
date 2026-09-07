@@ -31,7 +31,7 @@ cloud-agent 从「纯 API harness + 操作员 curl」演进为**浏览器一等�
 |---|---|---|
 | `/api/*` | 全部 API（迁移自 `/tasks*`、`/admin/*`） | w1a |
 | `/api/session/*` | 会话端点（w1b 新增） | w1b |
-| `/live/:taskId` | 过渡期旧页面，w4 退役 | — |
+| `/live/:taskId` | 旧页面已退役（w4b）：worker 答 301 → `/tasks/:taskId`，不再出 HTML | — |
 | `/healthz` | 健康检查，不动 | — |
 | 其余一切 | 静态资产 / SPA fallback | w2 起 |
 
@@ -113,9 +113,10 @@ GET  /admin/{tasks,attempts,events,chain-check}      → GET /api/admin/…
   `max_wall_seconds` 一律 6000（writer 实际拿 min(98,90)=90min 上限）；§6 表内 2400/3000 是
   杠杆前旧账，w2/w2a/w2b 三连 exit55@41min 已证旧预算是死区。
 
-- `/live/:taskId` 退役（2026-09-07 状态核）：前端页面与路由已随 w4a 移出站内路径（NotFoundPage
-  清单为准）；后端 `GET /live/:taskId`（src/index.ts liveMatch）仍在答整页 HTML，**301 化归 w4b**
-  （页面+路由删除；SSE 数据端点保留）。
+- `/live/:taskId` 退役（**w4b 已落地**）：前端页面与路由已随 w4a 移出站内路径；后端
+  `GET /live/:taskId`（src/index.ts liveMatch）自 w4b 起答 **301（永久）→ `/tasks/:taskId`**
+  （空体、不查任务存在性——旧的 404-vs-200 存在性泄露面就此关闭；鉴权门原样覆盖；
+  `src/obs/live.ts` 整文件删除；SSE 数据端点与监督器阈值零改动）。
 - **w3 注记（2026-09-06，取代上表 `/` 那一行的原「要点」）**：落地前对 `src/index.ts` 的
   `handleAdminTasks` 逐字核对，响应体只有 `{tasks:[{id,state,created_at,updated_at,version}], count}`，
   SQL 是 `SELECT … [WHERE state = ?] ORDER BY updated_at DESC LIMIT ?`。三条事实与两条旧设想相冲：

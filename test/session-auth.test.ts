@@ -257,12 +257,12 @@ describe("checkApiToken:会话 cookie 兜底(浏览器那条路)", () => {
     expect(res.status).toBe(200);
   });
 
-  it("最大红利:cookie 可直达 /live 页面(它带的就是事件流的凭据)", async () => {
+  it("最大红利延续:cookie 过门后 /live 直接 301 到详情页,落地那半在 SPA 里(它带的就是事件流的凭据)", async () => {
     const taskId = await seedTask();
     const cookie = await mintSessionCookieValue(TOKEN, Date.now());
     const res = await call(`/live/${taskId}`, { bearer: null, cookie });
-    expect(res.status).toBe(200);
-    expect(res.headers.get("content-type")).toContain("text/html");
+    expect(res.status).toBe(301);
+    expect(res.headers.get("location")).toBe(`/tasks/${taskId}`);
   });
 
   it("签名/载荷/pass 三种伪造一律 401 unauthorized", async () => {

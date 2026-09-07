@@ -441,11 +441,15 @@ export interface FactRow {
   readonly absent: boolean;
 }
 
-function fact(label: string, value: string, note = ""): FactRow {
+/**
+ * 「标签 + 值」两件小工厂,w4b 起由 task-deliverables.ts 共用
+ * (详情页下半三块的行与上半同一形状, 不值得各抄一份)。
+ */
+export function fact(label: string, value: string, note = ""): FactRow {
   return { label, value, note, absent: false };
 }
 
-function absentFact(label: string, note: string): FactRow {
+export function absentFact(label: string, note: string): FactRow {
   return { label, value: "—", note, absent: true };
 }
 
@@ -557,7 +561,12 @@ export function clampFacts(snapshot: TaskSnapshot | null): ClampFacts | null {
   return rows === 0 ? null : { rows, unreadable, ...facts };
 }
 
-function decodeJsonObject(text: string): Record<string, unknown> | null {
+/**
+ * 从可能是 JSON 的文本里安全解出对象(解不出/不是对象 → null,绝不抛)。
+ * w4b 起由 task-deliverables.ts 共用:patch 字节流的错误体是 JSON 而 200 体不是,
+ * 「能不能解」本身就是分支判据,这里不做任何更多解释。
+ */
+export function decodeJsonObject(text: string): Record<string, unknown> | null {
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);

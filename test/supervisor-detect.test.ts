@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest";
 import { toAgentEventV1, OBS_HEARTBEAT_KIND, type AgentEventV1 } from "../src/obs/events";
 import { SHELL_FIXTURE, SHELL_FIXTURE_COLLAPSED_KEY } from "./fixtures/shell-command-shapes";
 import { POLL_INTERVAL_MS } from "../src/exec/longrun";
-import { LIVE_STALL_DANGER_SECONDS, LIVE_STALL_WARN_SECONDS } from "../src/obs/live";
 import {
   AGENT_SILENT_YELLOW_MS,
   detectSupervisor,
@@ -171,8 +170,8 @@ describe("stall · last_event_gap(downlevel:无心跳的历史段)", () => {
   });
 
   it("黄线与 agent_silent 同一份常量(不留第二个数字)", () => {
-    expect(SUPERVISOR_THRESHOLDS.agent_silent_yellow_ms).toBe(LIVE_STALL_WARN_SECONDS * 1000);
-    expect(SUPERVISOR_THRESHOLDS.no_heartbeat_red_ms).toBe(LIVE_STALL_DANGER_SECONDS * 1000);
+    expect(SUPERVISOR_THRESHOLDS.agent_silent_yellow_ms).toBe(AGENT_SILENT_YELLOW_MS);
+    expect(SUPERVISOR_THRESHOLDS.no_heartbeat_red_ms).toBe(NO_HEARTBEAT_RED_MS);
   });
 
   it("有心跳的段上这条不再参与:分级交给两条新判据", () => {
@@ -184,10 +183,12 @@ describe("stall · last_event_gap(downlevel:无心跳的历史段)", () => {
   });
 });
 
-describe("阈值与实测同源(live.ts 只引用不重述)", () => {
-  it("Live 页面的秒数就是判据的毫秒数 / 1000", () => {
-    expect(LIVE_STALL_WARN_SECONDS * 1000).toBe(SUPERVISOR_THRESHOLDS.agent_silent_yellow_ms);
-    expect(LIVE_STALL_DANGER_SECONDS * 1000).toBe(SUPERVISOR_THRESHOLDS.no_heartbeat_red_ms);
+describe("阈值与实测同源", () => {
+  it("毫秒判据只此一份:detect 内部逻辑与 SUPERVISOR_THRESHOLDS 同源,前端副本由 web-stream-protocol.test.ts 对表", () => {
+    // w4b 退役 live 页后,「live.ts 只引用不重述」的第三份消费方消失;
+    // 剩下的两个消费方(本文件 + web 副本)各自在自己的文件里钉。
+    // 红线(runner 停)必须先于黄线(模型沉默)到达 —— 反了就是把「心跳没了」说轻了。
+    expect(NO_HEARTBEAT_RED_MS).toBeLessThan(AGENT_SILENT_YELLOW_MS);
   });
 });
 

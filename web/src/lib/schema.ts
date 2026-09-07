@@ -186,6 +186,72 @@ export const taskEventsPageSchema = z.object({
 export type TaskEventsPage = z.infer<typeof taskEventsPageSchema>;
 
 /**
+ * GET /api/tasks/:id/evidence(src/index.ts `handleGetEvidence` → `getEvidenceSummary` + R2 manifest)。
+ *
+ * 六个顶层键恒在(handler 的对象字面量),其中 `verifier_attempt_id` / `binding_digest`
+ * 按权威类型是 `string | null`(session.ts:1704)—— null 是信息(还没有 verifier /
+ * 还没过审批),不是缺键,所以 `nullable` 而不 `optional`。
+ * `manifest` 是 writer manifest 原件(src/audit/evidence.ts `EvidenceManifest`)的转写:
+ * `patch` / `base` 是 optional(v1 manifest 没有它们,读端按「没有/基线未固定」处理,
+ * 与 assembleCandidate 的判读同一条纪律)。
+ */
+export const artifactRefSchema = z.object({
+  key: z.string(),
+  digest: z.string(),
+  size: z.number(),
+});
+
+export const evidenceManifestSchema = z.object({
+  schema_version: z.number(),
+  task_id: z.string(),
+  attempt_id: z.string(),
+  role: z.string(),
+  produced_at: z.string(),
+  spec_digest: z.string(),
+  model: z.string(),
+  transcript: artifactRefSchema,
+  artifacts: z.array(artifactRefSchema),
+  patch: artifactRefSchema.optional(),
+  base: z.object({ sha: z.string(), source: z.string() }).optional(),
+});
+
+export const taskEvidenceSchema = z.object({
+  attempt_id: z.string(),
+  verifier_attempt_id: z.string().nullable(),
+  awaiting_human: z.boolean(),
+  digest: z.string(),
+  binding_digest: z.string().nullable(),
+  manifest: evidenceManifestSchema,
+});
+export type TaskEvidence = z.infer<typeof taskEvidenceSchema>;
+
+/**
+ * GET /api/tasks/:id/candidate(src/index.ts `handleGetCandidate` →
+ * src/audit/candidate.ts `assembleCandidate`)。view 的每个键恒在
+ * (assembleCandidate 的返回字面量),可空性以 `CandidateView` 接口为准:
+ * `base`/`patch`/`decision`/`binding_digest`/writer·verifier id 都是 `| null`。
+ * `warnings` 是**交付合同**:消费方必须与补丁同屏展示(诚实性声明,不许折叠进别的字段)。
+ */
+export const candidateViewSchema = z.object({
+  task_id: z.string(),
+  status: z.string(),
+  verified: z.boolean(),
+  safe_to_apply: z.boolean(),
+  base: z.object({ sha: z.string().nullable(), source: z.string() }).nullable(),
+  patch: artifactRefSchema.nullable(),
+  patch_complete: z.boolean(),
+  patch_incomplete_reason: z.string().nullable(),
+  writer_attempt_id: z.string().nullable(),
+  verifier_attempt_id: z.string().nullable(),
+  state: z.string(),
+  awaiting_human: z.boolean(),
+  decision: z.object({ decision: z.string(), actor: z.string(), by: z.string() }).nullable(),
+  binding_digest: z.string().nullable(),
+  warnings: z.array(z.string()),
+});
+export type CandidateView = z.infer<typeof candidateViewSchema>;
+
+/**
  * search 参数的运行时校验。
  *
  * 这一份是**必须有**的:URL 是用户可编辑输入(也是别人发出去的链接),而路由的 loader 与

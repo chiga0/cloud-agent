@@ -128,10 +128,9 @@ export function isBehavioralKind(kind: string): boolean {
 }
 
 /**
- * 摘要显示上限(字符)。与 `src/obs/live.ts` 的 `LIVE_TEXT_SUMMARY_MAX_CHARS` 同一个数、
- * 同一条理由:journal 里 payload.text 最长 2048,一屏时间线放不下也不需要放下 —— 这里只做
- * **显示**截断并标注原始长度,数据一个字节不动(全文有 GET /api/tasks/:id/events)。
- * 数值由 test/web-view.test.ts 钉住与 live.ts 相等。
+ * 摘要显示上限(字符)。同一条理由:journal 里 payload.text 最长 2048,一屏时间线放不下也
+ * 不需要放下 —— 这里只做**显示**截断并标注原始长度,数据一个字节不动(全文有
+ * GET /api/tasks/:id/events)。数值由 test/web-stream-protocol.test.ts 钉住为 200。
  */
 export const TEXT_SUMMARY_MAX_CHARS = 200;
 

@@ -1,11 +1,34 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useParams } from "@tanstack/react-router";
-import { Fragment, useEffect } from "react";
+import { Fragment, useEffect, useState } from "react";
 
-import { PagePlaceholder } from "../components/PagePlaceholder";
 import { StatusBadge } from "../components/StatusBadge";
-import { taskSnapshotQueryKey, taskSnapshotQueryOptions } from "../lib/queries";
-import type { TaskSnapshot } from "../lib/schema";
+import {
+  candidatePatchUrl,
+  candidateQueryOptions,
+  candidateUrl,
+  fetchCandidatePatchRaw,
+  taskEvidenceQueryOptions,
+  taskEvidenceUrl,
+  taskSnapshotQueryKey,
+  taskSnapshotQueryOptions,
+} from "../lib/queries";
+import {
+  candidateFacts,
+  candidateFailureText,
+  evidenceFacts,
+  evidenceFailureText,
+  isNoCandidateYet,
+  isNoEvidenceYet,
+  judgePatchResponse,
+  patchOutcomeOfThrown,
+  patchOutcomeText,
+  resultView,
+  CANDIDATE_EMPTY_TEXT,
+  EVIDENCE_EMPTY_TEXT,
+  type PatchOutcome,
+} from "../lib/task-deliverables";
+import type { CandidateView, TaskSnapshot } from "../lib/schema";
 import {
   attemptRowView,
   baselineFacts,
@@ -21,6 +44,7 @@ import {
   streamEnabledFor,
   timelineEmptyText,
   timelineRowView,
+  truncateHash,
   type FactRow,
 } from "../lib/task-detail";
 import { STREAM_CONNECTED_TEXT, STREAM_ENDED_TEXT } from "../lib/stream-protocol";
@@ -28,20 +52,23 @@ import { useTaskTimeline } from "../lib/use-task-timeline";
 import { stateTone } from "../lib/view";
 
 /**
- * `/tasks/$taskId` 上半(w4a 交付 ①②③④;§5 那一行的前两块)。
- *
- * 范围:头部状态区 + attempts + 事件时间线 + 停滞/坏帧韧性 + 断线双恢复源。
- * result / evidence / candidate 三块与 `/live` 的退役**顺延 w4b**,本文件末尾那两块
- * 占位件写明了将读的数据源 —— 提前填上它们等于在没有验收边界的地方做投影。
+ * `/tasks/$taskId` 整页:上半两块(头部状态区 + 事件时间线,w4a)+ 下半三块
+ * (result / evidence / candidate,w4b)。
  *
  * 这一份文件里**没有任何判据**:数字、阈值、状态→色、kind→徽章、四种失败各说哪句话、
- * 补齐该不该跑,全部在 `lib/task-detail.ts` 与 `lib/stream-protocol.ts`(w3 的教训:
- * 凡参与取数/判定的值出自纯函数,`.tsx` 只接线)。为什么这么切:测试跑在 Workers 运行时里,
- * 没有 DOM 也没有 `EventSource`,判据留在组件里就钉不住 —— 而这些判据逐条都对应
- * c9b/c9c 在浏览器里踩过的一次误报或漏报。
+ * 补齐该不该跑、patch 字节流算什么终局,全部在 `lib/task-detail.ts`、
+ * `lib/task-deliverables.ts` 与 `lib/stream-protocol.ts`(w3 的教训:凡参与取数/判定的
+ * 值出自纯函数,`.tsx` 只接线)。为什么这么切:测试跑在 Workers 运行时里,没有 DOM 也没有
+ * `EventSource`,判据留在组件里就钉不住 —— 而这些判据逐条都对应 c9b/c9c 在浏览器里
+ * 踩过的一次误报或漏报。
+ *
+ * 下半三块的分工(w4b):result 来自快照既有列(零新增请求);evidence 与 candidate
+ * 是两条独立查询,失败互不拖累;patch 正文按需加载(text/plain,唯一一条绕过
+ * apiRequest 介质检查的读法),warnings 无论补丁在不在都同屏展示。
  *
  * 需浏览器实测(单测覆盖不到,§7 的口径):真实 `EventSource` 按 `STREAM_CONN_RULES` 派发
- * error/open 的形状、时间线在 1000 条上限下的滚动、窄屏下 attempts 六列的横向溢出。
+ * error/open 的形状、时间线在 1000 条上限下的滚动、patch 正文与 result 全文的滚动区、
+ * 窄屏下 attempts 六列的横向溢出。
  */
 
 /** 头部说明行里那份「这一页读什么」的一句话。数据源写出来,操作员才知道该去核对什么。 */
@@ -194,27 +221,13 @@ export function TaskDetailPage() {
         )}
       </section>
 
-      <PagePlaceholder
-        title="result / evidence / candidate"
-        wave="w4b"
-        sources={[
-          "GET /api/tasks/:id/result",
-          "GET /api/tasks/:id/evidence",
-          "GET /api/tasks/:id/candidate",
-        ]}
-      >
-        <p className="ca-muted ca-text-xs">
-          先说清这一块占位的范围:上面两块(头部状态区 + 事件时间线)已经由 w4a 落地,
-          <strong>缺的是这一页的下半三块</strong>,连同 <code>/live/:taskId</code> 的退役
-          (按 §5:退役的是那个页面与路由,SSE 数据端点保留)一起顺延给 w4b。
-          将读的口径已经写清:<code>result_text</code> 其实已经在这页读到的快照里
-          (<code>task.result_text</code>),只是按 §5 的分区它属于 result 区;
-          <code>evidence</code> 与 <code>candidate</code> 是两条独立端点 ——
-          后者的 <code>?format=patch</code> 会在下发前重算字节 sha256(不一致即
-          <code>integrity_error</code>),那一棒要把它连同 <code>warnings</code>
-          一起如实带出来。本棒 <code>src/</code> 禁动,所以这三块的读法也不在这里先建。
-        </p>
-      </PagePlaceholder>
+      {task === undefined ? null : (
+        <>
+          <ResultSection text={task.result_text} />
+          <EvidenceSection taskId={taskId} />
+          <CandidateSection key={taskId} taskId={taskId} />
+        </>
+      )}
     </div>
   );
 }
@@ -300,5 +313,142 @@ function AttemptTable({ snapshot }: { snapshot: TaskSnapshot | null }) {
         </tbody>
       </table>
     </div>
+  );
+}
+
+/**
+ * result 块(w4b)。数据源 = 快照既有列 `task.result_text`,**零新增请求**:快照没读到
+ * 时整块跟着不出现(上面 `{task === undefined ? null : …}` 那一刀),不会自造一次取数。
+ */
+function ResultSection({ text }: { text: string | null | undefined }) {
+  const view = resultView(text);
+  return (
+    <section className="ca-card ca-stack">
+      <h2 className="ca-text-md">result</h2>
+      <p className="ca-muted ca-text-xs">
+        来自快照的 <code>result_text</code> 列 —— 与 <code>GET /api/tasks/:id/result</code>
+        是同一份内容的两个读法(端点 404 <code>no_result_yet</code> 与这里的空态是同一件事)。
+      </p>
+      {view.empty ? (
+        <p className="ca-muted">{view.emptyText}</p>
+      ) : (
+        <>
+          <pre className="ca-pre">{view.shown}</pre>
+          {view.note === "" ? null : <p className="ca-muted ca-text-xs">{view.note}</p>}
+          {view.full === view.shown ? null : (
+            <details>
+              <summary className="ca-muted ca-text-xs">看全文</summary>
+              <pre className="ca-pre">{view.full}</pre>
+            </details>
+          )}
+        </>
+      )}
+    </section>
+  );
+}
+
+/**
+ * evidence 块(w4b)。独立查询,失败不拖累其它两块;空态(还没证据)与失败(端点/对象
+ * 缺口)分开说话。这一块**只投影,不做质量推断**:每行的值全部来自端点答复,manifest
+ * 自报什么就摆什么 —— 评价证据质量是操作员的工作。
+ */
+function EvidenceSection({ taskId }: { taskId: string }) {
+  const query = useQuery(taskEvidenceQueryOptions(taskId));
+  return (
+    <section className="ca-card ca-stack">
+      <h2 className="ca-text-md">evidence</h2>
+      <p className="ca-muted ca-text-xs">
+        数据源 <code>{taskEvidenceUrl(taskId)}</code> —— 钉住的 writer manifest 及其
+        binding 状态。只投影:manifest 说自己是完整还是不完整,本页原样转述,不做质量判断。
+      </p>
+      {query.isError ? (
+        isNoEvidenceYet(query.error) ? (
+          <p className="ca-muted">{EVIDENCE_EMPTY_TEXT}</p>
+        ) : (
+          <p className="ca-error-text">{evidenceFailureText(query.error)}</p>
+        )
+      ) : query.data === undefined ? (
+        <p className="ca-muted ca-text-xs">读取中…</p>
+      ) : (
+        <FactBlock title="钉住的证据" rows={evidenceFacts(query.data)} />
+      )}
+    </section>
+  );
+}
+
+/**
+ * candidate 块(w4b)。`key={taskId}`:换任务时 patch 局部状态必须重置,不能把上一个
+ * 任务的补丁正文带过来。patch 正文**按需加载**(可能有几十 KB,不该跟着页面自动打);
+ * warnings 是交付合同,无论补丁在不在都同屏展示 —— 包括 no_patch 那个 404 自带的那份。
+ */
+function CandidateSection({ taskId }: { taskId: string }) {
+  const query = useQuery(candidateQueryOptions(taskId));
+  // patch 加载的三态:null = 没点过;loading = 在途;done = 有一次裁决(裁决结果是 PatchOutcome)。
+  const [patch, setPatch] = useState<
+    { phase: "loading" } | { phase: "done"; outcome: PatchOutcome } | null
+  >(null);
+  const loadPatch = () => {
+    setPatch({ phase: "loading" });
+    fetchCandidatePatchRaw(taskId)
+      .then((raw) => setPatch({ phase: "done", outcome: judgePatchResponse(raw) }))
+      .catch((err: unknown) => setPatch({ phase: "done", outcome: patchOutcomeOfThrown(err) }));
+  };
+  const candidate: CandidateView | undefined = query.data;
+  const failure = query.isError ? (isNoCandidateYet(query.error) ? null : candidateFailureText(query.error)) : null;
+  const patchOutcomeTextValue = patch !== null && patch.phase === "done" ? patchOutcomeText(patch.outcome) : null;
+  return (
+    <section className="ca-card ca-stack">
+      <h2 className="ca-text-md">candidate</h2>
+      <p className="ca-muted ca-text-xs">
+        数据源 <code>{candidateUrl(taskId)}</code>(投影)+{" "}
+        <code>{candidatePatchUrl(taskId)}</code>(补丁正文,按需)。safe_to_apply 只是组装方的
+        一句话,warnings 才是交付合同 —— 两者同屏,谁也不能只看其一。
+      </p>
+      {failure === null && query.isError ? (
+        <p className="ca-muted">{CANDIDATE_EMPTY_TEXT}</p>
+      ) : failure === null ? null : (
+        <p className="ca-error-text">{failure}</p>
+      )}
+      {candidate === undefined ? null : (
+        <>
+          <FactBlock title="候选投影" rows={candidateFacts(candidate)} />
+          {candidate.warnings.length === 0 ? null : (
+            <div className="ca-stack">
+              <span className="ca-label">warnings(交付合同,原样列出)</span>
+              <ul className="ca-stack">
+                {candidate.warnings.map((warning, index) => (
+                  <li key={index}>{warning}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+          {candidate.patch === null ? (
+            <p className="ca-muted ca-text-xs">这个候选没有补丁文件(见上面 patch digest 一行的说明)。</p>
+          ) : patch === null ? (
+            <button type="button" className="ca-btn" onClick={loadPatch}>
+              加载 patch 正文
+            </button>
+          ) : patch.phase === "loading" ? (
+            <p className="ca-muted ca-text-xs">补丁正文读取中…</p>
+          ) : (
+            <div className="ca-stack">
+              {patchOutcomeTextValue === null ? null : <p className="ca-error-text">{patchOutcomeTextValue}</p>}
+              {patch.outcome.kind === "ok" ? (
+                <pre className="ca-pre">{patch.outcome.text}</pre>
+              ) : patch.outcome.kind === "no_patch" && patch.outcome.warnings.length > 0 ? (
+                <div className="ca-stack">
+                  <span className="ca-label">no_patch 404 自带的 warnings</span>
+                  <ul className="ca-stack">
+                    {patch.outcome.warnings.map((warning, index) => (
+                      <li key={index}>{warning}</li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null}
+            </div>
+          )}
+        </>
+      )}
+    </section>
   );
 }

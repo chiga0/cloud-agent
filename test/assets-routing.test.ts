@@ -244,10 +244,11 @@ describe("worker 应答面:API 永远是 JSON,不是 HTML", () => {
     }
   });
 
-  it("/live/:taskId 与 /healthz 保持原形状(过渡期旧页面是 HTML,健康检查是 JSON)", async () => {
+  it("/live/:taskId 301 到详情页(w4b 退役,worker 认领这条路径才答得出重定向)、/healthz 是 JSON", async () => {
     const { taskId } = await seedRunningTask();
     const live = await request(`/live/${taskId}`);
-    expect(live.headers.get("content-type") ?? "").toContain("text/html");
+    expect(live.status).toBe(301);
+    expect(live.headers.get("location")).toBe(`/tasks/${taskId}`);
     const health = await request("/healthz");
     expect(health.headers.get("content-type") ?? "").toContain("application/json");
   });

@@ -11,13 +11,28 @@ import { applyMigrations } from "./d1";
 import { ApiError } from "../web/src/lib/api";
 import {
   TASK_EVENTS_PAGE_LIMIT,
+  candidatePatchUrl,
+  candidateQueryKey,
+  candidateUrl,
   taskEventsUrl,
+  taskEvidenceQueryKey,
+  taskEvidenceUrl,
+  taskSnapshotQueryKey,
   taskSnapshotUrl,
   taskStreamUrl,
+  fetchCandidatePatchRaw,
+  fetchCandidateView,
   fetchTaskEvents,
+  fetchTaskEvidence,
   fetchTaskSnapshot,
 } from "../web/src/lib/queries";
-import { taskEventsPageSchema, taskSnapshotSchema, type TaskSnapshot } from "../web/src/lib/schema";
+import {
+  candidateViewSchema,
+  taskEventsPageSchema,
+  taskEvidenceSchema,
+  taskSnapshotSchema,
+  type TaskSnapshot,
+} from "../web/src/lib/schema";
 import { EVENT_KINDS } from "../web/src/lib/kinds";
 import {
   STALL_DANGER_SECONDS,
@@ -62,6 +77,20 @@ import {
   type PullTriggerInput,
   type TaskEventsReader,
 } from "../web/src/lib/task-detail";
+import {
+  candidateFacts,
+  candidateFailureText,
+  evidenceFacts,
+  evidenceFailureText,
+  isNoCandidateYet,
+  isNoEvidenceYet,
+  judgePatchResponse,
+  patchOutcomeOfThrown,
+  patchOutcomeText,
+  resultView,
+  CANDIDATE_EMPTY_TEXT,
+  EVIDENCE_EMPTY_TEXT,
+} from "../web/src/lib/task-deliverables";
 import { STREAM_EVENT_BUFFER_LIMIT } from "../web/src/lib/use-event-stream";
 import { TEXT_SUMMARY_MAX_CHARS, type Tone } from "../web/src/lib/view";
 
@@ -1057,6 +1086,270 @@ describe("与真端点对表:SSE 路径", () => {
   it("路径带 `/` 的 id 会被编码,不会跑到别的端点上去", () => {
     expect(taskStreamUrl("a/b")).toBe("/api/tasks/a%2Fb/events/stream");
     expect(taskSnapshotUrl("../x")).toBe("/api/tasks/..%2Fx");
+  });
+});
+
+// ── 6. w4b:下半三块(result / evidence / candidate)─────────────────────────
+
+/**
+ * 逐字取自 2026-09-07 prod 干跑产物(/Users/gawain/c10-evidence/w4b-dryrun/,任务 2e0df9e5,
+ * DONE 终态):§N.26 的干跑纪律 —— 契约形状不凭记忆写。改 handler 忘了改前端,这里先红。
+ */
+const EVIDENCE_DONE_FIXTURE =
+  '{"attempt_id":"3649ddea-6e96-4246-86c2-ca94adcd24fe","verifier_attempt_id":"0ea9ca6a-7535-4cc8-a3a1-7c67dbb96527","awaiting_human":false,"digest":"4f4e0ca12e302d08a770d80c1957e731d59bc18e49c1fb0a9c9e74cecfa53f55","binding_digest":"9745c10005e47cf61b4353e75b6e51b4a395aaf5a936b4eb8e247826f9f180b9","manifest":{"schema_version":2,"task_id":"2e0df9e5-d755-4ba2-a2c7-cdf500779815","attempt_id":"3649ddea-6e96-4246-86c2-ca94adcd24fe","role":"writer","produced_at":"2026-09-06T16:04:24.357Z","spec_digest":"29faed731bedfff2ddbae0947c448ca309e4bf98ce637d1bdb42575635009034","model":"qwen3.8-flash","transcript":{"key":"attempts/3649ddea-6e96-4246-86c2-ca94adcd24fe/sha256/e1/89/e1897c0a8e1976f5c0ab338cc8c4d539bc9b2983c3db79109dfe65ca7a60900e","digest":"e1897c0a8e1976f5c0ab338cc8c4d539bc9b2983c3db79109dfe65ca7a60900e","size":469526},"artifacts":[{"key":"attempts/3649ddea-6e96-4246-86c2-ca94adcd24fe/sha256/e3/b0/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","digest":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","size":0}],"patch":{"key":"attempts/3649ddea-6e96-4246-86c2-ca94adcd24fe/sha256/aa/1a/aa1a674acbe05a57609817f3f061facfca7a9520d3569cdd3c89b09e0b1a09d8","digest":"aa1a674acbe05a57609817f3f061facfca7a9520d3569cdd3c89b09e0b1a09d8","size":36248},"base":{"sha":"a9383936d9c01b1e915dc0f99901f1483ed9b7b8","source":"pinned"}}}';
+const CANDIDATE_DONE_FIXTURE =
+  '{"task_id":"2e0df9e5-d755-4ba2-a2c7-cdf500779815","status":"approved","verified":true,"safe_to_apply":true,"base":{"sha":"a9383936d9c01b1e915dc0f99901f1483ed9b7b8","source":"pinned"},"patch":{"key":"attempts/3649ddea-6e96-4246-86c2-ca94adcd24fe/sha256/aa/1a/aa1a674acbe05a57609817f3f061facfca7a9520d3569cdd3c89b09e0b1a09d8","digest":"aa1a674acbe05a57609817f3f061facfca7a9520d3569cdd3c89b09e0b1a09d8","size":36248},"patch_complete":true,"patch_incomplete_reason":null,"writer_attempt_id":"3649ddea-6e96-4246-86c2-ca94adcd24fe","verifier_attempt_id":"0ea9ca6a-7535-4cc8-a3a1-7c67dbb96527","state":"DONE","awaiting_human":false,"decision":{"decision":"approve","actor":"agent:50f6251a-3eb9-43b5-a4a9-8e4ecafc2cb7","by":"reviewer"},"binding_digest":"9745c10005e47cf61b4353e75b6e51b4a395aaf5a936b4eb8e247826f9f180b9","warnings":[]}';
+
+describe("w4b result 块:task.result_text 是唯一数据源(零新增请求)", () => {
+  it("空(null/undefined/纯空白)必须说话:不许渲染成空白,也不许假装读取失败", () => {
+    for (const empty of [null, undefined, "", "   \n "] as const) {
+      const view = resultView(empty);
+      expect(view.empty).toBe(true);
+      expect(view.emptyText).toContain("还没有 result");
+      // 不假装读取失败:文案必须正面否认「这是读取失败」,而不是含糊其辞。
+      expect(view.emptyText).toContain("这不是读取失败");
+      expect(view.emptyText).not.toBe("");
+    }
+  });
+
+  it("短文本原样;超长按 TEXT_SUMMARY_MAX_CHARS 显示截断,note 指到 /result 端点,全文一个字节不少", () => {
+    const short = resultView("查询完成:杭州晴,26°C。");
+    expect(short.empty).toBe(false);
+    expect(short.shown).toBe("查询完成:杭州晴,26°C。");
+    expect(short.note).toBe("");
+    expect(short.full).toBe("查询完成:杭州晴,26°C。");
+
+    const long = resultView("ab".repeat(300));
+    expect(long.shown).toBe("ab".repeat(TEXT_SUMMARY_MAX_CHARS / 2));
+    expect(long.note).toContain("600");
+    expect(long.note).toContain("/api/tasks/:id/result");
+    expect(long.full).toBe("ab".repeat(300));
+  });
+
+  it("全文原样保留换行(result 是文档不是日志行):折叠与截断只发生在显示层,full 不动", () => {
+    const view = resultView("第一行\n第二行");
+    expect(view.full).toBe("第一行\n第二行");
+  });
+});
+
+describe("w4b evidence 块:404 的三种 type 各说各话,空态不是失败", () => {
+  const httpErr = (status: number, type: string | null) =>
+    new ApiError({ kind: "http", status, errorType: type }, "/api/tasks/x/evidence");
+
+  it("no_evidence_yet 判成空态;not_found / evidence_missing / 其余都不算空态", () => {
+    expect(isNoEvidenceYet(httpErr(404, "no_evidence_yet"))).toBe(true);
+    expect(isNoEvidenceYet(httpErr(404, "not_found"))).toBe(false);
+    expect(isNoEvidenceYet(httpErr(404, "evidence_missing"))).toBe(false);
+    expect(isNoEvidenceYet(httpErr(500, "no_evidence_yet"))).toBe(false);
+    expect(isNoEvidenceYet(new ApiError({ kind: "network" }, "/x"))).toBe(false);
+    expect(isNoEvidenceYet("boom")).toBe(false);
+  });
+
+  it("空态文案是 lib 的常量(页面只引用):任务没证据 ≠ 读不到", () => {
+    expect(EVIDENCE_EMPTY_TEXT).toContain("还没有 evidence");
+    expect(EVIDENCE_EMPTY_TEXT).toContain("不是读取失败");
+  });
+
+  it("失败文案:三种 404 分开,四种 failure kind 分开", () => {
+    expect(evidenceFailureText(httpErr(404, "no_evidence_yet"))).toContain("还没有 evidence");
+    expect(evidenceFailureText(httpErr(404, "not_found"))).toContain("任务");
+    expect(evidenceFailureText(httpErr(404, "not_found"))).not.toContain("还没有 evidence");
+    expect(evidenceFailureText(httpErr(404, "evidence_missing"))).toContain("缺失");
+    expect(evidenceFailureText(httpErr(500, "internal"))).toContain("500");
+    expect(evidenceFailureText(new ApiError({ kind: "unauthorized", status: 401 }, "/x"))).toContain("重新登录");
+    expect(evidenceFailureText(new ApiError({ kind: "network" }, "/x"))).toContain("网络");
+    expect(evidenceFailureText(new ApiError({ kind: "shape", status: 200, detail: "d" }, "/x"))).toContain("形状");
+  });
+
+  it("schema 接受 prod 干跑产物(逐字 fixture),evidenceFacts 把关键字段投影成行", () => {
+    const parsed = taskEvidenceSchema.safeParse(JSON.parse(EVIDENCE_DONE_FIXTURE));
+    expect(parsed.success, JSON.stringify((parsed as { error?: unknown }).error)).toBe(true);
+    if (!parsed.success) return;
+    const rows = evidenceFacts(parsed.data);
+    const labels = rows.map((row) => row.label);
+    for (const expected of [
+      "writer attempt",
+      "verifier attempt",
+      "证据 digest",
+      "binding_digest",
+      "awaiting_human",
+      "manifest 基线",
+      "transcript",
+      "patch 产物",
+    ]) {
+      expect(labels, expected).toContain(expected);
+    }
+    const writer = rows.find((row) => row.label === "writer attempt");
+    expect(writer?.value).toContain("3649ddea");
+    expect(writer?.note).toContain("3649ddea-6e96-4246-86c2-ca94adcd24fe");
+    expect(rows.find((row) => row.label === "binding_digest")?.value).toContain("9745c100");
+    expect(rows.find((row) => row.label === "manifest 基线")?.note).toContain("pinned");
+    expect(rows.find((row) => row.label === "transcript")?.value).toContain("469526");
+    expect(rows.find((row) => row.label === "patch 产物")?.value).toContain("36248");
+  });
+
+  it("verifier/binding 为 null 时说「—」并解释,不是空串(null 是信息)", () => {
+    const base = JSON.parse(EVIDENCE_DONE_FIXTURE) as Record<string, unknown>;
+    const parsed = taskEvidenceSchema.parse({ ...base, verifier_attempt_id: null, binding_digest: null });
+    const rows = evidenceFacts(parsed);
+    const verifier = rows.find((row) => row.label === "verifier attempt");
+    const binding = rows.find((row) => row.label === "binding_digest");
+    expect(verifier?.absent).toBe(true);
+    expect(verifier?.note).not.toBe("");
+    expect(binding?.absent).toBe(true);
+    expect(binding?.note).not.toBe("");
+  });
+});
+
+describe("w4b candidate 块:CandidateView 投影 + patch 字节流的判定", () => {
+  it("schema 接受 prod 干跑产物,candidateFacts 全字段投影,warnings 是独立出口不进 fact 行", () => {
+    const parsed = candidateViewSchema.safeParse(JSON.parse(CANDIDATE_DONE_FIXTURE));
+    expect(parsed.success, JSON.stringify((parsed as { error?: unknown }).error)).toBe(true);
+    if (!parsed.success) return;
+    const view = parsed.data;
+    const rows = candidateFacts(view);
+    expect(rows.find((row) => row.label === "status")?.value).toBe("approved");
+    expect(rows.find((row) => row.label === "safe_to_apply")?.value).toBe("true");
+    expect(rows.find((row) => row.label === "patch digest")?.value).toContain("aa1a674a");
+    expect(rows.find((row) => row.label === "补丁基线")?.note).toContain("pinned");
+    const decision = rows.find((row) => row.label === "decision");
+    expect(decision?.value).toContain("approve");
+    expect(decision?.value).toContain("reviewer");
+    expect(rows.find((row) => row.label === "patch_complete")?.value).toBe("true");
+    // warnings 不进 fact 行:它由页面独立渲染(与 patch 同屏是交付合同)
+    expect(view.warnings).toEqual([]);
+  });
+
+  it("patch_complete=false 的在途差量:fact 行给 false + reason(w4b 建棒的全部理由)", () => {
+    const base = JSON.parse(CANDIDATE_DONE_FIXTURE) as Record<string, unknown>;
+    const view = candidateViewSchema.parse({
+      ...base,
+      patch_complete: false,
+      patch_incomplete_reason: "budget_abort(exit=55)",
+    });
+    const row = candidateFacts(view).find((row) => row.label === "patch_complete");
+    expect(row?.value).toContain("false");
+    expect(row?.note).toContain("budget_abort(exit=55)");
+  });
+
+  it("空态常量与三种 404:no_candidate_yet 是「无候选」(中性),not_found 是任务不存在,evidence_missing 是缺口", () => {
+    expect(CANDIDATE_EMPTY_TEXT).toContain("无候选");
+    expect(CANDIDATE_EMPTY_TEXT).toContain("BLOCKED");
+    const httpErr = (type: string) =>
+      new ApiError({ kind: "http", status: 404, errorType: type }, "/api/tasks/x/candidate");
+    expect(isNoCandidateYet(httpErr("no_candidate_yet"))).toBe(true);
+    expect(isNoCandidateYet(httpErr("not_found"))).toBe(false);
+    expect(isNoCandidateYet(httpErr("evidence_missing"))).toBe(false);
+    expect(candidateFailureText(httpErr("not_found"))).toContain("任务");
+    expect(candidateFailureText(httpErr("evidence_missing"))).toContain("缺失");
+  });
+
+  it("candidateFailureText 盖四种 failure kind", () => {
+    expect(candidateFailureText(new ApiError({ kind: "unauthorized", status: 401 }, "/x"))).toContain("重新登录");
+    expect(candidateFailureText(new ApiError({ kind: "network" }, "/x"))).toContain("网络");
+    expect(candidateFailureText(new ApiError({ kind: "shape", status: 200, detail: "d" }, "/x"))).toContain("形状");
+    expect(candidateFailureText(new ApiError({ kind: "http", status: 500, errorType: null }, "/x"))).toContain("500");
+  });
+
+  it("judgePatchResponse:200 正文;no_patch 404 自带的 status/warnings 必须被带出来;integrity_error 500 带 expected/actual", () => {
+    expect(judgePatchResponse({ status: 200, body: "diff --git a/x b/x" })).toEqual({
+      kind: "ok",
+      text: "diff --git a/x b/x",
+    });
+
+    const noPatch = judgePatchResponse({
+      status: 404,
+      body: JSON.stringify({
+        error: {
+          type: "no_patch",
+          detail: "该候选没有补丁文件",
+          status: "unverified",
+          warnings: ["该候选没有可下载的补丁文件(非 repo 任务,或 writer 未导出变更)。"],
+        },
+      }),
+    });
+    expect(noPatch).toMatchObject({
+      kind: "no_patch",
+      detail: "该候选没有补丁文件",
+      candidateStatus: "unverified",
+    });
+    if (noPatch.kind === "no_patch") expect(noPatch.warnings).toHaveLength(1);
+
+    const integrity = judgePatchResponse({
+      status: 500,
+      body: JSON.stringify({
+        error: { type: "integrity_error", key: "attempts/a/sha256/aa/1a/aa1a", expected: "aa1a", actual: "bb2b" },
+      }),
+    });
+    expect(integrity).toEqual({
+      kind: "integrity_error",
+      key: "attempts/a/sha256/aa/1a/aa1a",
+      expected: "aa1a",
+      actual: "bb2b",
+    });
+
+    expect(judgePatchResponse({ status: 401, body: '{"error":{"type":"unauthorized"}}' })).toMatchObject({
+      kind: "unauthorized",
+    });
+    expect(judgePatchResponse({ status: 404, body: '{"error":{"type":"no_candidate_yet"}}' })).toMatchObject({
+      kind: "http",
+      errorType: "no_candidate_yet",
+    });
+    expect(judgePatchResponse({ status: 404, body: '{"error":{"type":"artifact_missing"}}' })).toMatchObject({
+      kind: "http",
+      errorType: "artifact_missing",
+    });
+    expect(judgePatchResponse({ status: 500, body: "boom" })).toMatchObject({ kind: "http", status: 500 });
+  });
+
+  it("integrity_error 的文案必须让 expected/actual 可见(这是证据链脱节,不是网络抖动)", () => {
+    const text = patchOutcomeText({
+      kind: "integrity_error",
+      key: "k",
+      expected: "aa1a674acbe05a576098",
+      actual: "bb2b0b77c3dd6f0a9156",
+    });
+    expect(text).toContain("integrity_error");
+    expect(text).toContain("aa1a674acbe05a576098");
+    expect(text).toContain("bb2b0b77c3dd6f0a9156");
+    expect(text).toContain("未下发");
+  });
+
+  it("抛出侧只有 network 一种(裸 fetch 包装的口径):patchOutcomeOfThrown 如实归类", () => {
+    const outcome = patchOutcomeOfThrown(new ApiError({ kind: "network" }, "/x"));
+    expect(outcome.kind).toBe("network");
+    expect(patchOutcomeText(outcome)).toContain("网络");
+  });
+});
+
+describe("w4b 与真端点对表:没跑完的任务上,三块全是诚实的空态", () => {
+  it("三块(快照/evidence/candidate)的查询 key 互不覆盖:一方的失败不许把另两块判死", () => {
+    expect(taskEvidenceQueryKey("t")).not.toEqual(taskSnapshotQueryKey("t"));
+    expect(candidateQueryKey("t")).not.toEqual(taskSnapshotQueryKey("t"));
+    expect(taskEvidenceQueryKey("t")).not.toEqual(candidateQueryKey("t"));
+  });
+
+  it("URL 全部由 taskPath 派生:编码过的 id 到不了别的端点", () => {
+    expect(taskEvidenceUrl("a/b")).toBe("/api/tasks/a%2Fb/evidence");
+    expect(candidateUrl("a/b")).toBe("/api/tasks/a%2Fb/candidate");
+    expect(candidatePatchUrl("a/b")).toBe("/api/tasks/a%2Fb/candidate?format=patch");
+  });
+
+  it("RUNNING 新任务:evidence/candidate 都答 404,前端判成空态而不是失败", async () => {
+    const { taskId } = await seedTask([1]);
+    stubFetchToWorker();
+    const evidenceErr = await fetchTaskEvidence(taskId).catch((caught: unknown) => caught);
+    expect(isNoEvidenceYet(evidenceErr)).toBe(true);
+    const candidateErr = await fetchCandidateView(taskId).catch((caught: unknown) => caught);
+    expect(isNoCandidateYet(candidateErr)).toBe(true);
+  });
+
+  it("patch 字节流走裸 fetch(介质检查收不了 text/plain):404 no_candidate_yet 归 http 一支", async () => {
+    const { taskId } = await seedTask([1]);
+    stubFetchToWorker();
+    const raw = await fetchCandidatePatchRaw(taskId);
+    expect(raw.status).toBe(404);
+    expect(judgePatchResponse(raw)).toMatchObject({ kind: "http", errorType: "no_candidate_yet" });
   });
 });
 

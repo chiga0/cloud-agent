@@ -18,11 +18,11 @@
  *    (帧 id 与 `GET /events` 的 `?after=` 同口径,见 `src/obs/stream.ts` 不变量 1),
  *    Query 在这里没有任何可缓存的东西。
  *
- * 与 live.ts 的关系:这份是**副本**,而理由与数字只有一份出处 —— 阈值的推导在
- * `src/supervisor/detect.ts`(算式与实测样本只在那里出现一次),分支表的实测记录在
- * `src/obs/live.ts`。副本会漂,所以 test/web-stream-protocol.test.ts 的 A 组从 worker 侧
- * import 那几份权威逐项比对:「改了后端忘了前端」在这里红,而不是在 prod 上被人看出来。
- * 文案有一处**刻意**不同并已核对:live.ts 写「EventSource 无法携带 Authorization 头,
+ * 与 live.ts 的关系(w4b 起):live 页已退役删除,这份不再是谁的「副本」—— 分支表的实测
+ * 结论自此只有这里一份载体;阈值的推导仍在 `src/supervisor/detect.ts`(算式与实测样本只在
+ * 那里出现一次)。test/web-stream-protocol.test.ts 的 A 组从 worker 侧 import 那几份权威
+ * 逐项比对:「改了后端忘了前端」在这里红,而不是在 prod 上被人看出来。
+ * 文案有一处**刻意**不同并已核对:live 页曾写「EventSource 无法携带 Authorization 头,
  * 当前只能靠 API 客户端」,那是 w1b 之前的话;w1b 起浏览器带同源会话 cookie,所以这里的 401
  * 分支说的是「会话失效 → 重新登录」这个新动作。
  */

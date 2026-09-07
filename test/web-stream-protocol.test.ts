@@ -5,12 +5,6 @@ import {
   NO_HEARTBEAT_RED_MS,
 } from "../src/supervisor/detect";
 import { OBS_EVENT_KINDS, OBS_HEARTBEAT_KIND } from "../src/obs/events";
-import {
-  LIVE_CONN_RULES,
-  LIVE_STALL_DANGER_SECONDS,
-  LIVE_STALL_WARN_SECONDS,
-  LIVE_TEXT_SUMMARY_MAX_CHARS,
-} from "../src/obs/live";
 import { OBS_SSE_END_EVENT, OBS_SSE_EVENT } from "../src/obs/stream";
 import { EVENT_KINDS, HEARTBEAT_KIND } from "../web/src/lib/kinds";
 import {
@@ -70,9 +64,6 @@ describe("A 组:前端副本与后端权威逐字一致", () => {
   it("停滞两档阈值与 supervisor 判据同值(毫秒 → 秒,不另立数字)", () => {
     expect(STALL_DANGER_SECONDS).toBe(NO_HEARTBEAT_RED_MS / 1000);
     expect(STALL_WARN_SECONDS).toBe(AGENT_SILENT_YELLOW_MS / 1000);
-    // 与 Live 页也一致:同一个问题不能有两个答案。
-    expect(STALL_DANGER_SECONDS).toBe(LIVE_STALL_DANGER_SECONDS);
-    expect(STALL_WARN_SECONDS).toBe(LIVE_STALL_WARN_SECONDS);
     // 常识防线:红必须比黄先到(反了就是「模型静默判红」,而那条永不该红)。
     expect(STALL_DANGER_SECONDS).toBeLessThan(STALL_WARN_SECONDS);
   });
@@ -90,17 +81,20 @@ describe("A 组:前端副本与后端权威逐字一致", () => {
     expect(SSE_END_EVENT).toBe(OBS_SSE_END_EVENT);
   });
 
-  it("显示截断长度与 Live 页一致", () => {
-    expect(TEXT_SUMMARY_MAX_CHARS).toBe(LIVE_TEXT_SUMMARY_MAX_CHARS);
+  it("显示截断长度就是 200(原与退役的 live 页互钉,w4b 后锚在这里)", () => {
+    expect(TEXT_SUMMARY_MAX_CHARS).toBe(200);
   });
 
-  it("连接分支表覆盖同一组 readyState,且 CLOSED 那条仍说「不会自动重连」", () => {
-    expect(STREAM_CONN_RULES.map((r) => r.readyState)).toEqual(
-      LIVE_CONN_RULES.map((r) => r.readyState),
-    );
-    expect(STREAM_CONN_RULES.map((r) => r.reconnecting)).toEqual(
-      LIVE_CONN_RULES.map((r) => r.reconnecting),
-    );
+  it("连接分支表覆盖实测的三种落点,兜底必须排表末(顺序错就是静默的文案错配)", () => {
+    // live 页退役(w4b)后这张表没有第二份副本可比对;取值的正确性由 c9c 浏览器实测
+    // 背书(401 → CLOSED 且不重连,断连 → CONNECTING 每 3s 重连),这里钉结构:
+    // CLOSED/CONNECTING 两条实测分支在前,null 兜底收尾且全表只有一条。
+    expect(STREAM_CONN_RULES.map((r) => r.readyState)).toEqual([
+      ES_READY_STATE_CLOSED,
+      ES_READY_STATE_CONNECTING,
+      null,
+    ]);
+    expect(STREAM_CONN_RULES.filter((r) => r.readyState === null)).toHaveLength(1);
     const closed = streamConnectionView(ES_READY_STATE_CLOSED, 0);
     expect(closed.text).toContain("不会自动重连");
     expect(closed.reconnecting).toBe(false);

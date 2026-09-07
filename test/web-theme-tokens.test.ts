@@ -21,6 +21,7 @@ import schemaLibRaw from "../web/src/lib/schema.ts?raw";
 import streamProtocolLibRaw from "../web/src/lib/stream-protocol.ts?raw";
 import tasksPageLibRaw from "../web/src/lib/tasks-page.ts?raw";
 import taskDetailLibRaw from "../web/src/lib/task-detail.ts?raw";
+import taskDeliverablesLibRaw from "../web/src/lib/task-deliverables.ts?raw";
 import useEventStreamLibRaw from "../web/src/lib/use-event-stream.ts?raw";
 import useTaskTimelineLibRaw from "../web/src/lib/use-task-timeline.ts?raw";
 import viewLibRaw from "../web/src/lib/view.ts?raw";
@@ -102,6 +103,7 @@ const WEB_SOURCES: Record<string, string> = {
   "web/src/lib/stream-protocol.ts": streamProtocolLibRaw,
   "web/src/lib/tasks-page.ts": tasksPageLibRaw,
   "web/src/lib/task-detail.ts": taskDetailLibRaw,
+  "web/src/lib/task-deliverables.ts": taskDeliverablesLibRaw,
   "web/src/lib/use-event-stream.ts": useEventStreamLibRaw,
   "web/src/lib/use-task-timeline.ts": useTaskTimelineLibRaw,
   "web/src/lib/view.ts": viewLibRaw,
