@@ -188,6 +188,15 @@ export function tasksFailureText(err: unknown): string {
   }
 }
 
+/**
+ * 数据源说明里指向详情页的那半句。页面括号里的**时态**也是投影的一部分:
+ * 2026-09-07 操作员浏览器走查抓到旧文案仍写「详情页由 w4 接入」,而详情页已由 w4a
+ * 上线 —— 将来时假话与假数据一样会让人不再相信这一页。钉在 test/web-tasks-page.test.ts。
+ */
+export function taskDetailNote(): string {
+  return "详情页 /tasks/<taskId> 已上线(w4a)";
+}
+
 /** id 列的截断宽度:UUID 的首段(8 个 hex)足以肉眼区分,剩下的靠 title。 */
 export const TASK_ID_VISIBLE_CHARS = 8;
 

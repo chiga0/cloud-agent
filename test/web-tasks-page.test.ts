@@ -19,6 +19,7 @@ import { archivedTasksSchema, tasksSearchSchema } from "../web/src/lib/schema";
 import {
   parseTasksFilter,
   STATE_FILTER_OPTIONS,
+  taskDetailNote,
   TASK_ID_VISIBLE_CHARS,
   tasksEmptyText,
   tasksFailureText,
@@ -470,6 +471,19 @@ describe("与真服务端对表:这一页发出去的每个 URL 都答 200", () 
     expect(overLimit.status).toBe(400);
     const errorType = ((await overLimit.json()) as { error?: { type?: string } }).error?.type;
     expect(errorType).toBe("invalid_limit");
+  });
+});
+
+// ── 6. 详情页指路:页面括号里的时态也是投影 ─────────────────────────────────
+// 2026-09-07 操作员浏览器走查抓到旧文案仍写「详情页由 w4 接入」(将来时),而详情页
+// 已由 w4a 上线(bundle 指纹与浏览器快照双证)。将来时假话与假数据一样会让人不再
+// 相信这一页,所以这句指路必须钉在现在时上。
+describe("taskDetailNote:详情页指路必须是现在时", () => {
+  it("说详情页已上线并给出路径,不留「由 w4 接入」这种将来时假话", () => {
+    const note = taskDetailNote();
+    expect(note).toContain("已上线");
+    expect(note).toContain("/tasks/<taskId>");
+    expect(note).not.toContain("由 w4 接入");
   });
 });
 

@@ -106,14 +106,16 @@ GET  /admin/{tasks,attempts,events,chain-check}      → GET /api/admin/…
 | `/login` | w2 | `POST /api/session/login` | token 粘贴框；错误提示不区分「token 错」与「网络错」（不泄露探测面） |
 | `/` 任务列表 | w3 | `GET /api/admin/tasks`（**已有端点，零后端改动**） | TanStack Table；state 过滤（search param + zod）；30s refetchInterval。**读取口径见下方 w3 注记**（取代本页旧文案里的「游标『加载更多』」与「RUNNING 置顶」） |
 | `/tasks/$taskId` 详情 | w4 | `GET /api/tasks/:id` + `/events` + `/events/stream`（全部已有） | 头部（state 徽章/budget/base sha/digest/attempts）+ **事件时间线**（SSE 直连 + Last-Event-ID 续传，与 `?after=` 拉取互为恢复源）+ attempts + result/evidence/candidate 区。**逐条迁移 c9b/c9c 实测经验**：kind 徽章全值、200 字符截断、停滞三色 >90s 黄 >300s 红（`Date.now()` 差值）、坏帧跳过并计数（绝不让一条坏帧停更整页）、end 帧停表、**readyState 双文案（401→CLOSED「不会自动重连」）** |
-| `/approvals` | w5 | `GET /api/admin/tasks?state=AWAITING_APPROVAL` + `POST /api/tasks/:id/approve`（已有；缺 state 过滤参数则小补） | 证据视图（result_text / binding digest / manifest）+ candidate patch 预览 + approve 确认弹层（原因必填）。**人工门的一等公民化** |
+| `/approvals` | w5 | 数据源重定见下方 w5 注记（W5-A：w5a 后端审批索引——现归档面**产不出** AWAITING_APPROVAL 新行，`GET /api/admin/tasks?state=…` 只含 2 行化石，§N.32 普查） | 证据视图（result_text / binding digest / manifest）+ candidate patch 预览 + approve 确认弹层（原因必填）。**人工门的一等公民化**。（`?state=` 与 `invalid_state` 校验已在 src/index.ts:925-947，§N.32 核实；旧「缺 state 过滤参数则小补」注记作废） |
 | `/audit` | w6 | `GET /api/admin/events` + `GET /api/admin/chain-check`（已有） | 跨任务事件流 + **digest 链可视化**（prev→cur 链接图形化，chain-check 状态置顶）+ `supervisor_finding` 流（消费 c10 产出） |
 
 - **预算注记（2026-09-06）**：墙钟杠杆（MAX_WRITER_WALL_MINUTES=90）落地后，w 系列派单
   `max_wall_seconds` 一律 6000（writer 实际拿 min(98,90)=90min 上限）；§6 表内 2400/3000 是
   杠杆前旧账，w2/w2a/w2b 三连 exit55@41min 已证旧预算是死区。
 
-- w4 验收通过后**退役 `/live/:taskId`**（页面 + 路由删除；SSE 数据端点保留）；过渡期 301 到 `/tasks/$taskId`。
+- `/live/:taskId` 退役（2026-09-07 状态核）：前端页面与路由已随 w4a 移出站内路径（NotFoundPage
+  清单为准）；后端 `GET /live/:taskId`（src/index.ts liveMatch）仍在答整页 HTML，**301 化归 w4b**
+  （页面+路由删除；SSE 数据端点保留）。
 - **w3 注记（2026-09-06，取代上表 `/` 那一行的原「要点」）**：落地前对 `src/index.ts` 的
   `handleAdminTasks` 逐字核对，响应体只有 `{tasks:[{id,state,created_at,updated_at,version}], count}`，
   SQL 是 `SELECT … [WHERE state = ?] ORDER BY updated_at DESC LIMIT ?`。三条事实与两条旧设想相冲：
@@ -130,10 +132,12 @@ GET  /admin/{tasks,attempts,events,chain-check}      → GET /api/admin/…
      挂在 `BLOCKED`/`DONE`/`REJECTED` 的收敛路径上），所以这一页**拿不到 RUNNING 的行**，
      置顶一个读不到的东西无从谈起。实时状态仍是 `GET /api/tasks/:id`（w4 那一页）。
      ⚠️ 同一条事实对 w5 有直接后果（不是 w3 的范围，w3 只记录不处置）：`ensureAwaitingApproval` /
-     `holdForHuman` 都不触发归档 ⇒ 归档表里通常没有 `AWAITING_APPROVAL` 的行 ⇒
-     `GET /api/admin/tasks?state=AWAITING_APPROVAL` 实测恒为空列表。它同时是 w2b 那个 Approvals
-     角标不显示的原因，而 w5 的整页数据源写的就是这一条 —— **w5 派单前必须先定夺**（后端补归档时机、
-     还是换数据源），不要等到那一棒在页面上找补。
+     `holdForHuman` 都不触发归档 ⇒ 归档表**产不出新的** `AWAITING_APPROVAL` 行（§N.32 D1 普查：
+     6 天 ~108 次归档零新增）；现存 2 行（4bd931de/39d7bdc1，2026-08-31 legacy 时间戳）是化石，
+     对应任务在 prod 已 404 ⇒ **不可操作**，w2b Approvals 角标 2 显示的就是这两行。
+     旧断言「`GET /api/admin/tasks?state=AWAITING_APPROVAL` 实测恒为空列表」**作废** —— 实情是
+     「只含化石」。w5 派单前必须先定夺数据源（§N.32 已定方向：W5-A 后端审批索引 = w5a 新增权威层
+     写路径 + w5b 页面；化石处置倾向「标注 unactionable 留列表」，待拍板）。
   防线：`test/web-tasks-page.test.ts`（真跑判定函数：任意脏输入 → 合法值或干脆不带、四种失败
   四种说法、空态与失败态分开、count 那句话的措辞、`TASKS_LIST_LIMIT` 与服务端 `MAX_ADMIN_LIMIT` 对表）
   与 `test/web-frontend-contract.test.ts`（反向钉子：分页/无限查询那套 API 与「共 N 条」这类总数断言

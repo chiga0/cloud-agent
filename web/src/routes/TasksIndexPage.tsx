@@ -14,6 +14,7 @@ import type { ArchivedTask } from "../lib/schema";
 import {
   parseTasksFilter,
   STATE_FILTER_OPTIONS,
+  taskDetailNote,
   tasksEmptyText,
   tasksFailureText,
   tasksFilterFallbackCopy,
@@ -133,7 +134,7 @@ export function TasksIndexPage() {
           数据源 <code>{`GET /api/admin/tasks?state=&limit=${TASKS_LIST_LIMIT}`}</code>
           {" —— "}只读投影,读的是 D1 归档的 tasks 表。归档在任务进终态时才发生,
           所以仍在 DO 里运行的任务不会出现在这一页(实时状态是 <code>GET /api/tasks/:id</code>
-          ,详情页由 w4 接入)。服务端按 updated_at 降序返回至多 limit 条:
+          ,{taskDetailNote()})。服务端按 updated_at 降序返回至多 limit 条:
           没有游标可以续读,也没有总数可算页数,所以这一页不放翻页控件;
           表头的排序只作用于本次读到的行。
         </p>
