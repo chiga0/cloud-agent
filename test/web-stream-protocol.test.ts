@@ -10,6 +10,7 @@ import { EVENT_KINDS, HEARTBEAT_KIND } from "../web/src/lib/kinds";
 import {
   ES_READY_STATE_CLOSED,
   ES_READY_STATE_CONNECTING,
+  ES_READY_STATE_OPEN,
   STALL_DANGER_SECONDS,
   STALL_WARN_SECONDS,
   SSE_AGENT_EVENT,
@@ -20,6 +21,7 @@ import {
   stallView,
   streamConnectionView,
   streamCountsText,
+  streamErrorView,
   STREAM_CONN_RULES,
 } from "../web/src/lib/stream-protocol";
 import { TEXT_SUMMARY_MAX_CHARS, kindBadgeClass, stateBadgeClass, summarize } from "../web/src/lib/view";
@@ -249,6 +251,22 @@ describe("B 组:readyState 双文案", () => {
     const view = streamConnectionView(7, 0);
     expect(view.text).toContain("7");
     expect(view.reconnecting).toBe(false);
+  });
+});
+
+describe("B 组:end 帧之后的 error 不是事故", () => {
+  // 2026-09-07 prod 实测(w4a 终态任务页):end 后服务端关流,浏览器照例报错重连,
+  // 旧闭包快照判据把每次都计成「重连」—— 9.6s 计 6 次、6s 后 15→16,常驻循环。
+  it("ended=true → null,三种 readyState 一律不计数不上屏(CLOSED 也不是例外)", () => {
+    for (const rs of [ES_READY_STATE_CONNECTING, ES_READY_STATE_OPEN, ES_READY_STATE_CLOSED]) {
+      expect(streamErrorView(true, rs, 7), `readyState=${rs}`).toBeNull();
+    }
+  });
+
+  it("ended=false → 与 streamConnectionView 逐字段一致(纯透传,分流判据仍只有 readyState 一张表)", () => {
+    for (const rs of [ES_READY_STATE_CONNECTING, ES_READY_STATE_OPEN, ES_READY_STATE_CLOSED, 7]) {
+      expect(streamErrorView(false, rs, 7), `readyState=${rs}`).toEqual(streamConnectionView(rs, 7));
+    }
   });
 });
 

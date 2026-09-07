@@ -157,6 +157,27 @@ export function streamConnectionView(readyState: number, reconnects: number): St
 }
 
 /**
+ * 一次 `onerror` 的完整裁决:**end 帧之后的 error 不是事故**。
+ *
+ * 流正常收尾后服务端会关流,而浏览器不懂 end 是业务语义,照例对断掉的重连 —— 每次重连
+ * 立刻又收到 end、再被关掉。ended 判据若拿 effect 闭包里的 state 快照(永远是创建时的
+ * false),页面开着就会每 ~3s 白计一次「重连」并把「连接中断」横幅挂在一条已正常结束的
+ * 流上(2026-09-07 prod 实测:终态任务页 9.6s 计 6 次,6s 后 15→16,常驻循环)。
+ * 所以 ended 必须由调用方喂**最新值**(hook 层经 ref 同步,不是闭包快照)。
+ *
+ * 返回 null = 这次 error 不上屏、不计数。ended=false 时与 streamConnectionView
+ * 逐字段一致:分流判据仍只有 readyState 一张表,这里只负责「已收尾就不再看」这一条。
+ */
+export function streamErrorView(
+  ended: boolean,
+  readyState: number,
+  reconnects: number,
+): StreamConnView | null {
+  if (ended) return null;
+  return streamConnectionView(readyState, reconnects);
+}
+
+/**
  * 一帧的三种结论。`bad` 不是异常处理的花瓶 —— 它是这条流的**正常**分支之一:
  * 流上除了事件帧还有终止帧与注释帧,而信封演进(`AgentEventV1.v`)时老页面必须先能
  * 读懂「我读不懂」并继续盯停滞。live.ts 用 `bad += 1; return` 表达了同一条纪律。

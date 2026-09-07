@@ -221,6 +221,19 @@ describe("EventSource 封装", () => {
   it("onopen 清掉错误文案(否则一次已恢复的断连会永远挂在「重连中」)", () => {
     expect(useEventStreamRaw).toMatch(/es\.onopen[\s\S]{0,200}setConnection\(null\)/);
   });
+
+  it("onerror 的 ended 判据读 ref 不读闭包快照(2026-09-07 prod:终态页 9.6s 白计 6 次重连)", () => {
+    // end 分支必须把翻转同步进 ref —— ref 是唯一能穿过 effect 闭包快照的通道,
+    // state 快照在闭包里永远是 effect 创建时的 false,end 对事件处理器不可见。
+    expect(useEventStreamRaw).toMatch(/frame\.kind === "end"[\s\S]{0,400}endedRef\.current = true/);
+    // onerror 的裁决必须喂 ref 的最新值;旧形状 if (ended.value) return 一经出现即红。
+    expect(useEventStreamRaw).toMatch(/es\.onerror[\s\S]{0,200}streamErrorView\(endedRef\.current/);
+    expect(useEventStreamRaw).not.toMatch(/if \(ended\.value\) return/);
+    // 换一条流必须复位 ref:沿用上一任务的 ended 会把新流的第一个真断线吞掉。
+    expect(useEventStreamRaw).toMatch(/endedRef\.current = false/);
+    // 反向修法同样禁止:把 ended 塞进 deps 会把流整个重建(丢时间线)。
+    expect(useEventStreamRaw).toMatch(/\}, \[path\]\);/);
+  });
 });
 
 describe("旧落地页退役不留兼容层(w2b)", () => {

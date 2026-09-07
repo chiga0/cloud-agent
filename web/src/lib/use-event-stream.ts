@@ -32,8 +32,8 @@ import {
   advanceStallClock,
   parseStreamFrame,
   stallView,
-  streamConnectionView,
   streamCountsText,
+  streamErrorView,
   STREAM_CONNECTED_TEXT,
   type StallClock,
   type StallView,
@@ -79,6 +79,9 @@ export function useEventStream(path: string | null, stallOf: StallViewFn = stall
   const [nowMs, setNowMs] = useState(() => Date.now());
   const clockRef = useRef<StallClock>(createStallClock(Date.now()));
   const reconnectsRef = useRef(0);
+  // ended 的镜像:事件处理器(onerror)是 effect 闭包,state 快照对它永远停在创建时刻,
+  // end 的翻转必须走 ref 才可见(2026-09-07 prod:闭包快照让终态页每 ~3s 白计一次重连)。
+  const endedRef = useRef(false);
 
   useEffect(() => {
     if (path === null) return;
@@ -86,6 +89,7 @@ export function useEventStream(path: string | null, stallOf: StallViewFn = stall
     // 那个数字比没有数字更危险。
     clockRef.current = createStallClock(Date.now());
     reconnectsRef.current = 0;
+    endedRef.current = false;
     setEvents([]);
     setCounts(EMPTY_COUNTS);
     setConnection(null);
@@ -108,6 +112,8 @@ export function useEventStream(path: string | null, stallOf: StallViewFn = stall
       if (frame.kind === "end") {
         // end 帧只证明「已非 RUNNING」(泵的唯一终止条件),给不出精确终态:
         // 权威终态要读 GET /api/tasks/:id。这里如实标注,不猜。
+        // 翻转必须先同步进 ref:onerror 在 effect 闭包里,state 快照对它不可见。
+        endedRef.current = true;
         setEnded({ value: true, events: frame.events, unreadable: frame.unreadable });
         return;
       }
@@ -134,8 +140,10 @@ export function useEventStream(path: string | null, stallOf: StallViewFn = stall
     };
 
     es.onerror = () => {
-      if (ended.value) return;
-      const view = streamConnectionView(es.readyState, reconnectsRef.current + 1);
+      // 裁决在 streamErrorView(判据可测);ended 喂 ref 的最新值 —— 闭包里的 state
+      // 快照永远是 false,那会让 end 后服务端关流的每一次报错都被计成「正在重连」。
+      const view = streamErrorView(endedRef.current, es.readyState, reconnectsRef.current + 1);
+      if (view === null) return;
       if (view.reconnecting) {
         // 只有浏览器真会重连时才记这一次 —— 否则「重连 N 次」本身是第二处谎。
         reconnectsRef.current += 1;
@@ -147,8 +155,9 @@ export function useEventStream(path: string | null, stallOf: StallViewFn = stall
     return () => {
       es.close();
     };
-    // path 是唯一依赖:ended.value / events 之类的变化不该重开一条流(那会丢时间线),
-    // 只有「换一条流」才需要重建。effect 内读的 ended 是闭包值,只用来避免重复收尾。
+    // path 是唯一依赖:ended / events 之类的变化不该重开一条流(那会丢时间线),
+    // 只有「换一条流」才需要重建。事件处理器要读「最新」ended 的地方一律走
+    // endedRef(ref 是唯一能穿过闭包快照的通道),不许读 state 快照。
   }, [path]);
 
   useEffect(() => {
