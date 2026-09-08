@@ -115,6 +115,9 @@ export function useEventStream(path: string | null, stallOf: StallViewFn = stall
         // 翻转必须先同步进 ref:onerror 在 effect 闭包里,state 快照对它不可见。
         endedRef.current = true;
         setEnded({ value: true, events: frame.events, unreadable: frame.unreadable });
+        // end 即 close:终止条件已到,浏览器对已收尾的流仍会按标准静默重试
+        // (2026-09-07 实测终态页每 ~3s 一次 /events),不留这条无意义负载。
+        es.close();
         return;
       }
       clockRef.current = advanceStallClock(clockRef.current, frame, now);

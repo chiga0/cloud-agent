@@ -213,9 +213,16 @@ describe("EventSource 封装", () => {
     }
     expect(useEventStreamRaw).toMatch(/bad: prev\.bad \+ 1/);
     // 坏帧分支里绝不允许 return 之前先关流(那是一条坏帧停更整页的形状)。
-    // 正则必须匹配实现的分支形状(if,不是 switch-case):变异验证发现 /case "bad"/ 恒不命中,
-    // 坏帧分支真插 es.close() 时这条钉子绿着 —— 2026-09-06 落地前变异电池 M5 修掉。
-    expect(useEventStreamRaw).not.toMatch(/frame\.kind === "bad"[\s\S]{0,500}es\.close\(\)/);
+    // 钉是分支块级捕获,不是距离窗口:end 分支加了 es.close() 后,坏帧与终止帧
+    // 同在 accept 内 500 字符可达,窗口钉会误伤(§N.44);块级捕获只看坏帧自己的分支。
+    // 窗口钉时代的老教训仍有效:变异验证发现 /case "bad"/ 恒不命中,正则必须匹配实现的 if 形状。
+    const badBranch = useEventStreamRaw.match(/frame\.kind === "bad"\)\s*\{([\s\S]*?)return;/)?.[1];
+    expect(badBranch, "坏帧分支块未捕获到").toBeDefined();
+    expect(badBranch).not.toContain("es.close");
+  });
+
+  it("end 帧到达即 es.close():终态流不再让浏览器静默重试", () => {
+    expect(useEventStreamRaw).toMatch(/frame\.kind === "end"[\s\S]{0,400}es\.close\(\)/);
   });
 
   it("onopen 清掉错误文案(否则一次已恢复的断连会永远挂在「重连中」)", () => {
