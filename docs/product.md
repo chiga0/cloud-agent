@@ -143,6 +143,24 @@ GET  /admin/{tasks,attempts,events,chain-check}      → GET /api/admin/…
   四种说法、空态与失败态分开、count 那句话的措辞、`TASKS_LIST_LIMIT` 与服务端 `MAX_ADMIN_LIMIT` 对表）
   与 `test/web-frontend-contract.test.ts`（反向钉子：分页/无限查询那套 API 与「共 N 条」这类总数断言
   一律不许出现在读层与列表页）。工程事实见 docs/architecture.md §12.7。
+- **w6 注记（2026-09-08，起草 w6.json 时对 `src/index.ts` 逐字核对，取代上表 `/audit` 行原「要点」里的「跨任务事件流」设想）**：
+  1. `GET /api/admin/events` **`?task_id=` 必填**（src/index.ts:1113 注释原话：分页脊线是每 task 的 seq，
+     跨 task 的 seq 互不相干，混在一起分页没有意义）——「跨任务事件流」**没有端点支撑**。落地形态：
+     任务选择器（`GET /api/admin/tasks`，w3 注记三条事实全部适用）+ 单任务链回放；真跨任务合并流需要
+     新后端游标端点，而 §6 表 w6「新增后端=无」⇒ 登记候选、不进本棒。响应形状
+     `{events:[{seq,kind,digest,prev_digest,created_at,canonical}],next_cursor}`，`canonical` 逐字透出、
+     `digest = sha256Hex((prev_digest ?? "GENESIS") + canonical)`（与 chain-check 同口径）——客户端重算
+     对表是本页的可核验性来源。四类 400：`invalid_task_id`（缺/畸形）、`invalid_cursor`、`invalid_limit`。
+  2. 全局 chain-check 的 `checked` 是**有事件的任务数不是事件数**（c14 教训）；`brokenTasks` 条目形状
+     `taskId:seq:reason`（reason∈prev/digest/seq/state，≤20 条）；**未归档任务对全局模式不可见**
+     （5489dc8a 教训，src/index.ts:814 注释原文）⇒ 审计页=「归档世界」，与 admin/events 终态才归档自洽；
+     对账模式（`?task_id=`）三态 `not_archived`/`diverged`/`consistent`，DO 无记录 → 404 `task_not_found`。
+  3. `supervisor_finding` 的 payload 形状钉在 `supervisorFindingPayload`（src/supervisor/detect.ts:623，
+     导出即为了可单测）：`{attempt_id,kind,rule,severity,evidence,mode:"shadow",enforced:false}`；
+     prod 现状 = SUPERVISOR_MODE shadow 且 prod 零 tick ⇒ findings 面大概率空，空态必须写
+     「未观测到」不许写「正常」（零证据≠正常纪律）。kind 渲染纪律：权威链事件 kind 不在
+     `web/src/lib/kinds.ts` 的 EVENT_KINDS 里（那份是 OBS 流 kind，权威=src/obs/events.ts）——
+     本页 kind 原样字符串渲染、只为 `task.transition` 特判取 `payload.to` 染色，**不建第二份 kind 名单**。
 - 后端在四层可观测架构里已经基本完工（admin/events、chain-check、approve、candidate 全部现成）——
   w 系列本质是**前端工程**，这决定预算分布。
 
